@@ -1,0 +1,8 @@
+data/
+models/
+tmp/
+bin/
+*.pyc
+__pycache__/
+*.log
+*.whl

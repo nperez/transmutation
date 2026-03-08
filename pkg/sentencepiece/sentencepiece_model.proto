@@ -1,0 +1,123 @@
+// Copyright 2016 Google Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto2";
+
+option optimize_for = LITE_RUNTIME;
+
+package sentencepiece;
+
+option go_package = "./;sentencepiece";
+
+message TrainerSpec {
+  repeated string input = 1;
+  optional string input_format = 7;
+  optional string model_prefix = 2;
+
+  enum ModelType {
+    UNIGRAM = 1;
+    BPE = 2;
+    WORD = 3;
+    CHAR = 4;
+  }
+  optional ModelType model_type = 3 [default = UNIGRAM];
+  optional int32 vocab_size = 4 [default = 8000];
+  repeated string accept_language = 5;
+  optional int32 self_test_sample_size = 6 [default = 0];
+
+  optional float character_coverage = 10 [default = 0.9995];
+  optional uint64 input_sentence_size = 11 [default = 0];
+  optional bool shuffle_input_sentence = 19 [default = true];
+  optional int32 seed_sentencepiece_size = 14 [default = 1000000];
+  optional float shrinking_factor = 15 [default = 0.75];
+  optional int32 max_sentence_length = 18 [default = 4192];
+  optional int32 num_threads = 16 [default = 16];
+  optional int32 num_sub_iterations = 17 [default = 2];
+  optional int32 max_sentencepiece_length = 20 [default = 16];
+
+  optional bool split_by_unicode_script = 21 [default = true];
+  optional bool split_by_number = 23 [default = true];
+  optional bool split_by_whitespace = 22 [default = true];
+  optional bool treat_whitespace_as_suffix = 24 [default = false];
+  optional bool allow_whitespace_only_pieces = 26 [default = false];
+  optional bool split_digits = 25 [default = false];
+
+  repeated string control_symbols = 30;
+  repeated string user_defined_symbols = 31;
+  optional string required_chars = 36;
+  optional bool byte_fallback = 35 [default = false];
+  optional bool vocabulary_output_piece_score = 32 [default = true];
+  optional bool hard_vocab_limit = 33 [default = true];
+  optional bool use_all_vocab = 34 [default = false];
+
+  optional int32 unk_id = 40 [default = 0];
+  optional int32 bos_id = 41 [default = 1];
+  optional int32 eos_id = 42 [default = 2];
+  optional int32 pad_id = 43 [default = -1];
+  optional string unk_piece = 45 [default = "<unk>"];
+  optional string bos_piece = 46 [default = "<s>"];
+  optional string eos_piece = 47 [default = "</s>"];
+  optional string pad_piece = 48 [default = "<pad>"];
+  optional string unk_surface = 44 [default = " \xE2\x81\x87 "];
+  optional bool train_extremely_large_corpus = 49 [default = false];
+
+  extensions 200 to max;
+}
+
+message NormalizerSpec {
+  optional string name = 1;
+  optional bytes precompiled_charsmap = 2;
+  optional bool add_dummy_prefix = 3 [default = true];
+  optional bool remove_extra_whitespaces = 4 [default = true];
+  optional bool escape_whitespaces = 5 [default = true];
+  optional string normalization_rule_tsv = 6;
+
+  extensions 200 to max;
+}
+
+message SelfTestData {
+  message Sample {
+    optional string input = 1;
+    optional string expected = 2;
+  }
+  repeated Sample samples = 1;
+
+  extensions 200 to max;
+}
+
+message ModelProto {
+  message SentencePiece {
+    enum Type {
+      NORMAL = 1;
+      UNKNOWN = 2;
+      CONTROL = 3;
+      USER_DEFINED = 4;
+      UNUSED = 5;
+      BYTE = 6;
+    }
+    optional string piece = 1;
+    optional float score = 2;
+    optional Type type = 3 [default = NORMAL];
+
+    extensions 200 to max;
+  }
+
+  repeated SentencePiece pieces = 1;
+  optional TrainerSpec trainer_spec = 2;
+  optional NormalizerSpec normalizer_spec = 3;
+  optional SelfTestData self_test_data = 4;
+  optional NormalizerSpec denormalizer_spec = 5;
+
+  extensions 200 to max;
+}

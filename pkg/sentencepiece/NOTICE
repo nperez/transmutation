@@ -1,0 +1,5 @@
+The files sentencepiece_model.proto and sentencepiece_model.pb.go contain code
+derived from Google's SentencePiece project, licensed under the Apache License 2.0.
+See the file headers for the original copyright notice.
+
+Source: https://github.com/google/sentencepiece
