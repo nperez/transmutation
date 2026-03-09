@@ -29,6 +29,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"nickandperla.net/transmutation/pkg/agent"
 	"nickandperla.net/transmutation/pkg/corrupt"
 	"nickandperla.net/transmutation/pkg/jsongen"
 	"nickandperla.net/transmutation/pkg/languages"
@@ -40,6 +41,8 @@ type TrainingPair struct {
 	Input  string `json:"input"`
 	Target string `json:"target"`
 }
+
+var stage int
 
 func main() {
 	var (
@@ -56,7 +59,13 @@ func main() {
 	flag.Uint64Var(&seed, "seed", 42, "base random seed")
 	flag.IntVar(&workers, "workers", runtime.NumCPU(), "number of parallel workers")
 	flag.BoolVar(&toStdout, "stdout", false, "write JSONL to stdout instead of files")
+	flag.IntVar(&stage, "stage", 0, "curriculum stage (1-5); 0 = legacy random JSON")
 	flag.Parse()
+
+	if stage < 0 || stage > 5 {
+		fmt.Fprintf(os.Stderr, "error: stage must be 0-5\n")
+		os.Exit(1)
+	}
 
 	// Stdout mode: generate count pairs directly to stdout, no files.
 	if toStdout {
@@ -78,7 +87,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("Generating %d train + %d val pairs with %d workers\n", trainCount, valCount, workers)
+	stageLabel := "legacy"
+	if stage > 0 {
+		stageLabel = fmt.Sprintf("stage %d", stage)
+	}
+	fmt.Printf("Generating %d train + %d val pairs (%s) with %d workers\n",
+		trainCount, valCount, stageLabel, workers)
 
 	start := time.Now()
 	generateSplit(filepath.Join(outDir, "train"), trainCount, seed, workers)
@@ -94,14 +108,12 @@ func main() {
 }
 
 func generateSplit(dir string, count int, baseSeed uint64, workers int) {
-	// Split work across multiple files for parallel writing.
 	pairsPerWorker := count / workers
 	remainder := count % workers
 
 	var wg sync.WaitGroup
 	var generated atomic.Int64
 
-	// Progress reporter.
 	done := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(2 * time.Second)
@@ -159,7 +171,12 @@ func generateToWriter(w io.Writer, count int, baseSeed uint64, generated *atomic
 		seed := baseSeed + uint64(i)
 		rng := rand.New(rand.NewPCG(seed, seed+1))
 
-		pair := generatePair(rng, langGens)
+		var pair TrainingPair
+		if stage > 0 {
+			pair = generateAgentPair(rng)
+		} else {
+			pair = generateLegacyPair(rng, langGens)
+		}
 		if err := enc.Encode(pair); err != nil {
 			return fmt.Errorf("encode: %w", err)
 		}
@@ -169,7 +186,54 @@ func generateToWriter(w io.Writer, count int, baseSeed uint64, generated *atomic
 	return bw.Flush()
 }
 
-func generatePair(rng *rand.Rand, langGens []jsongen.LanguageGenerator) TrainingPair {
+// generateAgentPair produces a training pair using the agent response schema.
+func generateAgentPair(rng *rand.Rand) TrainingPair {
+	gen := agent.NewGenerator(rng, agent.Stage(stage))
+	cleanJSON, xmlOut := gen.Generate()
+
+	corrCfg := stageCorruptionConfig(rng)
+	input := corrupt.Apply(cleanJSON, corrCfg, rng)
+
+	return TrainingPair{Input: input, Target: xmlOut}
+}
+
+// stageCorruptionConfig returns a corruption config appropriate for the
+// current curriculum stage.
+func stageCorruptionConfig(rng *rand.Rand) corrupt.Config {
+	switch stage {
+	case 1, 2, 3:
+		// Stages 1-3: 100% clean (model learns faithful transcription).
+		return corrupt.NoneConfig()
+	case 4:
+		// Stage 4: 95% clean, 3% subtle, 2% light.
+		r := rng.Float64()
+		if r < 0.95 {
+			return corrupt.NoneConfig()
+		} else if r < 0.98 {
+			return corrupt.SubtleConfig()
+		}
+		return corrupt.LightConfig()
+	case 5:
+		// Stage 5: 90% clean, 5% subtle, 3% light, 2% light+wrapper.
+		r := rng.Float64()
+		if r < 0.90 {
+			return corrupt.NoneConfig()
+		} else if r < 0.95 {
+			return corrupt.SubtleConfig()
+		} else if r < 0.98 {
+			return corrupt.LightConfig()
+		}
+		cfg := corrupt.LightConfig()
+		cfg.WrapperProb = 1.0
+		return cfg
+	default:
+		return corrupt.NoneConfig()
+	}
+}
+
+// --- Legacy pipeline (stage 0) ---
+
+func generateLegacyPair(rng *rand.Rand, langGens []jsongen.LanguageGenerator) TrainingPair {
 	cfg := randomConfig(rng)
 	gen := jsongen.NewGenerator(cfg, rng)
 	node := gen.Generate()
@@ -181,62 +245,54 @@ func generatePair(rng *rand.Rand, langGens []jsongen.LanguageGenerator) Training
 
 	xmlOut, err := xmlconv.Convert([]byte(cleanJSON))
 	if err != nil {
-		// Should never happen since we just generated valid JSON.
 		panic(fmt.Sprintf("xmlconv failed on generated JSON: %v", err))
 	}
 
 	corrCfg := randomCorruptionConfig(rng)
 	corrupted := corrupt.Apply(cleanJSON, corrCfg, rng)
 
-	return TrainingPair{
-		Input:  corrupted,
-		Target: xmlOut,
-	}
+	return TrainingPair{Input: corrupted, Target: xmlOut}
 }
 
-// randomConfig generates a random jsongen.Config biased toward realistic sizes.
 func randomConfig(rng *rand.Rand) jsongen.Config {
-	// Size distribution: mostly small/medium, occasionally large.
 	var sizeBudget int
 	r := rng.Float64()
 	switch {
 	case r < 0.3:
-		sizeBudget = 5 + rng.IntN(15) // small: 5-20 nodes
+		sizeBudget = 5 + rng.IntN(15)
 	case r < 0.7:
-		sizeBudget = 20 + rng.IntN(80) // medium: 20-100 nodes
+		sizeBudget = 20 + rng.IntN(80)
 	case r < 0.9:
-		sizeBudget = 100 + rng.IntN(400) // large: 100-500 nodes
+		sizeBudget = 100 + rng.IntN(400)
 	default:
-		sizeBudget = 500 + rng.IntN(1500) // very large: 500-2000 nodes
+		sizeBudget = 500 + rng.IntN(1500)
 	}
 
 	return jsongen.Config{
-		MaxDepth:   2 + rng.IntN(6),          // 2-7
-		MaxBreadth: 2 + rng.IntN(12),         // 2-13
-		MinBreadth: 1 + rng.IntN(3),          // 1-3
+		MaxDepth:   2 + rng.IntN(6),
+		MaxBreadth: 2 + rng.IntN(12),
+		MinBreadth: 1 + rng.IntN(3),
 		SizeBudget: sizeBudget,
-		ArrayProb:  0.1 + rng.Float64()*0.4,  // 0.1-0.5
+		ArrayProb:  0.1 + rng.Float64()*0.4,
 		ScalarDist: jsongen.ScalarDistribution{
-			String: 0.3 + rng.Float64()*0.4, // 0.3-0.7
-			Number: 0.1 + rng.Float64()*0.2, // 0.1-0.3
+			String: 0.3 + rng.Float64()*0.4,
+			Number: 0.1 + rng.Float64()*0.2,
 			Bool:   0.05 + rng.Float64()*0.15,
 			Null:   0.05 + rng.Float64()*0.1,
 		},
 	}
 }
 
-// randomCorruptionConfig picks a corruption intensity randomly.
-// Distribution reflects real-world LLM output: mostly clean/light.
 func randomCorruptionConfig(rng *rand.Rand) corrupt.Config {
 	r := rng.Float64()
 	switch {
 	case r < 0.25:
-		return corrupt.NoneConfig() // 25% clean passthrough
+		return corrupt.NoneConfig()
 	case r < 0.60:
-		return corrupt.LightConfig() // 35% light
+		return corrupt.LightConfig()
 	case r < 0.90:
-		return corrupt.MediumConfig() // 30% medium
+		return corrupt.MediumConfig()
 	default:
-		return corrupt.HeavyConfig() // 10% heavy
+		return corrupt.HeavyConfig()
 	}
 }

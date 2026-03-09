@@ -26,6 +26,7 @@ from pathlib import Path
 import sentencepiece as spm
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 
@@ -91,8 +92,12 @@ def train(args):
     warmup_steps = min(args.warmup_steps, total_steps // 10)
     scheduler = get_cosine_schedule(optimizer, warmup_steps, total_steps)
 
-    # Loss.
+    # Loss — optionally upweight content tokens (numbers, strings, code)
+    # vs structural XML tokens (IDs 0-15: special + XML tags).
     criterion = nn.CrossEntropyLoss(ignore_index=-100)
+    use_content_weight = args.content_weight != 1.0
+    if use_content_weight:
+        print(f"Content weight: {args.content_weight}x (structural tokens 0-{args.structural_max_id} at 1.0x)")
 
     # Mixed precision.
     scaler = GradScaler("cuda", enabled=args.fp16)
@@ -197,7 +202,13 @@ def train(args):
 
             with autocast("cuda", enabled=args.fp16):
                 logits = model(src, tgt_in, src_mask)
-                loss = criterion(logits.reshape(-1, vocab_size), tgt_labels.reshape(-1))
+                if use_content_weight:
+                    loss = weighted_content_loss(
+                        logits, tgt_labels, vocab_size,
+                        args.content_weight, args.structural_max_id,
+                    )
+                else:
+                    loss = criterion(logits.reshape(-1, vocab_size), tgt_labels.reshape(-1))
                 loss = loss / args.grad_accum
 
             scaler.scale(loss).backward()
@@ -309,6 +320,25 @@ def validate(model, loader, criterion, vocab_size, device, fp16, sp):
     return total_loss, total_tokens, exact_rate
 
 
+def weighted_content_loss(logits, tgt_labels, vocab_size, content_weight, structural_max_id):
+    """Cross-entropy loss with higher weight on content tokens.
+
+    Structural tokens (IDs 0..structural_max_id) get weight 1.0.
+    All other tokens (actual content being copied) get content_weight.
+    Padding positions (label == -100) contribute 0.
+    """
+    flat_logits = logits.reshape(-1, vocab_size)
+    flat_labels = tgt_labels.reshape(-1)
+    per_token = F.cross_entropy(flat_logits, flat_labels, reduction="none", ignore_index=-100)
+
+    valid = flat_labels != -100
+    structural = (flat_labels >= 0) & (flat_labels <= structural_max_id)
+    weights = torch.where(structural, 1.0, content_weight)
+    weights = torch.where(valid, weights, 0.0)
+
+    return (per_token * weights).sum() / weights.sum().clamp(min=1)
+
+
 def get_cosine_schedule(optimizer, warmup_steps, total_steps, min_lr_ratio=0.1):
     """Linear warmup then cosine decay."""
     import math
@@ -362,6 +392,13 @@ def main():
     parser.add_argument("--grad-accum", type=int, default=4)
     parser.add_argument("--fp16", action="store_true", default=True)
     parser.add_argument("--no-fp16", action="store_false", dest="fp16")
+
+    # Loss weighting.
+    parser.add_argument("--content-weight", type=float, default=1.0,
+                        help="Weight multiplier for content tokens (numbers, strings). "
+                             "Structural XML tokens (0..structural-max-id) stay at 1.0.")
+    parser.add_argument("--structural-max-id", type=int, default=15,
+                        help="Token IDs 0..N are considered structural (XML tags, special tokens)")
 
     # Data.
     parser.add_argument("--max-src-len", type=int, default=2048)

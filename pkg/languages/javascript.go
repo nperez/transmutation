@@ -40,63 +40,72 @@ func (JavaScript) Generate(rng *rand.Rand) string {
 	}
 }
 
-var (
-	jsNames = []string{"getData", "handleRequest", "processItem", "validateInput", "formatOutput", "fetchUser", "parseResponse", "transformData", "filterResults", "computeTotal"}
-	jsVars  = []string{"data", "config", "user", "items", "response", "result", "options", "payload", "context", "state"}
-)
-
 func genJSArrow(rng *rand.Rand) string {
-	name := pick(rng, jsNames)
-	args := pickN(rng, jsVars, 1+rng.IntN(3))
-	body := pick(rng, jsVars) + ".map(item => item." + pick(rng, jsVars) + ")"
+	name := FuncName(rng)
+	nArgs := 1 + rng.IntN(3)
+	args := make([]string, nArgs)
+	for i := range args {
+		args[i] = VarName(rng)
+	}
+	prop := VarName(rng)
+	body := VarName(rng) + ".map(item => item." + prop + ")"
 	if rng.Float64() < 0.5 {
-		body = pick(rng, jsVars) + ".filter(x => x !== null).map(x => x." + pick(rng, jsVars) + ")"
+		body = VarName(rng) + ".filter(x => x !== null).map(x => x." + prop + ")"
 	}
 	return fmt.Sprintf("const %s = (%s) => {\n  return %s;\n};", name, strings.Join(args, ", "), body)
 }
 
 func genJSAsync(rng *rand.Rand) string {
-	name := pick(rng, jsNames)
-	arg := pick(rng, jsVars)
-	url := pick(rng, []string{"`/api/v1/users/${id}`", "`/api/v2/data/${type}`", "`${baseUrl}/items/${id}`", "'/api/health'"})
+	name := FuncName(rng)
+	arg := VarName(rng)
+	url := fmt.Sprintf("`/api/v%d/%s/${%s}`", 1+rng.IntN(3), VarName(rng), VarName(rng))
 	return fmt.Sprintf("async function %s(%s) {\n  try {\n    const response = await fetch(%s);\n    if (!response.ok) throw new Error(`HTTP ${response.status}`);\n    return await response.json();\n  } catch (error) {\n    console.error('Failed to %s:', error);\n    throw error;\n  }\n}",
 		name, arg, url, name)
 }
 
 func genJSDestructure(rng *rand.Rand) string {
-	fields := pickN(rng, jsVars, 2+rng.IntN(4))
-	source := pick(rng, jsVars)
+	nFields := 2 + rng.IntN(4)
+	fields := make([]string, nFields)
+	for i := range fields {
+		fields[i] = VarName(rng)
+	}
+	source := VarName(rng)
 	lines := []string{
 		fmt.Sprintf("const { %s } = %s;", strings.Join(fields, ", "), source),
 	}
 	if rng.Float64() < 0.5 {
-		arr := pickN(rng, jsVars, 2)
-		lines = append(lines, fmt.Sprintf("const [%s, ...rest] = %s;", strings.Join(arr, ", "), pick(rng, jsVars)))
+		arr := []string{VarName(rng), VarName(rng)}
+		lines = append(lines, fmt.Sprintf("const [%s, ...rest] = %s;", strings.Join(arr, ", "), VarName(rng)))
 	}
 	return strings.Join(lines, "\n")
 }
 
 func genJSTemplateLiteral(rng *rand.Rand) string {
-	parts := make([]string, 2+rng.IntN(3))
+	nParts := 2 + rng.IntN(4)
+	parts := make([]string, nParts)
 	for i := range parts {
 		if rng.Float64() < 0.5 {
-			parts[i] = "${" + pick(rng, jsVars) + "}"
+			parts[i] = "${" + VarName(rng) + "}"
 		} else {
-			parts[i] = pick(rng, []string{"Error:", "Status:", "User", "Result:", "ID:", "Path:"})
+			labels := []string{"Error:", "Status:", "User", "Result:", "ID:", "Path:", "Count:", "Value:"}
+			parts[i] = pick(rng, labels)
 		}
 	}
-	return "const message = `" + strings.Join(parts, " ") + "`;"
+	return fmt.Sprintf("const %s = `%s`;", VarName(rng), strings.Join(parts, " "))
 }
 
 func genJSClass(rng *rand.Rand) string {
-	name := pick(rng, []string{"DataService", "ApiClient", "EventHandler", "StateManager", "CacheProvider", "AuthMiddleware"})
-	fields := pickN(rng, jsVars, 2+rng.IntN(3))
-	ctorArgs := strings.Join(fields, ", ")
+	name := TypeName(rng)
+	nFields := 2 + rng.IntN(4)
+	fields := make([]string, nFields)
+	for i := range fields {
+		fields[i] = VarName(rng)
+	}
 	assignments := ""
 	for _, f := range fields {
 		assignments += fmt.Sprintf("\n    this.%s = %s;", f, f)
 	}
-	method := pick(rng, jsNames)
+	method := FuncName(rng)
 	return fmt.Sprintf("class %s {\n  constructor(%s) {%s\n  }\n\n  async %s() {\n    return this.%s;\n  }\n}",
-		name, ctorArgs, assignments, method, pick(rng, fields))
+		name, strings.Join(fields, ", "), assignments, method, pick(rng, fields))
 }

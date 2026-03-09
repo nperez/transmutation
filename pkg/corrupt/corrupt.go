@@ -76,6 +76,22 @@ func HeavyConfig() Config {
 	}
 }
 
+// SubtleConfig returns a configuration with very light corruption —
+// the kind of subtle errors LLMs actually produce in production.
+// Missing quote, trailing comma, extra brace.
+func SubtleConfig() Config {
+	return Config{
+		QuoteStripProb: 0.08,
+		CommaDropProb:  0.05,
+		ColonDropProb:  0.0,
+		CommentProb:    0.0,
+		WrapperProb:    0.0,
+		TrailingProb:   0.15,
+		WhitespaceProb: 0.0,
+		BracketProb:    0.05,
+	}
+}
+
 // NoneConfig returns a configuration with no corruption (clean passthrough).
 func NoneConfig() Config {
 	return Config{}

@@ -40,32 +40,36 @@ func (Go) Generate(rng *rand.Rand) string {
 	}
 }
 
-var (
-	goTypes   = []string{"string", "int", "int64", "float64", "bool", "[]byte", "error", "context.Context", "time.Time", "time.Duration", "[]string", "map[string]any"}
-	goNames   = []string{"Process", "Handle", "Validate", "Transform", "Parse", "Fetch", "Compute", "Execute", "Initialize", "Cleanup"}
-	goVars    = []string{"data", "config", "user", "items", "result", "err", "ctx", "opts", "buf", "client"}
-	goStructs = []string{"Server", "Client", "Handler", "Service", "Repository", "Config", "Request", "Response", "Worker", "Manager"}
-	goFields  = []string{"ID", "Name", "Type", "Status", "CreatedAt", "UpdatedAt", "Config", "Data", "Logger", "Client", "Timeout", "MaxRetries"}
-)
+var goTypes = []string{
+	"string", "int", "int64", "float64", "bool", "[]byte", "error",
+	"context.Context", "time.Time", "time.Duration", "[]string",
+	"map[string]any", "io.Reader", "io.Writer", "http.Handler",
+}
+
+func goTag(field string) string {
+	lower := strings.ToLower(field[:1]) + field[1:]
+	return fmt.Sprintf("`json:\"%s\"`", lower)
+}
 
 func genGoStruct(rng *rand.Rand) string {
-	name := pick(rng, goStructs)
-	fields := pickN(rng, goFields, 3+rng.IntN(4))
+	name := TypeName(rng)
+	nFields := 3 + rng.IntN(5)
 	lines := []string{fmt.Sprintf("type %s struct {", name)}
-	for _, f := range fields {
-		tag := fmt.Sprintf("`json:\"%s\"`", strings.ToLower(f[:1])+f[1:])
-		lines = append(lines, fmt.Sprintf("\t%s %s %s", f, pick(rng, goTypes), tag))
+	for range nFields {
+		field := FuncName(rng) // PascalCase field name
+		lines = append(lines, fmt.Sprintf("\t%s %s %s", field, pick(rng, goTypes), goTag(field)))
 	}
 	lines = append(lines, "}")
 	return strings.Join(lines, "\n")
 }
 
 func genGoFunc(rng *rand.Rand) string {
-	name := pick(rng, goNames)
-	receiver := pick(rng, goStructs)
-	arg := pick(rng, goVars)
+	name := FuncName(rng)
+	receiver := TypeName(rng)
+	arg := VarName(rng)
 	argType := pick(rng, goTypes)
 	retType := pick(rng, goTypes)
+	innerCall := SnakeFuncName(rng)
 	return fmt.Sprintf(`func (s *%s) %s(%s %s) (%s, error) {
 	if %s == nil {
 		return %s, fmt.Errorf("%s: %s is required")
@@ -77,12 +81,14 @@ func genGoFunc(rng *rand.Rand) string {
 	return result, nil
 }`, receiver, name, arg, argType, retType,
 		arg, zeroValue(retType), strings.ToLower(name), arg,
-		pick(rng, []string{"process", "handle", "validate", "execute"}), arg,
+		innerCall, arg,
 		zeroValue(retType), strings.ToLower(name))
 }
 
 func genGoGoroutine(rng *rand.Rand) string {
 	chanType := pick(rng, []string{"string", "int", "error", "struct{}", "[]byte"})
+	itemsVar := VarName(rng)
+	workerFunc := SnakeFuncName(rng)
 	return fmt.Sprintf(`ch := make(chan %s, %d)
 var wg sync.WaitGroup
 
@@ -107,39 +113,43 @@ go func() {
 for result := range ch {
 	fmt.Println(result)
 }`, chanType, 1+rng.IntN(100),
-		pick(rng, goVars),
+		itemsVar,
 		pick(rng, goTypes),
-		strings.ToLower(pick(rng, goNames)))
+		workerFunc)
 }
 
 func genGoInterface(rng *rand.Rand) string {
-	name := pick(rng, goStructs) + "er"
-	methods := pickN(rng, goNames, 2+rng.IntN(3))
+	name := TypeName(rng)
+	nMethods := 2 + rng.IntN(3)
 	lines := []string{fmt.Sprintf("type %s interface {", name)}
-	for _, m := range methods {
+	for range nMethods {
+		m := FuncName(rng)
 		lines = append(lines, fmt.Sprintf("\t%s(ctx context.Context, %s %s) (%s, error)",
-			m, pick(rng, goVars), pick(rng, goTypes), pick(rng, goTypes)))
+			m, VarName(rng), pick(rng, goTypes), pick(rng, goTypes)))
 	}
 	lines = append(lines, "}")
 	return strings.Join(lines, "\n")
 }
 
 func genGoErrorHandling(rng *rand.Rand) string {
-	fn := strings.ToLower(pick(rng, goNames))
+	fn := SnakeFuncName(rng)
+	errType := TypeName(rng)
+	resultVar := VarName(rng)
+	argVar := VarName(rng)
 	return fmt.Sprintf(`%s, err := %s(%s)
 if err != nil {
-	var %sErr *%sError
+	var %sErr *%s
 	if errors.As(err, &%sErr) {
 		log.Printf("%s-specific error: %%v", %sErr)
 		return nil, %sErr
 	}
 	return nil, fmt.Errorf("%s failed: %%w", err)
 }`,
-		pick(rng, goVars), fn, pick(rng, goVars),
-		fn, pick(rng, goStructs),
-		fn,
-		fn, fn,
-		fn,
+		resultVar, fn, argVar,
+		VarName(rng), errType,
+		VarName(rng),
+		fn, VarName(rng),
+		VarName(rng),
 		fn)
 }
 

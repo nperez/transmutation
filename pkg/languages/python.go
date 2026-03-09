@@ -43,50 +43,56 @@ func (Python) Generate(rng *rand.Rand) string {
 }
 
 var (
-	pyNames    = []string{"process", "handle", "validate", "transform", "parse", "fetch", "compute", "analyze", "filter", "convert"}
-	pyArgs     = []string{"data", "config", "user", "items", "request", "response", "options", "result", "context", "params"}
-	pyTypes    = []string{"str", "int", "float", "bool", "list", "dict", "Optional[str]", "List[int]", "Dict[str, Any]", "Tuple[int, ...]"}
-	pyModules  = []string{"os", "sys", "json", "pathlib", "typing", "dataclasses", "asyncio", "logging", "collections", "functools", "itertools", "re", "datetime"}
-	pyExcepts  = []string{"ValueError", "TypeError", "KeyError", "RuntimeError", "ConnectionError", "TimeoutError", "FileNotFoundError"}
+	pyTypes   = []string{"str", "int", "float", "bool", "list", "dict", "Optional[str]", "List[int]", "Dict[str, Any]", "Tuple[int, ...]", "bytes", "Set[str]", "Any"}
+	pyModules = []string{"os", "sys", "json", "pathlib", "typing", "dataclasses", "asyncio", "logging", "collections", "functools", "itertools", "re", "datetime", "hashlib", "base64", "uuid"}
+	pyExcepts = []string{"ValueError", "TypeError", "KeyError", "RuntimeError", "ConnectionError", "TimeoutError", "FileNotFoundError", "PermissionError", "IndexError", "AttributeError"}
 )
 
 func genPyFunction(rng *rand.Rand) string {
-	name := pick(rng, pyNames)
-	args := pickN(rng, pyArgs, 1+rng.IntN(3))
-	typedArgs := make([]string, len(args))
-	for i, a := range args {
-		typedArgs[i] = a + ": " + pick(rng, pyTypes)
+	name := SnakeFuncName(rng)
+	nArgs := 1 + rng.IntN(4)
+	args := make([]string, nArgs)
+	for i := range args {
+		args[i] = VarName(rng) + ": " + pick(rng, pyTypes)
 	}
 	ret := pick(rng, pyTypes)
-	body := "    result = " + pick(rng, pyArgs) + "\n"
+	body := "    result = " + VarName(rng) + "\n"
 	if rng.Float64() < 0.5 {
 		body += fmt.Sprintf("    if not %s:\n        raise %s(\"invalid %s\")\n",
-			pick(rng, pyArgs), pick(rng, pyExcepts), pick(rng, pyArgs))
+			VarName(rng), pick(rng, pyExcepts), VarName(rng))
 	}
 	body += "    return result"
-	return fmt.Sprintf("def %s(%s) -> %s:\n%s", name, strings.Join(typedArgs, ", "), ret, body)
+	return fmt.Sprintf("def %s(%s) -> %s:\n%s", name, strings.Join(args, ", "), ret, body)
 }
 
 func genPyListComp(rng *rand.Rand) string {
-	item := pick(rng, pyArgs)
-	coll := pick(rng, pyArgs)
-	transform := pick(rng, []string{
+	item := VarName(rng)
+	coll := VarName(rng)
+	transforms := []string{
 		item + ".strip()", item + ".lower()", "str(" + item + ")",
 		item + " * 2", item + "[0]", "len(" + item + ")",
-	})
+		item + ".upper()", "int(" + item + ")", item + " + " + RandInt(rng),
+	}
+	transform := pick(rng, transforms)
 	filter := ""
 	if rng.Float64() < 0.6 {
-		filter = fmt.Sprintf(" if %s", pick(rng, []string{
+		filters := []string{
 			item, item + " is not None", "len(" + item + ") > 0",
 			item + " != ''", "isinstance(" + item + ", str)",
-		}))
+			item + " > " + RandInt(rng), item + " not in seen",
+		}
+		filter = " if " + pick(rng, filters)
 	}
 	return fmt.Sprintf("[%s for %s in %s%s]", transform, item, coll, filter)
 }
 
 func genPyClass(rng *rand.Rand) string {
-	name := "Data" + pick(rng, []string{"Handler", "Processor", "Manager", "Service", "Client", "Factory"})
-	fields := pickN(rng, pyArgs, 2+rng.IntN(3))
+	name := TypeName(rng)
+	nFields := 2 + rng.IntN(4)
+	fields := make([]string, nFields)
+	for i := range fields {
+		fields[i] = VarName(rng)
+	}
 	lines := []string{fmt.Sprintf("class %s:", name)}
 	initArgs := make([]string, len(fields))
 	for i, f := range fields {
@@ -97,18 +103,20 @@ func genPyClass(rng *rand.Rand) string {
 		lines = append(lines, fmt.Sprintf("        self.%s = %s", f, f))
 	}
 	if rng.Float64() < 0.5 {
-		lines = append(lines, "", "    def __repr__(self) -> str:")
-		lines = append(lines, fmt.Sprintf("        return f\"%s(%s)\"", name, pick(rng, fields)+"={self."+pick(rng, fields)+"}"))
+		method := SnakeFuncName(rng)
+		lines = append(lines, "", fmt.Sprintf("    def %s(self) -> %s:", method, pick(rng, pyTypes)))
+		lines = append(lines, fmt.Sprintf("        return self.%s", pick(rng, fields)))
 	}
 	return strings.Join(lines, "\n")
 }
 
 func genPyImports(rng *rand.Rand) string {
-	mods := pickN(rng, pyModules, 2+rng.IntN(4))
+	nMods := 2 + rng.IntN(5)
+	mods := pickN(rng, pyModules, nMods)
 	lines := make([]string, len(mods))
 	for i, m := range mods {
 		if rng.Float64() < 0.3 {
-			lines[i] = fmt.Sprintf("from %s import %s", m, pick(rng, pyNames))
+			lines[i] = fmt.Sprintf("from %s import %s", m, SnakeFuncName(rng))
 		} else {
 			lines[i] = "import " + m
 		}
@@ -117,20 +125,23 @@ func genPyImports(rng *rand.Rand) string {
 }
 
 func genPyFString(rng *rand.Rand) string {
-	parts := make([]string, 2+rng.IntN(3))
+	nParts := 2 + rng.IntN(4)
+	parts := make([]string, nParts)
 	for i := range parts {
 		if rng.Float64() < 0.5 {
-			parts[i] = fmt.Sprintf("{%s}", pick(rng, pyArgs))
+			parts[i] = fmt.Sprintf("{%s}", VarName(rng))
 		} else {
-			parts[i] = pick(rng, []string{"Error:", "Result:", "User", "Status:", "Value =", "Count:", "Path:"})
+			labels := []string{"Error:", "Result:", "User", "Status:", "Value =", "Count:", "Path:", "ID:", "Total:"}
+			parts[i] = pick(rng, labels)
 		}
 	}
 	return "f\"" + strings.Join(parts, " ") + "\""
 }
 
 func genPyAsyncFunc(rng *rand.Rand) string {
-	name := pick(rng, pyNames)
-	arg := pick(rng, pyArgs)
-	return fmt.Sprintf("async def %s(%s: %s) -> %s:\n    async with aiohttp.ClientSession() as session:\n        response = await session.get(url)\n        return await response.json()",
-		name, arg, pick(rng, pyTypes), pick(rng, pyTypes))
+	name := SnakeFuncName(rng)
+	arg := VarName(rng)
+	url := RandURL(rng)
+	return fmt.Sprintf("async def %s(%s: %s) -> %s:\n    async with aiohttp.ClientSession() as session:\n        response = await session.get(\"%s\")\n        return await response.json()",
+		name, arg, pick(rng, pyTypes), pick(rng, pyTypes), url)
 }

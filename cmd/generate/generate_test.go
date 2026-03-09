@@ -30,7 +30,7 @@ func TestGeneratePairProducesValidOutput(t *testing.T) {
 
 	for seed := range uint64(200) {
 		rng := rand.New(rand.NewPCG(seed, seed+1))
-		pair := generatePair(rng, langGens)
+		pair := generateLegacyPair(rng, langGens)
 
 		// Input should be non-empty.
 		if pair.Input == "" {
@@ -92,7 +92,7 @@ func TestGeneratePairWithAllCorruptionLevels(t *testing.T) {
 
 		// Also verify the full pair generation works.
 		rng2 := rand.New(rand.NewPCG(seed, seed+1))
-		pair := generatePair(rng2, langGens)
+		pair := generateLegacyPair(rng2, langGens)
 		if pair.Target == "" {
 			t.Errorf("seed %d: empty target", seed)
 		}

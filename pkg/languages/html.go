@@ -46,10 +46,11 @@ htmlInputs  = []string{"text", "email", "password", "number", "checkbox", "radio
 
 func genHTMLForm(rng *rand.Rand) string {
 	fields := 2 + rng.IntN(4)
-	lines := []string{fmt.Sprintf("<form action=\"/api/%s\" method=\"POST\">", pick(rng, []string{"submit", "login", "register", "update", "search"}))}
+	actions := []string{"submit", "login", "register", "update", "search", "create", "import", "export"}
+	lines := []string{fmt.Sprintf("<form action=\"/api/%s\" method=\"POST\">", pick(rng, actions))}
 	for range fields {
 		inputType := pick(rng, htmlInputs)
-		name := pick(rng, []string{"username", "email", "password", "first_name", "last_name", "phone", "address", "query"})
+		name := VarName(rng)
 		lines = append(lines, fmt.Sprintf("  <div class=\"%s\">", pick(rng, htmlClasses)))
 		lines = append(lines, fmt.Sprintf("    <label for=\"%s\">%s</label>", name, titleCase(name)))
 		lines = append(lines, fmt.Sprintf("    <input type=\"%s\" name=\"%s\" id=\"%s\" placeholder=\"Enter %s\" required />", inputType, name, name, name))
@@ -71,7 +72,8 @@ func genHTMLTable(rng *rand.Rand) string {
 	for range rows {
 		lines = append(lines, "    <tr>")
 		for range cols {
-			lines = append(lines, fmt.Sprintf("      <td>%s</td>", pick(rng, []string{"Alice", "Bob", "42", "active", "2024-01-15", "admin", "$99.99", "pending"})))
+			cellVals := []string{VarName(rng), RandInt(rng), "active", "pending", "admin", "$" + RandFloat(rng), "true", "false"}
+			lines = append(lines, fmt.Sprintf("      <td>%s</td>", pick(rng, cellVals)))
 		}
 		lines = append(lines, "    </tr>")
 	}

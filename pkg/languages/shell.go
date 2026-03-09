@@ -42,73 +42,100 @@ func (Shell) Generate(rng *rand.Rand) string {
 
 var (
 	shCmds  = []string{"grep", "awk", "sed", "cut", "sort", "uniq", "wc", "head", "tail", "xargs", "find", "cat"}
-	shFiles = []string{"/var/log/syslog", "/etc/hosts", "/tmp/output.txt", "$HOME/.config/app.conf", "/proc/meminfo", "data.csv", "input.json"}
-	shVars  = []string{"$USER", "$HOME", "$PWD", "$PATH", "${HOSTNAME}", "${APP_ENV}", "${DB_HOST}", "${API_KEY}"}
-	shFlags = []string{"-r", "-n", "-v", "-i", "-l", "-e", "-f", "-d", "-w"}
+	shFlags = []string{"-r", "-n", "-v", "-i", "-l", "-e", "-f", "-d", "-w", "-c", "-q"}
 )
 
+func shVar(rng *rand.Rand) string {
+	names := []string{"USER", "HOME", "PWD", "PATH", "HOSTNAME", "APP_ENV", "DB_HOST", "API_KEY",
+		"PORT", "LOG_LEVEL", "CONFIG_DIR", "DATA_DIR", "CACHE_TTL", "MAX_RETRIES"}
+	if rng.Float64() < 0.5 {
+		return "$" + pick(rng, names)
+	}
+	return "${" + pick(rng, names) + "}"
+}
+
+func shFile(rng *rand.Rand) string {
+	return RandPath(rng)
+}
+
 func genShellPipe(rng *rand.Rand) string {
-	stages := make([]string, 2+rng.IntN(4))
-	stages[0] = pick(rng, shCmds) + " " + pick(rng, shFlags) + " " + pick(rng, shFiles)
-	for i := 1; i < len(stages); i++ {
+	nStages := 2 + rng.IntN(4)
+	stages := make([]string, nStages)
+	stages[0] = pick(rng, shCmds) + " " + pick(rng, shFlags) + " " + shFile(rng)
+	for i := 1; i < nStages; i++ {
 		cmd := pick(rng, shCmds)
 		switch cmd {
 		case "grep":
-			stages[i] = fmt.Sprintf("grep %s '%s'", pick(rng, shFlags), pick(rng, []string{"error", "warning", "failed", "success", "^[0-9]", "pattern.*match"}))
+			patterns := []string{"error", "warning", "failed", "success", "timeout",
+				VarName(rng), "^[0-9]", "pattern.*match", "not found"}
+			stages[i] = fmt.Sprintf("grep %s '%s'", pick(rng, shFlags), pick(rng, patterns))
 		case "awk":
-			stages[i] = fmt.Sprintf("awk '{print $%d}'", 1+rng.IntN(5))
+			stages[i] = fmt.Sprintf("awk '{print $%d}'", 1+rng.IntN(8))
 		case "sed":
-			stages[i] = fmt.Sprintf("sed 's/%s/%s/g'", pick(rng, []string{"old", "foo", "error", "\\t"}), pick(rng, []string{"new", "bar", "warn", " "}))
+			from := pick(rng, []string{VarName(rng), "old", "error", "\\t", "TODO"})
+			to := pick(rng, []string{VarName(rng), "new", "warn", " ", "DONE"})
+			stages[i] = fmt.Sprintf("sed 's/%s/%s/g'", from, to)
 		case "sort":
-			stages[i] = "sort " + pick(rng, []string{"-n", "-r", "-u", "-k2", "-t,"})
+			stages[i] = "sort " + pick(rng, []string{"-n", "-r", "-u", "-k2", "-t,", "-nr"})
 		case "head":
-			stages[i] = fmt.Sprintf("head -n %d", 5+rng.IntN(95))
+			stages[i] = fmt.Sprintf("head -n %d", 1+rng.IntN(100))
+		case "tail":
+			stages[i] = fmt.Sprintf("tail -n %d", 1+rng.IntN(100))
 		default:
 			stages[i] = cmd + " " + pick(rng, shFlags)
 		}
 	}
 	result := strings.Join(stages, " | ")
 	if rng.Float64() < 0.3 {
-		result += " > " + pick(rng, shFiles)
+		result += " > " + shFile(rng)
 	}
 	return result
 }
 
 func genShellConditional(rng *rand.Rand) string {
-	cond := pick(rng, []string{
-		fmt.Sprintf("-f %s", pick(rng, shFiles)),
-		fmt.Sprintf("-d %s", pick(rng, shVars)),
-		fmt.Sprintf("-z %s", pick(rng, shVars)),
-		fmt.Sprintf("-n %s", pick(rng, shVars)),
+	conds := []string{
+		fmt.Sprintf("-f %s", shFile(rng)),
+		fmt.Sprintf("-d %s", shVar(rng)),
+		fmt.Sprintf("-z %s", shVar(rng)),
+		fmt.Sprintf("-n %s", shVar(rng)),
 		"$? -eq 0",
-		"\"${APP_ENV}\" = \"production\"",
-	})
+		fmt.Sprintf("\"%s\" = \"%s\"", shVar(rng), VarName(rng)),
+		fmt.Sprintf("%s -gt %s", shVar(rng), RandInt(rng)),
+	}
 	return fmt.Sprintf("if [ %s ]; then\n  echo \"condition met\"\n  %s %s\nelse\n  echo \"condition not met\" >&2\n  exit 1\nfi",
-		cond, pick(rng, shCmds), pick(rng, shFiles))
+		pick(rng, conds), pick(rng, shCmds), shFile(rng))
 }
 
 func genShellLoop(rng *rand.Rand) string {
 	if rng.Float64() < 0.5 {
-		return fmt.Sprintf("for f in %s/*.log; do\n  echo \"Processing $f\"\n  %s \"$f\" >> /tmp/output.txt\ndone",
-			pick(rng, []string{"/var/log", "$HOME/logs", "/tmp"}), pick(rng, shCmds))
+		exts := []string{"*.log", "*.txt", "*.csv", "*.json", "*.yaml"}
+		return fmt.Sprintf("for f in %s/%s; do\n  echo \"Processing $f\"\n  %s \"$f\" >> %s\ndone",
+			shVar(rng), pick(rng, exts), pick(rng, shCmds), shFile(rng))
 	}
 	return fmt.Sprintf("while IFS= read -r line; do\n  echo \"$line\" | %s %s\ndone < %s",
-		pick(rng, shCmds), pick(rng, shFlags), pick(rng, shFiles))
+		pick(rng, shCmds), pick(rng, shFlags), shFile(rng))
 }
 
 func genShellFunction(rng *rand.Rand) string {
-	name := pick(rng, []string{"cleanup", "deploy", "backup", "check_status", "setup_env", "run_tests"})
+	name := SnakeFuncName(rng)
+	localVar := VarName(rng)
 	return fmt.Sprintf("%s() {\n  local %s=%s\n  echo \"Running %s...\"\n  %s %s %s\n  return $?\n}",
-		name, pick(rng, []string{"input", "output", "target", "config"}), pick(rng, shVars),
-		name, pick(rng, shCmds), pick(rng, shFlags), pick(rng, shFiles))
+		name, localVar, shVar(rng),
+		name, pick(rng, shCmds), pick(rng, shFlags), shFile(rng))
 }
 
 func genShellOneliner(rng *rand.Rand) string {
-	return pick(rng, []string{
-		fmt.Sprintf("find %s -name '*.log' -mtime +%d -exec rm {} \\;", pick(rng, shVars), 7+rng.IntN(23)),
-		fmt.Sprintf("tar -czf backup_%s.tar.gz %s", "${HOSTNAME}", pick(rng, shFiles)),
-		fmt.Sprintf("curl -s -H 'Authorization: Bearer %s' https://api.example.com/v1/data | jq '.results[]'", pick(rng, shVars)),
-		fmt.Sprintf("docker exec -it $(docker ps -q -f name=%s) /bin/bash", pick(rng, []string{"web", "api", "db", "redis"})),
-		fmt.Sprintf("ssh %s@%s 'sudo systemctl restart %s'", pick(rng, []string{"deploy", "admin", "root"}), pick(rng, []string{"prod-01", "staging", "db-master"}), pick(rng, []string{"nginx", "app", "postgresql"})),
-	})
+	oneliners := []string{
+		fmt.Sprintf("find %s -name '*.log' -mtime +%d -exec rm {} \\;", shVar(rng), 1+rng.IntN(30)),
+		fmt.Sprintf("tar -czf backup_%s.tar.gz %s", RandInt(rng), shFile(rng)),
+		fmt.Sprintf("curl -s -H 'Authorization: Bearer %s' %s | jq '.results[]'", shVar(rng), RandURL(rng)),
+		fmt.Sprintf("docker exec -it $(docker ps -q -f name=%s) /bin/bash", VarName(rng)),
+		fmt.Sprintf("ssh %s@%s 'sudo systemctl restart %s'",
+			pick(rng, []string{"deploy", "admin", "root"}),
+			VarName(rng)+"-"+RandInt(rng),
+			VarName(rng)),
+		fmt.Sprintf("rsync -avz --delete %s/ %s@%s:%s/", shFile(rng),
+			pick(rng, []string{"deploy", "backup"}), VarName(rng), shFile(rng)),
+	}
+	return pick(rng, oneliners)
 }

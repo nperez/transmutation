@@ -106,9 +106,9 @@ case "${1:-all}" in
             --data-dir data \
             --tokenizer models/tokenizer.model \
             --output-dir models \
-            --batch-size 2 \
-            --grad-accum 16 \
-            --max-src-len 1024 \
+            --batch-size 1 \
+            --grad-accum 32 \
+            --max-src-len 1536 \
             --max-tgt-len 2048 \
             --epochs 5 \
             --lr 3e-4 \
@@ -196,7 +196,7 @@ case "${1:-all}" in
             --output-dir models \
             --batch-size 2 \
             --grad-accum 16 \
-            --max-src-len 1024 \
+            --max-src-len 2048 \
             --max-tgt-len 2048 \
             --epochs 5 \
             --lr 3e-4 \
