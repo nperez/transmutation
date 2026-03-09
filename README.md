@@ -201,13 +201,15 @@ Code generators produce syntactically realistic snippets with high combinatorial
 
 **Encoder** — called once per input:
 - Input: `src_ids` (1, src_len) int64
-- Output: `memory` (1, src_len, 384) float32
+- Outputs: `all_k` (6, 6, src_len, 64) float32, `all_v` (6, 6, src_len, 64) float32
+
+The encoder pre-computes cross-attention K/V projections for all 6 decoder layers (6 heads, head_dim=64), so the decoder only needs Q projection per step.
 
 **Decoder** — called once per output token (autoregressive loop in caller):
-- Inputs: `tgt_token` (1, 1) int64, `memory` (1, src_len, 384) float32, `all_h` (6, 768, 16) float32, `all_conv` (6, 768, 3) float32
+- Inputs: `tgt_token` (1, 1) int64, `all_k` (6, 6, src_len, 64) float32, `all_v` (6, 6, src_len, 64) float32, `all_h` (6, 768, 16) float32, `all_conv` (6, 768, 3) float32
 - Outputs: `logits` (1, 8000) float32, `all_h_out` (6, 768, 16) float32, `all_conv_out` (6, 768, 3) float32
 
-Initialize `all_h` and `all_conv` to zeros. Feed BOS token first. Greedy decode: take argmax of logits, stop at EOS.
+Initialize `all_h` and `all_conv` to zeros. Feed BOS token first. Greedy decode: take argmax of logits, stop at EOS. Copy `all_h_out`/`all_conv_out` back into `all_h`/`all_conv` each step. `all_k`/`all_v` are read-only.
 
 ## License
 

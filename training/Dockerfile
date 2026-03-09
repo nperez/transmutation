@@ -29,4 +29,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 COPY . /app/training/
 
+RUN useradd -m -u 1000 trainer
+USER trainer
+
 ENTRYPOINT ["python"]

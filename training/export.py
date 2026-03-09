@@ -97,12 +97,39 @@ def patch_mamba_for_onnx(model):
 
 
 class EncoderWrapper(nn.Module):
+    """Encoder that pre-computes cross-attention K/V for all decoder layers.
+
+    This moves the expensive memory projection (src_len × d_model²) to the
+    encoder (called once) instead of repeating it every decoder step.
+
+    Outputs:
+        all_k: (n_layers, n_heads, src_len, head_dim) - cached K projections
+        all_v: (n_layers, n_heads, src_len, head_dim) - cached V projections
+    """
     def __init__(self, model):
         super().__init__()
         self.model = model
 
     def forward(self, src_ids):
-        return self.model.encode(src_ids)
+        memory = self.model.encode(src_ids)  # (1, src_len, d_model)
+        batch = memory.size(0)
+
+        k_list = []
+        v_list = []
+        for layer in self.model.decoder_layers:
+            mha = layer.cross_attn
+            w_q, w_k, w_v = mha.in_proj_weight.chunk(3, dim=0)
+            b_q, b_k, b_v = mha.in_proj_bias.chunk(3, dim=0)
+            k = F.linear(memory, w_k, b_k)  # (1, src_len, d_model)
+            v = F.linear(memory, w_v, b_v)
+            k = k.view(batch, -1, mha.num_heads, mha.head_dim).transpose(1, 2)  # (1, n_heads, src_len, head_dim)
+            v = v.view(batch, -1, mha.num_heads, mha.head_dim).transpose(1, 2)
+            k_list.append(k)
+            v_list.append(v)
+
+        all_k = torch.cat(k_list, dim=0)  # (n_layers, n_heads, src_len, head_dim)
+        all_v = torch.cat(v_list, dim=0)  # (n_layers, n_heads, src_len, head_dim)
+        return all_k, all_v
 
 
 # ---------------------------------------------------------------------------
@@ -110,11 +137,12 @@ class EncoderWrapper(nn.Module):
 # ---------------------------------------------------------------------------
 
 class SingleStepDecoderWrapper(nn.Module):
-    """One decoder step. Takes single token + Mamba state, returns logits + new state.
+    """One decoder step with pre-computed KV cache.
 
     Inputs:
         tgt_token: (1, 1) int64
-        memory: (1, src_len, d_model) float32
+        all_k: (n_layers, n_heads, src_len, head_dim) float32  — cached from encoder
+        all_v: (n_layers, n_heads, src_len, head_dim) float32  — cached from encoder
         all_h: (n_layers, d_inner, d_state) float32
         all_conv: (n_layers, d_inner, d_conv-1) float32
     Outputs:
@@ -132,7 +160,7 @@ class SingleStepDecoderWrapper(nn.Module):
         self.output_proj = model.output_proj
         self.n_layers = len(model.decoder_layers)
 
-    def forward(self, tgt_token, memory, all_h, all_conv):
+    def forward(self, tgt_token, all_k, all_v, all_h, all_conv):
         x = self.embedding(tgt_token) * self.pos_scale  # (1, 1, d_model)
 
         h_outs = []
@@ -142,6 +170,8 @@ class SingleStepDecoderWrapper(nn.Module):
             layer = self.decoder_layers[i]
             h_in = all_h[i:i+1]       # (1, d_inner, d_state)
             conv_in = all_conv[i:i+1]  # (1, d_inner, d_conv-1)
+            k_i = all_k[i:i+1]        # (1, n_heads, src_len, head_dim)
+            v_i = all_v[i:i+1]        # (1, n_heads, src_len, head_dim)
 
             # Mamba self-attention (single token, no loop).
             residual = x
@@ -151,10 +181,10 @@ class SingleStepDecoderWrapper(nn.Module):
             h_outs.append(h_new)
             conv_outs.append(conv_new)
 
-            # Cross-attention (1 query token vs full memory).
+            # Cross-attention with cached K/V (only Q projection needed per step).
             residual = x
             x_norm = layer.cross_norm(x)
-            x_attn = _cross_attn(layer.cross_attn, x_norm, memory)
+            x_attn = _cross_attn_cached(layer.cross_attn, x_norm, k_i, v_i)
             x = residual + x_attn
 
             # Feedforward.
@@ -208,7 +238,7 @@ def _mamba_step(mamba, x, h, conv_buf):
 
 
 def _cross_attn(mha, query, memory):
-    """Cross-attention with -1 reshapes for dynamic ONNX shapes."""
+    """Cross-attention with full K/V projection (used by encoder validation only)."""
     d_model = query.size(-1)
     batch = query.size(0)
 
@@ -232,6 +262,26 @@ def _cross_attn(mha, query, memory):
     return mha.out_proj(out)
 
 
+def _cross_attn_cached(mha, query, k, v):
+    """Cross-attention with pre-computed K/V. Only Q projection per step."""
+    d_model = query.size(-1)
+    batch = query.size(0)
+
+    w_q, _, _ = mha.in_proj_weight.chunk(3, dim=0)
+    b_q, _, _ = mha.in_proj_bias.chunk(3, dim=0)
+
+    q = F.linear(query, w_q, b_q)
+    q = q.view(batch, -1, mha.num_heads, mha.head_dim).transpose(1, 2)
+
+    scale = 1.0 / math.sqrt(mha.head_dim)
+    attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+    attn = F.softmax(attn, dim=-1)
+    out = torch.matmul(attn, v)
+
+    out = out.transpose(1, 2).contiguous().view(batch, -1, d_model)
+    return mha.out_proj(out)
+
+
 # ---------------------------------------------------------------------------
 # Export
 # ---------------------------------------------------------------------------
@@ -243,8 +293,12 @@ def export_encoder(model, output_path, vocab_size):
 
     torch.onnx.export(
         EncoderWrapper(model), (dummy,), output_path,
-        input_names=["src_ids"], output_names=["memory"],
-        dynamic_axes={"src_ids": {1: "src_len"}, "memory": {1: "src_len"}},
+        input_names=["src_ids"], output_names=["all_k", "all_v"],
+        dynamic_axes={
+            "src_ids": {1: "src_len"},
+            "all_k": {2: "src_len"},
+            "all_v": {2: "src_len"},
+        },
         opset_version=17,
     )
     print(f"Encoder exported to {output_path}")
@@ -255,11 +309,14 @@ def export_decoder(model, output_path, vocab_size):
     device = next(model.parameters()).device
 
     n_layers = len(model.decoder_layers)
+    mha = model.decoder_layers[0].cross_attn
+    n_heads, head_dim = mha.num_heads, mha.head_dim
     m = model.decoder_layers[0].self_mamba
     d_inner, d_state, d_conv = m.d_inner, m.d_state, m.d_conv
 
     dummy_token = torch.randint(0, vocab_size, (1, 1), device=device)
-    dummy_memory = torch.randn(1, 32, model.d_model, device=device)
+    dummy_k = torch.randn(n_layers, n_heads, 32, head_dim, device=device)
+    dummy_v = torch.randn(n_layers, n_heads, 32, head_dim, device=device)
     dummy_h = torch.zeros(n_layers, d_inner, d_state, device=device)
     dummy_conv = torch.zeros(n_layers, d_inner, d_conv - 1, device=device)
 
@@ -267,14 +324,14 @@ def export_decoder(model, output_path, vocab_size):
 
     torch.onnx.export(
         wrapper,
-        (dummy_token, dummy_memory, dummy_h, dummy_conv),
+        (dummy_token, dummy_k, dummy_v, dummy_h, dummy_conv),
         output_path,
-        input_names=["tgt_token", "memory", "all_h", "all_conv"],
+        input_names=["tgt_token", "all_k", "all_v", "all_h", "all_conv"],
         output_names=["logits", "all_h_out", "all_conv_out"],
-        dynamic_axes={"memory": {1: "src_len"}},
+        dynamic_axes={"all_k": {2: "src_len"}, "all_v": {2: "src_len"}},
         opset_version=17,
     )
-    print(f"Decoder (single-step) exported to {output_path}")
+    print(f"Decoder (single-step, KV cached) exported to {output_path}")
 
 
 def validate(model, encoder_path, decoder_path, sp):
@@ -295,11 +352,11 @@ def validate(model, encoder_path, decoder_path, sp):
     src_ids = sp.encode(test_input)
     pt_ids = greedy_decode(ref, src_ids, sp, max_len=60, device="cpu")
 
-    # ONNX single-step decode.
+    # ONNX single-step decode with KV cache.
     enc_sess = ort.InferenceSession(encoder_path)
     dec_sess = ort.InferenceSession(decoder_path)
 
-    memory = enc_sess.run(None, {"src_ids": np.array([src_ids], dtype=np.int64)})[0]
+    all_k, all_v = enc_sess.run(None, {"src_ids": np.array([src_ids], dtype=np.int64)})
 
     n_layers = len(model.decoder_layers)
     m = model.decoder_layers[0].self_mamba
@@ -312,7 +369,7 @@ def validate(model, encoder_path, decoder_path, sp):
 
     for _ in range(60):
         logits, all_h, all_conv = dec_sess.run(None, {
-            "tgt_token": token, "memory": memory,
+            "tgt_token": token, "all_k": all_k, "all_v": all_v,
             "all_h": all_h, "all_conv": all_conv,
         })
         next_id = int(logits[0].argmax())
@@ -381,6 +438,16 @@ def main():
     enc_mb = os.path.getsize(enc_path) / 1024 / 1024
     dec_mb = os.path.getsize(dec_path) / 1024 / 1024
     print(f"\nEncoder: {enc_mb:.1f} MB, Decoder: {dec_mb:.1f} MB, Total: {enc_mb+dec_mb:.1f} MB")
+
+    # Dynamic int8 quantization for faster CPU inference.
+    from onnxruntime.quantization import quantize_dynamic, QuantType
+    enc_q_path = os.path.join(args.output_dir, "encoder_int8.onnx")
+    dec_q_path = os.path.join(args.output_dir, "decoder_int8.onnx")
+    quantize_dynamic(enc_path, enc_q_path, weight_type=QuantType.QInt8)
+    quantize_dynamic(dec_path, dec_q_path, weight_type=QuantType.QInt8)
+    enc_q_mb = os.path.getsize(enc_q_path) / 1024 / 1024
+    dec_q_mb = os.path.getsize(dec_q_path) / 1024 / 1024
+    print(f"\nQuantized (int8): Encoder: {enc_q_mb:.1f} MB, Decoder: {dec_q_mb:.1f} MB, Total: {enc_q_mb+dec_q_mb:.1f} MB")
 
 
 if __name__ == "__main__":

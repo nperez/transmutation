@@ -26,6 +26,7 @@ import (
 	"math"
 	"os"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
@@ -58,8 +59,8 @@ func main() {
 	flag.StringVar(&tokenizerPath, "tokenizer", "models/tokenizer.model", "path to sentencepiece model")
 	flag.StringVar(&ortLibPath, "ort-lib", "", "path to onnxruntime shared library")
 	flag.IntVar(&nSamples, "n", 10, "number of samples to run")
-	flag.IntVar(&maxSrcLen, "max-src-len", 256, "max source token length")
-	flag.IntVar(&maxTgtLen, "max-tgt-len", 512, "max target generation length")
+	flag.IntVar(&maxSrcLen, "max-src-len", 1536, "max source token length")
+	flag.IntVar(&maxTgtLen, "max-tgt-len", 2048, "max target generation length")
 	flag.IntVar(&nLayers, "n-layers", 6, "number of decoder layers")
 	flag.IntVar(&dInner, "d-inner", 768, "Mamba d_inner (d_model * expand)")
 	flag.IntVar(&dState, "d-state", 16, "Mamba d_state")
@@ -86,9 +87,22 @@ func main() {
 	}
 	defer ort.DestroyEnvironment()
 
-	// Create encoder session.
+	// Session options with threading for CPU performance.
+	sessionOpts, err := ort.NewSessionOptions()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create session options: %v\n", err)
+		os.Exit(1)
+	}
+	defer sessionOpts.Destroy()
+	nThreads := runtime.NumCPU()
+	if err := sessionOpts.SetIntraOpNumThreads(nThreads); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to set thread count: %v\n", err)
+	}
+	fmt.Printf("ORT threads: %d\n", nThreads)
+
+	// Create encoder session (outputs cached K/V for cross-attention).
 	encSession, err := ort.NewDynamicAdvancedSession(
-		encoderPath, []string{"src_ids"}, []string{"memory"}, nil,
+		encoderPath, []string{"src_ids"}, []string{"all_k", "all_v"}, sessionOpts,
 	)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create encoder session: %v\n", err)
@@ -96,12 +110,12 @@ func main() {
 	}
 	defer encSession.Destroy()
 
-	// Create decoder session (single-step: token + memory + state → logits + state).
+	// Create decoder session (single-step with KV cache).
 	decSession, err := ort.NewDynamicAdvancedSession(
 		decoderPath,
-		[]string{"tgt_token", "memory", "all_h", "all_conv"},
+		[]string{"tgt_token", "all_k", "all_v", "all_h", "all_conv"},
 		[]string{"logits", "all_h_out", "all_conv_out"},
-		nil,
+		sessionOpts,
 	)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create decoder session: %v\n", err)
@@ -147,15 +161,15 @@ func main() {
 		total++
 		t0 := time.Now()
 
-		// Encode.
-		memory, err := runEncoder(encSession, srcIDs)
+		// Encode (returns cached K/V).
+		allK, allV, err := runEncoder(encSession, srcIDs)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "encoder error: %v\n", err)
 			continue
 		}
 
 		// Decode (greedy, single-step autoregressive).
-		predIDs, err := greedyDecode(decSession, memory, bosID, eosID, maxTgtLen, nLayers, dInner, dState, dConv)
+		predIDs, err := greedyDecode(decSession, allK, allV, bosID, eosID, maxTgtLen, nLayers, dInner, dState, dConv)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "decoder error: %v\n", err)
 			continue
@@ -200,44 +214,46 @@ func main() {
 		}
 		fmt.Println()
 
-		memory.Destroy()
+		allK.Destroy()
+		allV.Destroy()
 	}
 
 	fmt.Printf("===== %d samples: exact=%d xml_ok=%d =====\n", total, exactCount, xmlOKCount)
 }
 
-// runEncoder runs the encoder ONNX model and returns the memory tensor.
-func runEncoder(session *ort.DynamicAdvancedSession, srcIDs []int64) (*ort.Tensor[float32], error) {
+// runEncoder runs the encoder ONNX model and returns cached K/V tensors.
+func runEncoder(session *ort.DynamicAdvancedSession, srcIDs []int64) (*ort.Tensor[float32], *ort.Tensor[float32], error) {
 	srcShape := ort.NewShape(1, int64(len(srcIDs)))
 	srcTensor, err := ort.NewTensor(srcShape, srcIDs)
 	if err != nil {
-		return nil, fmt.Errorf("create src tensor: %w", err)
+		return nil, nil, fmt.Errorf("create src tensor: %w", err)
 	}
 	defer srcTensor.Destroy()
 
-	outputs := []ort.Value{nil}
+	outputs := []ort.Value{nil, nil}
 	err = session.Run([]ort.Value{srcTensor}, outputs)
 	if err != nil {
-		return nil, fmt.Errorf("encoder run: %w", err)
+		return nil, nil, fmt.Errorf("encoder run: %w", err)
 	}
 
-	memTensor, ok := outputs[0].(*ort.Tensor[float32])
+	kTensor, ok := outputs[0].(*ort.Tensor[float32])
 	if !ok {
-		return nil, fmt.Errorf("unexpected encoder output type")
+		return nil, nil, fmt.Errorf("unexpected encoder K output type")
 	}
-	return memTensor, nil
+	vTensor, ok := outputs[1].(*ort.Tensor[float32])
+	if !ok {
+		return nil, nil, fmt.Errorf("unexpected encoder V output type")
+	}
+	return kTensor, vTensor, nil
 }
 
-// greedyDecode runs single-step autoregressive greedy decoding.
+// greedyDecode runs single-step autoregressive greedy decoding with KV cache.
 func greedyDecode(
 	session *ort.DynamicAdvancedSession,
-	memory *ort.Tensor[float32],
+	allK, allV *ort.Tensor[float32],
 	bosID, eosID int64,
 	maxLen, nLayers, dInner, dState, dConv int,
 ) ([]int64, error) {
-	memShape := memory.GetShape()
-	memData := memory.GetData()
-
 	// Initialize Mamba state: all zeros.
 	hSize := nLayers * dInner * dState
 	convSize := nLayers * dInner * (dConv - 1)
@@ -247,51 +263,40 @@ func greedyDecode(
 	tgtIDs := []int64{}
 	currentToken := bosID
 
+	// Pre-allocate reusable tensors to avoid per-step allocation.
+	tokenData := []int64{bosID}
+	tokenTensor, err := ort.NewTensor(ort.NewShape(1, 1), tokenData)
+	if err != nil {
+		return nil, fmt.Errorf("create token tensor: %w", err)
+	}
+	defer tokenTensor.Destroy()
+
+	hTensor, err := ort.NewTensor(
+		ort.NewShape(int64(nLayers), int64(dInner), int64(dState)), hData,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create h tensor: %w", err)
+	}
+	defer hTensor.Destroy()
+
+	convTensor, err := ort.NewTensor(
+		ort.NewShape(int64(nLayers), int64(dInner), int64(dConv-1)), convData,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create conv tensor: %w", err)
+	}
+	defer convTensor.Destroy()
+
 	for range maxLen {
-		// Create single-token tensor.
-		tokenTensor, err := ort.NewTensor(ort.NewShape(1, 1), []int64{currentToken})
-		if err != nil {
-			return nil, fmt.Errorf("create token tensor: %w", err)
-		}
+		// Update token in-place.
+		tokenTensor.GetData()[0] = currentToken
 
-		// Clone memory.
-		memClone, err := ort.NewTensor(ort.NewShape(memShape...), memData)
-		if err != nil {
-			tokenTensor.Destroy()
-			return nil, fmt.Errorf("clone memory: %w", err)
-		}
-
-		// Create state tensors.
-		hTensor, err := ort.NewTensor(
-			ort.NewShape(int64(nLayers), int64(dInner), int64(dState)), hData,
-		)
-		if err != nil {
-			tokenTensor.Destroy()
-			memClone.Destroy()
-			return nil, fmt.Errorf("create h tensor: %w", err)
-		}
-
-		convTensor, err := ort.NewTensor(
-			ort.NewShape(int64(nLayers), int64(dInner), int64(dConv-1)), convData,
-		)
-		if err != nil {
-			tokenTensor.Destroy()
-			memClone.Destroy()
-			hTensor.Destroy()
-			return nil, fmt.Errorf("create conv tensor: %w", err)
-		}
-
-		// Run decoder step.
+		// Run decoder step. K/V are read-only from encoder.
 		outputs := []ort.Value{nil, nil, nil}
 		err = session.Run(
-			[]ort.Value{tokenTensor, memClone, hTensor, convTensor},
+			[]ort.Value{tokenTensor, allK, allV, hTensor, convTensor},
 			outputs,
 		)
-		tokenTensor.Destroy()
-		memClone.Destroy()
-		hTensor.Destroy()
-		convTensor.Destroy()
-
 		if err != nil {
 			return nil, fmt.Errorf("decoder run: %w", err)
 		}
@@ -305,21 +310,19 @@ func greedyDecode(
 		nextID := argmax(logitsData)
 		logitsTensor.Destroy()
 
-		// Extract updated state.
+		// Copy updated state back into reusable tensors.
 		hOutTensor, ok := outputs[1].(*ort.Tensor[float32])
 		if !ok {
 			return nil, fmt.Errorf("unexpected h_out type")
 		}
-		hData = make([]float32, hSize)
-		copy(hData, hOutTensor.GetData())
+		copy(hTensor.GetData(), hOutTensor.GetData())
 		hOutTensor.Destroy()
 
 		convOutTensor, ok := outputs[2].(*ort.Tensor[float32])
 		if !ok {
 			return nil, fmt.Errorf("unexpected conv_out type")
 		}
-		convData = make([]float32, convSize)
-		copy(convData, convOutTensor.GetData())
+		copy(convTensor.GetData(), convOutTensor.GetData())
 		convOutTensor.Destroy()
 
 		if int64(nextID) == eosID {

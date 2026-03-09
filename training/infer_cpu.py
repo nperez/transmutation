@@ -157,7 +157,7 @@ def patch_mamba_for_cpu(model):
             module.forward = lambda x, m=module: mamba_forward_cpu(m, x)
 
 
-def greedy_decode(model, src_ids, sp, max_len=512, device="cpu"):
+def greedy_decode(model, src_ids, sp, max_len=2048, device="cpu"):
     with torch.no_grad():
         src = torch.tensor([src_ids], dtype=torch.long, device=device)
         memory = model.encode(src)
@@ -237,7 +237,7 @@ def read_records(sp, max_src_len):
 def main():
     checkpoint = sys.argv[1] if len(sys.argv) > 1 else "models/epoch_1.pt"
     n_samples = int(sys.argv[2]) if len(sys.argv) > 2 else 10
-    max_src_len = int(sys.argv[3]) if len(sys.argv) > 3 else 256
+    max_src_len = int(sys.argv[3]) if len(sys.argv) > 3 else 1536
 
     device = torch.device("cpu")
     model, sp = load_model(checkpoint, device)

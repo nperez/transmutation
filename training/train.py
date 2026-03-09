@@ -17,10 +17,13 @@
 
 import atexit
 import argparse
+import copy
 import json
 import os
+import re
 import signal
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import sentencepiece as spm
@@ -31,6 +34,7 @@ from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 
 from dataset import create_dataloader
+from infer_cpu import greedy_decode, patch_mamba_for_cpu
 from model import build_model
 
 
@@ -88,9 +92,10 @@ def train(args):
         betas=(0.9, 0.98),
     )
 
-    total_steps = n_batches_per_epoch * args.epochs // args.grad_accum
-    warmup_steps = min(args.warmup_steps, total_steps // 10)
-    scheduler = get_cosine_schedule(optimizer, warmup_steps, total_steps)
+    warmup_steps = args.warmup_steps
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=args.lr_patience,
+    )
 
     # Loss — optionally upweight content tokens (numbers, strings, code)
     # vs structural XML tokens (IDs 0-15: special + XML tags).
@@ -117,7 +122,10 @@ def train(args):
         ckpt = torch.load(args.resume, map_location=device, weights_only=True)
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        try:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        except (KeyError, ValueError):
+            print("  Scheduler state incompatible (type changed?), starting fresh")
         if "scaler_state_dict" in ckpt:
             scaler.load_state_dict(ckpt["scaler_state_dict"])
         completed_epoch = ckpt.get("epoch_complete", False)
@@ -167,7 +175,7 @@ def train(args):
             print(f">>> atexit: FAILED to save checkpoint: {e} <<<")
     atexit.register(atexit_save)
 
-    print(f"\nTraining for {args.epochs} epochs, {total_steps} steps")
+    print(f"\nTraining for {args.epochs} epochs (ReduceLROnPlateau, patience={args.lr_patience})")
     print(f"Grad accumulation: {args.grad_accum}, effective batch: {args.batch_size * args.grad_accum}")
     print()
 
@@ -223,10 +231,16 @@ def train(args):
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
-                scheduler.step()
                 global_step += 1
 
-            pbar.set_postfix(loss=f"{loss.item() * args.grad_accum:.4f}", lr=f"{scheduler.get_last_lr()[0]:.2e}")
+                # Linear warmup: scale LR during initial steps.
+                if global_step <= warmup_steps:
+                    warmup_lr = args.lr * global_step / warmup_steps
+                    for pg in optimizer.param_groups:
+                        pg["lr"] = warmup_lr
+
+            cur_lr = optimizer.param_groups[0]["lr"]
+            pbar.set_postfix(loss=f"{loss.item() * args.grad_accum:.4f}", lr=f"{cur_lr:.2e}")
 
             # Handle signal-triggered checkpoint.
             if sig_state["save"]:
@@ -246,17 +260,32 @@ def train(args):
         val_loss, val_tokens, val_exact = validate(model, val_loader, criterion, vocab_size, device, args.fp16, sp)
         avg_val_loss = val_loss / max(val_tokens, 1)
 
+        # Step the plateau scheduler based on validation loss.
+        old_lr = optimizer.param_groups[0]["lr"]
+        scheduler.step(avg_val_loss)
+        new_lr = optimizer.param_groups[0]["lr"]
+        if new_lr < old_lr:
+            print(f"  LR reduced: {old_lr:.2e} -> {new_lr:.2e}")
+
+        # Autoregressive eval on a handful of validation samples.
+        ar_exact, ar_xml_ok, ar_total = autoregressive_eval(
+            model, val_loader.dataset, sp, n_samples=args.ar_eval_samples, device=device,
+        )
+
         log_entry = {
             "epoch": epoch,
             "train_loss": avg_train_loss,
             "val_loss": avg_val_loss,
             "val_exact_match": val_exact,
-            "lr": scheduler.get_last_lr()[0],
+            "ar_exact": ar_exact,
+            "ar_xml_ok": ar_xml_ok,
+            "ar_total": ar_total,
+            "lr": new_lr,
             "global_step": global_step,
         }
         log_entries.append(log_entry)
 
-        print(f"Epoch {epoch}: train_loss={avg_train_loss:.4f} val_loss={avg_val_loss:.4f} val_exact={val_exact:.2%} lr={scheduler.get_last_lr()[0]:.2e}")
+        print(f"Epoch {epoch}: train_loss={avg_train_loss:.4f} val_loss={avg_val_loss:.4f} val_exact={val_exact:.2%} ar={ar_exact}/{ar_total}exact {ar_xml_ok}/{ar_total}xml lr={new_lr:.2e}")
 
         # Save best.
         if avg_val_loss < best_val_loss:
@@ -339,17 +368,47 @@ def weighted_content_loss(logits, tgt_labels, vocab_size, content_weight, struct
     return (per_token * weights).sum() / weights.sum().clamp(min=1)
 
 
-def get_cosine_schedule(optimizer, warmup_steps, total_steps, min_lr_ratio=0.1):
-    """Linear warmup then cosine decay."""
-    import math
+@torch.no_grad()
+def autoregressive_eval(model, dataset, sp, n_samples=10, device="cuda"):
+    """Run greedy autoregressive decoding on a few validation samples."""
+    model.eval()
 
-    def lr_lambda(step):
-        if step < warmup_steps:
-            return step / max(warmup_steps, 1)
-        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
-        return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+    # Copy model to CPU for autoregressive decoding (Mamba CUDA kernels
+    # don't support single-step mode, but the CPU forward pass does).
+    cpu_model = copy.deepcopy(model).cpu()
+    patch_mamba_for_cpu(cpu_model)
+    cpu_model.eval()
 
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    exact_count = 0
+    xml_ok_count = 0
+    total = 0
+
+    for i in range(min(n_samples, len(dataset))):
+        record = dataset.records[i]
+        src_ids = sp.encode(record["input"])[:dataset.max_src_len]
+        target = record["target"]
+
+        pred_ids = greedy_decode(cpu_model, src_ids, sp, max_len=dataset.max_tgt_len, device="cpu")
+        pred = sp.decode(pred_ids)
+
+        norm_pred = re.sub(r"\s+", " ", pred.strip())
+        norm_tgt = re.sub(r"\s+", " ", target.strip())
+        exact = norm_pred == norm_tgt
+
+        try:
+            ET.fromstring(pred.strip())
+            xml_ok = True
+        except ET.ParseError:
+            xml_ok = False
+
+        if exact:
+            exact_count += 1
+        if xml_ok:
+            xml_ok_count += 1
+        total += 1
+
+    del cpu_model
+    return exact_count, xml_ok_count, total
 
 
 def save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, output_dir, filename, epoch_complete=True, epoch_step=0, epoch_seed=None):
@@ -388,10 +447,14 @@ def main():
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-steps", type=int, default=1000)
+    parser.add_argument("--lr-patience", type=int, default=2,
+                        help="ReduceLROnPlateau patience (epochs without improvement before LR decay)")
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--grad-accum", type=int, default=4)
     parser.add_argument("--fp16", action="store_true", default=True)
     parser.add_argument("--no-fp16", action="store_false", dest="fp16")
+    parser.add_argument("--ar-eval-samples", type=int, default=10,
+                        help="Number of samples for autoregressive eval per epoch")
 
     # Loss weighting.
     parser.add_argument("--content-weight", type=float, default=1.0,

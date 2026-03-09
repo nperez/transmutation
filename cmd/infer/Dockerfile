@@ -28,5 +28,8 @@ RUN ln -sf libonnxruntime.so.${ORT_VERSION} /usr/local/lib/libonnxruntime.so && 
 
 COPY --from=builder /infer /usr/local/bin/infer
 
+RUN useradd -m -u 1000 infer
+USER infer
+
 WORKDIR /app
 ENTRYPOINT ["infer"]
