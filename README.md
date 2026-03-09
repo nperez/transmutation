@@ -18,7 +18,33 @@ XML was chosen as the output format because it cleanly handles embedded content 
 
 **Inference**: ONNX Runtime. The ONNX models can be loaded from any language with an ONNX runtime — Go, Python, Java, C#, Rust, etc. A Go inference harness is included.
 
-**Data generation**: Go. Generates random JSON structures with embedded code snippets, applies configurable corruption, and produces the target XML.
+**Data generation**: Go. Generates agent response JSON with embedded code, markdown, and tool calls. Applies configurable corruption and produces target XML.
+
+## Input Schema
+
+Training data follows a fixed agent response schema:
+
+```json
+{
+  "thought": "reasoning about the user's request...",
+  "answer": "response text, often markdown with code blocks...",
+  "tool": {
+    "tool_name": "execute_sql",
+    "arguments": {
+      "query": "SELECT * FROM users WHERE active = true"
+    }
+  },
+  "memory": [
+    "User prefers Python for scripting tasks.",
+    "The database is PostgreSQL on port 5432."
+  ]
+}
+```
+
+- `thought` — the agent's reasoning (always present)
+- `answer` — text response, may contain markdown with fenced code blocks, tables, and lists (null when a tool is called)
+- `tool` — tool invocation with arguments; code execution tools (`execute_sql`, `execute_python`, `execute_javascript`, `execute_shell`, `execute_go`) embed realistic code snippets; utility tools (`search`, `read_file`, `write_file`, `http_request`) have simple arguments (null when an answer is given)
+- `memory` — contextual notes carried across interactions
 
 ## XML Schema
 
@@ -61,7 +87,8 @@ transmutation/
 │   ├── infer/          # Go ONNX inference CLI + Dockerfile
 │   └── collage/        # Visual sample collage generator
 ├── pkg/
-│   ├── jsongen/        # Random JSON structure builder
+│   ├── agent/          # Agent response schema generator (curriculum stages)
+│   ├── jsongen/        # Random JSON structure builder (legacy)
 │   ├── languages/      # Embedded code snippet generators (SQL, Python, JS, Go, etc.)
 │   ├── corrupt/        # JSON corrupter (quotes, commas, comments, wrappers, etc.)
 │   ├── xmlconv/        # Deterministic JSON -> XML converter
@@ -69,7 +96,7 @@ transmutation/
 ├── training/           # Python training code (runs in Docker)
 │   ├── Dockerfile
 │   ├── model.py        # Mamba encoder-decoder
-│   ├── train.py        # Training loop
+│   ├── train.py        # Training loop with content-weighted loss
 │   ├── export.py       # ONNX export (single-step decoder)
 │   ├── infer_cpu.py    # Python CPU inference
 │   ├── run.sh          # Orchestrates all training steps
@@ -89,6 +116,10 @@ transmutation/
 ### Generate Training Data
 
 ```bash
+# Agent schema (curriculum stage 1-5)
+go run ./cmd/generate -stage 1 -train 200000 -val 10000
+
+# Legacy random JSON (stage 0)
 go run ./cmd/generate -train 200000 -val 10000
 ```
 
@@ -100,7 +131,7 @@ Writes JSONL shards to `data/train/` and `data/val/`.
 ./training/run.sh train
 ```
 
-Runs tokenizer training (if needed), then model training in a Docker container with GPU passthrough. Checkpoints are saved to `models/`. Supports auto-resume from interrupts.
+Runs tokenizer training (if needed), then model training in a Docker container with GPU passthrough. Checkpoints are saved to `models/`. Supports auto-resume from interrupts (SIGUSR1 saves a mid-epoch checkpoint).
 
 See `./training/run.sh` for all commands: `tokenizer`, `train`, `infer`, `export`, `go-infer`, `all`.
 
@@ -137,6 +168,18 @@ echo '{"input": "{\"name\": \"Alice\"}", "target": ""}' | \
 go run ./cmd/generate -stdout -train 30 -val 0 | ./training/run.sh infer 10
 ```
 
+## Curriculum Training
+
+Training follows a staged curriculum that progressively increases complexity:
+
+1. **Clean simple** — text answers and markdown, clean JSON, learn the schema
+2. **Tool calls** — add code execution and utility tool invocations with embedded code
+3. **Full mix** — all content types together (simple, markdown, code tools, utility tools)
+4. **Subtle corruption** — introduce light JSON corruption (~5% of samples)
+5. **Wrappers** — add preamble/postamble text around the JSON
+
+The loss function weights content tokens (strings, numbers) higher than structural XML tokens to penalize mistakes in the actual data the model is copying.
+
 ## Corruption Types
 
 The corrupter applies a random subset of these to valid JSON:
@@ -152,7 +195,7 @@ The corrupter applies a random subset of these to valid JSON:
 
 ## Embedded Languages
 
-String values can contain realistic snippets of: SQL, Python, JavaScript, Go, Shell, HTML, Markdown, CSS, YAML, and nested JSON-as-string. The model learns to recognize language boundaries and wrap content in CDATA when needed.
+Code generators produce syntactically realistic snippets with high combinatorial entropy via compositional identifier generation. Supported languages: SQL, Python, JavaScript, Go, Shell, HTML, Markdown, CSS, YAML, and nested JSON-as-string.
 
 ## ONNX Model API
 
