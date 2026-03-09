@@ -269,6 +269,8 @@ for e in entries[-5:]:
             LATEST=$(ls -v "$PROJECT_DIR/models"/epoch_*.pt 2>/dev/null | tail -1 || true)
             if [ -n "$LATEST" ]; then
                 CHECKPOINT="models/$(basename "$LATEST")"
+            elif [ -f "$PROJECT_DIR/models/interrupt.pt" ]; then
+                CHECKPOINT="models/interrupt.pt"
             else
                 echo "Error: no checkpoint found."
                 exit 1
