@@ -18,10 +18,12 @@
 import atexit
 import argparse
 import copy
+from datetime import datetime
 import json
 import os
 import re
 import signal
+import subprocess
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -36,6 +38,39 @@ from tqdm import tqdm
 from dataset import create_dataloader
 from infer_cpu import greedy_decode, patch_mamba_for_cpu
 from model import build_model
+
+
+def generate_data(generator_bin, data_dir, train_count, val_count, stage, seed, mix_pct=10):
+    """Call the Go generator to write training and/or validation data.
+
+    Pass train_count=0 to skip train generation, val_count=0 to skip val.
+    """
+    cmd = [
+        generator_bin,
+        "-stage", str(stage),
+        "-train", str(train_count),
+        "-val", str(val_count),
+        "-out", data_dir,
+        "-seed", str(seed),
+    ]
+    # Mix in haiku corpus if it exists.
+    haiku_dir = os.path.join(data_dir, "haiku")
+    has_haiku = os.path.isdir(haiku_dir) and any(f.endswith(".jsonl") for f in os.listdir(haiku_dir))
+    if has_haiku:
+        cmd.extend(["-mix", haiku_dir, "-mix-pct", str(mix_pct)])
+
+    parts = []
+    if train_count > 0:
+        parts.append(f"{train_count} train")
+    if val_count > 0:
+        parts.append(f"{val_count} val")
+    label = " + ".join(parts)
+    haiku_label = f" + haiku mix ({mix_pct}%)" if has_haiku else ""
+    print(f"Generating {label} samples (stage {stage}, seed {seed}){haiku_label}...")
+
+    t0 = time.time()
+    subprocess.run(cmd, check=True)
+    print(f"  Generated in {time.time() - t0:.1f}s")
 
 
 def train(args):
@@ -64,7 +99,7 @@ def train(args):
         pad_id=pad_id,
     ).to(device)
 
-    # Shared dataloader args.
+    # Data directories and dataloader args.
     train_data_dir = os.path.join(args.data_dir, "train")
     val_data_dir = os.path.join(args.data_dir, "val")
     dl_kwargs = dict(
@@ -75,14 +110,11 @@ def train(args):
         num_workers=args.num_workers,
         pad_id=pad_id,
     )
-    val_loader, _ = create_dataloader(data_dir=val_data_dir, shuffle=False, **dl_kwargs)
-    # Train loader created per-epoch (for resumable seeded shuffle).
-    tmp_loader, _ = create_dataloader(data_dir=train_data_dir, shuffle=True, **dl_kwargs)
-    n_train = len(tmp_loader.dataset)
-    n_batches_per_epoch = len(tmp_loader)
-    del tmp_loader
-    print(f"Train samples: {n_train}")
-    print(f"Val samples:   {len(val_loader.dataset)}")
+    n_train = args.train_samples
+    n_val = args.val_samples
+    n_batches_per_epoch = n_train // args.batch_size
+    print(f"Train samples/epoch: {n_train}")
+    print(f"Val samples/epoch:   {n_val}")
 
     # Optimizer + scheduler.
     optimizer = torch.optim.AdamW(
@@ -140,7 +172,10 @@ def train(args):
         if os.path.exists(log_path):
             with open(log_path) as f:
                 log_entries = json.load(f)
-        print(f"Resuming from epoch {start_epoch}, step {resume_epoch_step}, global_step={global_step}, best_val_loss={best_val_loss:.4f}")
+        # Override optimizer LR with command-line value (allows fine-tuning at lower LR).
+        for pg in optimizer.param_groups:
+            pg["lr"] = args.lr
+        print(f"Resuming from epoch {start_epoch}, step {resume_epoch_step}, global_step={global_step}, best_val_loss={best_val_loss:.4f}, lr={args.lr}")
 
     # Signal handling: preserve state on any interruption.
     # SIGUSR1 = save checkpoint, keep training
@@ -166,28 +201,38 @@ def train(args):
         try:
             print("\n>>> atexit: saving emergency checkpoint <<<")
             actual_step = atexit_state["step"]
+            fname = interrupt_filename()
             save_checkpoint(model, optimizer, scheduler, scaler,
                             atexit_state["epoch"], global_step, best_val_loss,
-                            args.output_dir, "interrupt.pt", epoch_complete=False,
+                            args.output_dir, fname, epoch_complete=False,
                             epoch_step=actual_step, epoch_seed=atexit_state["epoch_seed"])
             print(f">>> atexit: saved at epoch {atexit_state['epoch']} batch {actual_step} <<<")
         except Exception as e:
             print(f">>> atexit: FAILED to save checkpoint: {e} <<<")
     atexit.register(atexit_save)
 
+    # Generate held-out validation data ONCE with a fixed seed.
+    # This ensures val is truly independent of training data across all epochs.
+    VAL_SEED = 7777777
+    generate_data(args.generator, args.data_dir, 0, n_val, args.stage, VAL_SEED, args.mix_pct)
+    print(f"Fixed validation set: {n_val} samples (seed {VAL_SEED}), reused every epoch")
+
     print(f"\nTraining for {args.epochs} epochs (ReduceLROnPlateau, patience={args.lr_patience})")
     print(f"Grad accumulation: {args.grad_accum}, effective batch: {args.batch_size * args.grad_accum}")
     print()
 
     for epoch in range(start_epoch, args.epochs + 1):
-        # Create train loader with deterministic seed for this epoch.
         epoch_seed = epoch * 1000 + 42
         start_index = 0
+
+        # Generate fresh training data for this epoch (val is fixed).
         if epoch == start_epoch and resume_epoch_step > 0:
             if resume_epoch_seed is not None:
                 epoch_seed = resume_epoch_seed
             start_index = resume_epoch_step
             print(f"Resuming epoch {epoch} from batch {start_index} (seed={epoch_seed})")
+        generate_data(args.generator, args.data_dir, n_train, 0, args.stage, epoch_seed, args.mix_pct)
+
         train_loader, epoch_seed = create_dataloader(
             data_dir=train_data_dir, shuffle=True,
             epoch_seed=epoch_seed, start_index=start_index, **dl_kwargs,
@@ -207,6 +252,11 @@ def train(args):
             tgt_in = batch["tgt_input"].to(device)
             tgt_labels = batch["tgt_labels"].to(device)
             src_mask = batch["src_key_padding_mask"].to(device)
+
+            if args.token_noise > 0:
+                tgt_in = corrupt_content_tokens(
+                    tgt_in, args.token_noise, args.structural_max_id, vocab_size, pad_id,
+                )
 
             with autocast("cuda", enabled=args.fp16):
                 logits = model(src, tgt_in, src_mask)
@@ -246,31 +296,37 @@ def train(args):
             if sig_state["save"]:
                 sig_state["save"] = False
                 actual_step = start_index + step + 1
+                fname = interrupt_filename()
                 save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss,
-                                args.output_dir, "interrupt.pt", epoch_complete=False,
+                                args.output_dir, fname, epoch_complete=False,
                                 epoch_step=actual_step, epoch_seed=epoch_seed)
-                print(f"\n>>> Checkpoint saved: epoch {epoch} batch {actual_step}/{n_batches_per_epoch} <<<")
+                print(f"\n>>> Checkpoint saved ({fname}): epoch {epoch} batch {actual_step}/{n_batches_per_epoch} <<<")
                 if sig_state["stop"]:
                     print("Exiting cleanly.")
                     return model
 
         avg_train_loss = train_loss / max(train_tokens, 1)
 
-        # Validate.
+        # Validate (fixed held-out val set, generated once before training).
+        val_loader, _ = create_dataloader(
+            data_dir=val_data_dir, shuffle=False, **dl_kwargs,
+        )
         val_loss, val_tokens, val_exact = validate(model, val_loader, criterion, vocab_size, device, args.fp16, sp)
         avg_val_loss = val_loss / max(val_tokens, 1)
-
-        # Step the plateau scheduler based on validation loss.
-        old_lr = optimizer.param_groups[0]["lr"]
-        scheduler.step(avg_val_loss)
-        new_lr = optimizer.param_groups[0]["lr"]
-        if new_lr < old_lr:
-            print(f"  LR reduced: {old_lr:.2e} -> {new_lr:.2e}")
 
         # Autoregressive eval on a handful of validation samples.
         ar_exact, ar_xml_ok, ar_total = autoregressive_eval(
             model, val_loader.dataset, sp, n_samples=args.ar_eval_samples, device=device,
         )
+
+        # Step the plateau scheduler based on AR error rate, not val loss.
+        # Val loss is near-zero with teacher forcing even when AR inference is bad.
+        ar_error = 1.0 - (ar_exact / max(ar_total, 1))
+        old_lr = optimizer.param_groups[0]["lr"]
+        scheduler.step(ar_error)
+        new_lr = optimizer.param_groups[0]["lr"]
+        if new_lr < old_lr:
+            print(f"  LR reduced: {old_lr:.2e} -> {new_lr:.2e}")
 
         log_entry = {
             "epoch": epoch,
@@ -300,10 +356,10 @@ def train(args):
         # Epoch complete — atexit not needed until next epoch starts.
         atexit_state["active"] = False
 
-        # Clean up interrupt checkpoint after successful epoch completion.
-        interrupt_path = os.path.join(args.output_dir, "interrupt.pt")
-        if os.path.exists(interrupt_path):
-            os.remove(interrupt_path)
+        # Clean up interrupt checkpoints after successful epoch completion.
+        for f in os.listdir(args.output_dir):
+            if f.startswith("interrupt_") and f.endswith(".pt"):
+                os.remove(os.path.join(args.output_dir, f))
 
         # Save training log.
         with open(os.path.join(args.output_dir, "training_log.json"), "w") as f:
@@ -347,6 +403,26 @@ def validate(model, loader, criterion, vocab_size, device, fp16, sp):
 
     exact_rate = exact_matches / max(total_samples, 1)
     return total_loss, total_tokens, exact_rate
+
+
+def corrupt_content_tokens(tgt_in, noise_prob, structural_max_id, vocab_size, pad_id):
+    """Replace content tokens in decoder input with random tokens.
+
+    Only content tokens (ID > structural_max_id) are candidates.
+    BOS (position 0) and padding are never touched.
+    """
+    content_mask = tgt_in > structural_max_id  # content tokens only
+    content_mask[:, 0] = False  # never corrupt BOS
+    content_mask &= tgt_in != pad_id  # never corrupt padding
+
+    noise_mask = torch.rand_like(tgt_in, dtype=torch.float) < noise_prob
+    replace_mask = content_mask & noise_mask
+
+    random_ids = torch.randint(
+        structural_max_id + 1, vocab_size, tgt_in.shape,
+        device=tgt_in.device, dtype=tgt_in.dtype,
+    )
+    return torch.where(replace_mask, random_ids, tgt_in)
 
 
 def weighted_content_loss(logits, tgt_labels, vocab_size, content_weight, structural_max_id):
@@ -411,6 +487,11 @@ def autoregressive_eval(model, dataset, sp, n_samples=10, device="cuda"):
     return exact_count, xml_ok_count, total
 
 
+def interrupt_filename():
+    """Timestamped interrupt checkpoint filename (never overwrites previous)."""
+    return f"interrupt_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pt"
+
+
 def save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, output_dir, filename, epoch_complete=True, epoch_step=0, epoch_seed=None):
     path = os.path.join(output_dir, filename)
     torch.save({
@@ -462,8 +543,20 @@ def main():
                              "Structural XML tokens (0..structural-max-id) stay at 1.0.")
     parser.add_argument("--structural-max-id", type=int, default=15,
                         help="Token IDs 0..N are considered structural (XML tags, special tokens)")
+    parser.add_argument("--token-noise", type=float, default=0.0,
+                        help="Probability of replacing a content token in decoder input with a random content token (0=off)")
 
-    # Data.
+    # Data generation.
+    parser.add_argument("--generator", type=str, default="/app/generate",
+                        help="Path to Go generator binary")
+    parser.add_argument("--stage", type=int, default=1,
+                        help="Curriculum stage for data generation (1-5)")
+    parser.add_argument("--train-samples", type=int, default=200000,
+                        help="Number of training samples to generate per epoch")
+    parser.add_argument("--mix-pct", type=float, default=10,
+                        help="Percentage of haiku corpus to mix per epoch (0-100)")
+    parser.add_argument("--val-samples", type=int, default=10000,
+                        help="Number of validation samples to generate per epoch")
     parser.add_argument("--max-src-len", type=int, default=2048)
     parser.add_argument("--max-tgt-len", type=int, default=4096)
     parser.add_argument("--num-workers", type=int, default=2)

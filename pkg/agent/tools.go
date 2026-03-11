@@ -18,7 +18,7 @@ package agent
 import (
 	"strings"
 
-	"nickandperla.net/transmutation/pkg/languages"
+	"nickandperla.net/transmutation/pkg/randtext"
 )
 
 // Argument structs use ordered struct fields for deterministic JSON output.
@@ -73,7 +73,7 @@ var simpleToolNames = []string{
 // Concatenates 2-4 snippets to produce realistically long code.
 func (g *Generator) codeTool() ToolCall {
 	name := g.pick(codeToolNames)
-	nSnippets := 4 + g.rng.IntN(4) // 4-7 snippets
+	nSnippets := 1 + g.rng.IntN(3) // 1-3 snippets
 
 	var args any
 	switch name {
@@ -125,16 +125,16 @@ func (g *Generator) simpleTool() ToolCall {
 	switch name {
 	case "search":
 		args = searchArgs{
-			Query: g.pick(topics),
+			Query: randtext.SearchQuery(g.rng),
 		}
 	case "read_file":
 		args = readFileArgs{
-			Path: languages.RandPath(g.rng),
+			Path: randtext.FilePath(g.rng),
 		}
 	case "write_file":
 		// Always use simpleAnswer for substantial content.
 		args = writeFileArgs{
-			Path:    languages.RandPath(g.rng),
+			Path:    randtext.FilePath(g.rng),
 			Content: g.simpleAnswer(),
 		}
 	case "http_request":
@@ -145,12 +145,12 @@ func (g *Generator) simpleTool() ToolCall {
 			nFields := 3 + g.rng.IntN(5) // 3-7 fields
 			fields := make([]string, nFields)
 			for i := range fields {
-				fields[i] = `"` + languages.VarName(g.rng) + `": "` + languages.VarName(g.rng) + `"`
+				fields[i] = `"` + randtext.Noun(g.rng) + `": "` + randtext.Noun(g.rng) + `"`
 			}
 			body = "{" + strings.Join(fields, ", ") + "}"
 		}
 		args = httpRequestArgs{
-			URL:    languages.RandURL(g.rng),
+			URL:    randtext.URL(g.rng),
 			Method: method,
 			Body:   body,
 		}

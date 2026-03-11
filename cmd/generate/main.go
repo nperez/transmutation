@@ -18,6 +18,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"encoding/xml"
 	"flag"
 	"fmt"
 	"io"
@@ -25,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -52,6 +54,8 @@ func main() {
 		seed       uint64
 		workers    int
 		toStdout   bool
+		wrapStdin  bool
+		mixDir     string
 	)
 	flag.IntVar(&trainCount, "train", 1000000, "number of training pairs")
 	flag.IntVar(&valCount, "val", 50000, "number of validation pairs")
@@ -60,11 +64,24 @@ func main() {
 	flag.IntVar(&workers, "workers", runtime.NumCPU(), "number of parallel workers")
 	flag.BoolVar(&toStdout, "stdout", false, "write JSONL to stdout instead of files")
 	flag.IntVar(&stage, "stage", 0, "curriculum stage (1-5); 0 = legacy random JSON")
+	flag.BoolVar(&wrapStdin, "wrap", false, "read JSON from stdin, convert to JSONL training pairs on stdout")
+	var mixPct float64
+	flag.StringVar(&mixDir, "mix", "", "directory of extra JSONL files to copy into train output")
+	flag.Float64Var(&mixPct, "mix-pct", 100, "percentage of mix lines to include (0-100)")
 	flag.Parse()
 
 	if stage < 0 || stage > 5 {
 		fmt.Fprintf(os.Stderr, "error: stage must be 0-5\n")
 		os.Exit(1)
+	}
+
+	// Wrap mode: read JSON objects from stdin, convert each to a training pair.
+	if wrapStdin {
+		if err := wrapFromStdin(); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	// Stdout mode: generate count pairs directly to stdout, no files.
@@ -94,15 +111,35 @@ func main() {
 	fmt.Printf("Generating %d train + %d val pairs (%s) with %d workers\n",
 		trainCount, valCount, stageLabel, workers)
 
-	start := time.Now()
-	generateSplit(filepath.Join(outDir, "train"), trainCount, seed, workers)
-	trainDur := time.Since(start)
-	fmt.Printf("Train: %d pairs in %s (%.0f pairs/sec)\n", trainCount, trainDur, float64(trainCount)/trainDur.Seconds())
+	var trainDur, valDur time.Duration
 
-	start = time.Now()
-	generateSplit(filepath.Join(outDir, "val"), valCount, seed+1000000, workers)
-	valDur := time.Since(start)
-	fmt.Printf("Val:   %d pairs in %s (%.0f pairs/sec)\n", valCount, valDur, float64(valCount)/valDur.Seconds())
+	if trainCount > 0 {
+		start := time.Now()
+		generateSplit(filepath.Join(outDir, "train"), trainCount, seed, workers)
+		trainDur = time.Since(start)
+		fmt.Printf("Train: %d pairs in %s (%.0f pairs/sec)\n", trainCount, trainDur, float64(trainCount)/trainDur.Seconds())
+
+		if mixDir != "" {
+			mixed := mixExtraData(mixDir, filepath.Join(outDir, "train"), mixPct, seed)
+			if mixed > 0 {
+				fmt.Printf("Mixed (train): %d extra pairs from %s (%.0f%%)\n", mixed, mixDir, mixPct)
+			}
+		}
+	}
+
+	if valCount > 0 {
+		start := time.Now()
+		generateSplit(filepath.Join(outDir, "val"), valCount, seed+1000000, workers)
+		valDur = time.Since(start)
+		fmt.Printf("Val:   %d pairs in %s (%.0f pairs/sec)\n", valCount, valDur, float64(valCount)/valDur.Seconds())
+
+		if mixDir != "" {
+			mixed := mixExtraData(mixDir, filepath.Join(outDir, "val"), mixPct, seed+2000000)
+			if mixed > 0 {
+				fmt.Printf("Mixed (val): %d extra pairs from %s (%.0f%%)\n", mixed, mixDir, mixPct)
+			}
+		}
+	}
 
 	fmt.Printf("Total: %s\n", trainDur+valDur)
 }
@@ -295,4 +332,193 @@ func randomCorruptionConfig(rng *rand.Rand) corrupt.Config {
 	default:
 		return corrupt.HeavyConfig()
 	}
+}
+
+// mixExtraData samples lines from JSONL files in srcDir and writes a single
+// mixed shard to dstDir. pct controls what percentage of lines to include
+// (0-100). seed ensures different samples each epoch.
+func mixExtraData(srcDir, dstDir string, pct float64, seed uint64) int {
+	entries, err := os.ReadDir(srcDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warn: cannot read mix dir %s: %v\n", srcDir, err)
+		return 0
+	}
+
+	// Collect all lines from all JSONL files.
+	var allLines []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(srcDir, e.Name()))
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			if line = strings.TrimSpace(line); line != "" {
+				allLines = append(allLines, line)
+			}
+		}
+	}
+
+	if len(allLines) == 0 {
+		return 0
+	}
+
+	// Sample lines.
+	rng := rand.New(rand.NewPCG(seed, seed^0xdeadbeef))
+	keep := int(float64(len(allLines)) * pct / 100)
+	if keep <= 0 {
+		return 0
+	}
+	if keep >= len(allLines) {
+		keep = len(allLines)
+	}
+
+	// Fisher-Yates shuffle, take first 'keep'.
+	for i := len(allLines) - 1; i > 0; i-- {
+		j := rng.IntN(i + 1)
+		allLines[i], allLines[j] = allLines[j], allLines[i]
+	}
+	sampled := allLines[:keep]
+
+	// Write single mixed shard.
+	dst := filepath.Join(dstDir, "mix_haiku.jsonl")
+	var b strings.Builder
+	for _, line := range sampled {
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	if err := os.WriteFile(dst, []byte(b.String()), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "warn: cannot write %s: %v\n", dst, err)
+		return 0
+	}
+	return keep
+}
+
+// wrapFromStdin reads JSON objects from stdin (one per line or as a stream),
+// validates each thoroughly, converts to XML, verifies XML validity,
+// and writes JSONL pairs to stdout. Rejects any sample that doesn't meet
+// quality gates.
+func wrapFromStdin() error {
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024) // 10MB max line
+	enc := json.NewEncoder(os.Stdout)
+
+	lineNum := 0
+	accepted := 0
+	rejected := 0
+
+	for scanner.Scan() {
+		lineNum++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		// Gate 1: valid JSON.
+		if !json.Valid([]byte(line)) {
+			fmt.Fprintf(os.Stderr, "REJECT line %d: invalid JSON\n", lineNum)
+			rejected++
+			continue
+		}
+
+		// Gate 2: must be a JSON object with expected schema fields.
+		var obj map[string]any
+		if err := json.Unmarshal([]byte(line), &obj); err != nil {
+			fmt.Fprintf(os.Stderr, "REJECT line %d: not a JSON object: %v\n", lineNum, err)
+			rejected++
+			continue
+		}
+
+		// Check required fields exist.
+		if _, ok := obj["thought"]; !ok {
+			fmt.Fprintf(os.Stderr, "REJECT line %d: missing 'thought' field\n", lineNum)
+			rejected++
+			continue
+		}
+		if _, ok := obj["memory"]; !ok {
+			fmt.Fprintf(os.Stderr, "REJECT line %d: missing 'memory' field\n", lineNum)
+			rejected++
+			continue
+		}
+
+		// Must have exactly one of answer/tool non-null.
+		answerNull := obj["answer"] == nil
+		toolNull := obj["tool"] == nil
+		if answerNull == toolNull {
+			fmt.Fprintf(os.Stderr, "REJECT line %d: need exactly one of answer/tool non-null (answer=%v, tool=%v)\n",
+				lineNum, !answerNull, !toolNull)
+			rejected++
+			continue
+		}
+
+		// thought must be a non-empty string.
+		thought, ok := obj["thought"].(string)
+		if !ok || len(thought) < 10 {
+			fmt.Fprintf(os.Stderr, "REJECT line %d: thought must be a string with 10+ chars\n", lineNum)
+			rejected++
+			continue
+		}
+
+		// memory must be a non-empty array.
+		mem, ok := obj["memory"].([]any)
+		if !ok || len(mem) < 1 {
+			fmt.Fprintf(os.Stderr, "REJECT line %d: memory must be a non-empty array\n", lineNum)
+			rejected++
+			continue
+		}
+
+		// Gate 3: pretty-print for consistent formatting.
+		pretty, err := json.MarshalIndent(obj, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "REJECT line %d: marshal error: %v\n", lineNum, err)
+			rejected++
+			continue
+		}
+
+		// Gate 4: convert to XML.
+		xmlOut, err := xmlconv.Convert(pretty)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "REJECT line %d: xmlconv error: %v\n", lineNum, err)
+			rejected++
+			continue
+		}
+
+		// Gate 5: verify XML is parseable.
+		xmlWrapped := "<root>" + xmlOut + "</root>"
+		decoder := xmlDecoder(xmlWrapped)
+		xmlValid := true
+		for {
+			_, err := decoder.Token()
+			if err != nil {
+				if err.Error() != "EOF" {
+					fmt.Fprintf(os.Stderr, "REJECT line %d: generated XML is not parseable: %v\n", lineNum, err)
+					xmlValid = false
+				}
+				break
+			}
+		}
+		if !xmlValid {
+			rejected++
+			continue
+		}
+
+		pair := TrainingPair{Input: string(pretty), Target: xmlOut}
+		if err := enc.Encode(pair); err != nil {
+			return fmt.Errorf("encode pair %d: %w", lineNum, err)
+		}
+		accepted++
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("reading stdin: %w", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "Wrap results: %d accepted, %d rejected out of %d lines\n", accepted, rejected, lineNum)
+	return nil
+}
+
+func xmlDecoder(s string) *xml.Decoder {
+	return xml.NewDecoder(strings.NewReader(s))
 }
