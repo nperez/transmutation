@@ -407,9 +407,36 @@ for e in entries[-5:]:
         "$PROJECT_DIR/scripts/gen_haiku.sh" "$N" "$PROJECT_DIR/data/haiku"
         ;;
 
+    haiku-split)
+        HAIKU_DIR="$PROJECT_DIR/data/haiku"
+        TRAIN_DIR="$PROJECT_DIR/data/haiku_train"
+        VAL_DIR="$PROJECT_DIR/data/haiku_val"
+
+        if [ ! -d "$HAIKU_DIR" ]; then
+            echo "Error: $HAIKU_DIR does not exist."
+            exit 1
+        fi
+
+        mkdir -p "$TRAIN_DIR" "$VAL_DIR"
+
+        # Concatenate all JSONL, sort for determinism, split 90/10 by line number.
+        TOTAL=$(cat "$HAIKU_DIR"/*.jsonl | wc -l)
+        VAL_COUNT=$(( TOTAL / 10 ))
+        TRAIN_COUNT=$(( TOTAL - VAL_COUNT ))
+
+        cat "$HAIKU_DIR"/*.jsonl | sort > "$PROJECT_DIR/tmp/haiku_sorted.jsonl"
+        head -n "$TRAIN_COUNT" "$PROJECT_DIR/tmp/haiku_sorted.jsonl" > "$TRAIN_DIR/haiku.jsonl"
+        tail -n "$VAL_COUNT" "$PROJECT_DIR/tmp/haiku_sorted.jsonl" > "$VAL_DIR/haiku.jsonl"
+        rm -f "$PROJECT_DIR/tmp/haiku_sorted.jsonl"
+
+        echo "Split $TOTAL haiku samples: $TRAIN_COUNT train, $VAL_COUNT val"
+        echo "  $TRAIN_DIR/haiku.jsonl"
+        echo "  $VAL_DIR/haiku.jsonl"
+        ;;
+
     haiku-clean)
         echo "Cleaning haiku corpus..."
-        rm -rf "$PROJECT_DIR/data/haiku"
+        rm -rf "$PROJECT_DIR/data/haiku" "$PROJECT_DIR/data/haiku_train" "$PROJECT_DIR/data/haiku_val"
         echo "Done."
         ;;
 
@@ -421,7 +448,7 @@ for e in entries[-5:]:
 
     clean-all)
         echo "Cleaning all data (train, val, haiku)..."
-        rm -rf "$PROJECT_DIR/data/train" "$PROJECT_DIR/data/val" "$PROJECT_DIR/data/haiku"
+        rm -rf "$PROJECT_DIR/data/train" "$PROJECT_DIR/data/val" "$PROJECT_DIR/data/haiku" "$PROJECT_DIR/data/haiku_train" "$PROJECT_DIR/data/haiku_val"
         echo "Done."
         ;;
 
@@ -443,7 +470,8 @@ Inference:
 
 Data:
   haiku-gen [N]     Generate N samples via Claude Haiku (default 100).
-  haiku-clean       Remove haiku corpus.
+  haiku-split       Split haiku corpus into train/val (90/10).
+  haiku-clean       Remove haiku corpus (all splits).
   clean-generated   Remove train/val data (preserves haiku).
   clean-all         Remove all data (train, val, haiku).
 

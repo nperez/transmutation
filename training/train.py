@@ -40,10 +40,11 @@ from infer_cpu import greedy_decode, patch_mamba_for_cpu
 from model import build_model
 
 
-def generate_data(generator_bin, data_dir, train_count, val_count, stage, seed, mix_pct=10):
+def generate_data(generator_bin, data_dir, train_count, val_count, stage, seed, mix_pct=10, mix_dir=None):
     """Call the Go generator to write training and/or validation data.
 
     Pass train_count=0 to skip train generation, val_count=0 to skip val.
+    mix_dir overrides the default haiku directory (data_dir/haiku).
     """
     cmd = [
         generator_bin,
@@ -54,10 +55,11 @@ def generate_data(generator_bin, data_dir, train_count, val_count, stage, seed, 
         "-seed", str(seed),
     ]
     # Mix in haiku corpus if it exists.
-    haiku_dir = os.path.join(data_dir, "haiku")
-    has_haiku = os.path.isdir(haiku_dir) and any(f.endswith(".jsonl") for f in os.listdir(haiku_dir))
+    if mix_dir is None:
+        mix_dir = os.path.join(data_dir, "haiku")
+    has_haiku = os.path.isdir(mix_dir) and any(f.endswith(".jsonl") for f in os.listdir(mix_dir))
     if has_haiku:
-        cmd.extend(["-mix", haiku_dir, "-mix-pct", str(mix_pct)])
+        cmd.extend(["-mix", mix_dir, "-mix-pct", str(mix_pct)])
 
     parts = []
     if train_count > 0:
@@ -217,10 +219,19 @@ def train(args):
             print(f">>> atexit: FAILED to save checkpoint: {e} <<<")
     atexit.register(atexit_save)
 
+    # Haiku split directories: train and val get separate pools to prevent leakage.
+    haiku_train_dir = os.path.join(args.data_dir, "haiku_train")
+    haiku_val_dir = os.path.join(args.data_dir, "haiku_val")
+    # Fall back to unsplit haiku/ if split dirs don't exist.
+    if not os.path.isdir(haiku_train_dir):
+        haiku_train_dir = os.path.join(args.data_dir, "haiku")
+    if not os.path.isdir(haiku_val_dir):
+        haiku_val_dir = os.path.join(args.data_dir, "haiku")
+
     # Generate held-out validation data ONCE at max stage with a fixed seed.
     # Val always at hardest stage so metrics are comparable across stage transitions.
     VAL_SEED = 7777777
-    generate_data(args.generator, args.data_dir, 0, n_val, args.max_stage, VAL_SEED, args.mix_pct)
+    generate_data(args.generator, args.data_dir, 0, n_val, args.max_stage, VAL_SEED, args.mix_pct, mix_dir=haiku_val_dir)
     print(f"Fixed validation set: {n_val} samples (stage {args.max_stage}, seed {VAL_SEED}), reused every epoch")
     print(f"Training stage: {current_stage} (auto-advance at AR>{args.stage_advance_ar:.0%} for {args.stage_patience} epochs, max={args.max_stage})")
 
@@ -238,7 +249,7 @@ def train(args):
                 epoch_seed = resume_epoch_seed
             start_index = resume_epoch_step
             print(f"Resuming epoch {epoch} from batch {start_index} (seed={epoch_seed})")
-        generate_data(args.generator, args.data_dir, n_train, 0, current_stage, epoch_seed, args.mix_pct)
+        generate_data(args.generator, args.data_dir, n_train, 0, current_stage, epoch_seed, args.mix_pct, mix_dir=haiku_train_dir)
 
         train_loader, epoch_seed = create_dataloader(
             data_dir=train_data_dir, shuffle=True,
