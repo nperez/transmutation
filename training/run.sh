@@ -171,8 +171,12 @@ case "${1:-help}" in
             --warmup-steps "$WARMUP" \
             --save-every 5 \
             --fp16 \
+            --max-stage 5 \
+            --stage-advance-ar 0.5 \
+            --stage-patience 3 \
             --content-weight 10.0 \
             --token-noise 0.15 \
+            --ar-eval-samples 50 \
             $RESUME_FLAG \
             "$@")
 
@@ -241,7 +245,8 @@ for f in sorted(os.listdir('models')):
     vl = c.get('best_val_loss', None)
     ec = c.get('epoch_complete', False)
     es = c.get('epoch_step', 0)
-    parts = [f'epoch={ep}', f'step={gs}']
+    stg = c.get('stage', '?')
+    parts = [f'epoch={ep}', f'step={gs}', f'stage={stg}']
     if vl is not None: parts.append(f'best_val={vl:.4f}')
     if not ec and es: parts.append(f'batch={es}')
     print(f'  {f:<40s} {sz_mb:.0f}MB  {\" \".join(parts)}')
@@ -316,20 +321,8 @@ for e in entries[-5:]:
         STAGE="${1:-3}"
         if [ -n "${1:-}" ]; then shift; fi
 
-        if [ -f "$PROJECT_DIR/models/best.pt" ]; then
-            CHECKPOINT="models/best.pt"
-        else
-            LATEST=$(ls -v "$PROJECT_DIR/models"/epoch_*.pt 2>/dev/null | tail -1 || true)
-            LATEST_INT=$(ls -t "$PROJECT_DIR/models"/interrupt_*.pt 2>/dev/null | head -1 || true)
-            if [ -n "$LATEST" ]; then
-                CHECKPOINT="models/$(basename "$LATEST")"
-            elif [ -n "$LATEST_INT" ]; then
-                CHECKPOINT="models/$(basename "$LATEST_INT")"
-            else
-                echo "Error: no checkpoint found."
-                exit 1
-            fi
-        fi
+        RESUME_CKPT=$(find_resume_flag | sed 's/--resume //')
+        CHECKPOINT="${RESUME_CKPT:-models/best.pt}"
 
         GEN_COUNT=$(( N_SAMPLES * 3 ))
         TMPFILE="$PROJECT_DIR/tmp/infer_input_$$.jsonl"

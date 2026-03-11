@@ -142,11 +142,14 @@ def train(args):
     # Training state.
     os.makedirs(args.output_dir, exist_ok=True)
     best_val_loss = float("inf")
+    best_ar_exact = 0
     log_entries = []
     global_step = 0
     start_epoch = 1
     resume_epoch_seed = None
     resume_epoch_step = 0
+    current_stage = args.stage
+    stage_good_epochs = 0  # consecutive epochs above stage-advance threshold
 
     # Resume from checkpoint.
     if args.resume and os.path.exists(args.resume):
@@ -164,6 +167,8 @@ def train(args):
         start_epoch = ckpt["epoch"] + 1 if completed_epoch else ckpt["epoch"]
         global_step = ckpt.get("global_step", 0)
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
+        current_stage = ckpt.get("stage", args.stage)
+        stage_good_epochs = ckpt.get("stage_good_epochs", 0)
         if not completed_epoch:
             resume_epoch_seed = ckpt.get("epoch_seed")
             resume_epoch_step = ckpt.get("epoch_step", 0)
@@ -175,7 +180,7 @@ def train(args):
         # Override optimizer LR with command-line value (allows fine-tuning at lower LR).
         for pg in optimizer.param_groups:
             pg["lr"] = args.lr
-        print(f"Resuming from epoch {start_epoch}, step {resume_epoch_step}, global_step={global_step}, best_val_loss={best_val_loss:.4f}, lr={args.lr}")
+        print(f"Resuming from epoch {start_epoch}, step {resume_epoch_step}, global_step={global_step}, best_val_loss={best_val_loss:.4f}, lr={args.lr}, stage={current_stage}")
 
     # Signal handling: preserve state on any interruption.
     # SIGUSR1 = save checkpoint, keep training
@@ -205,17 +210,19 @@ def train(args):
             save_checkpoint(model, optimizer, scheduler, scaler,
                             atexit_state["epoch"], global_step, best_val_loss,
                             args.output_dir, fname, epoch_complete=False,
-                            epoch_step=actual_step, epoch_seed=atexit_state["epoch_seed"])
+                            epoch_step=actual_step, epoch_seed=atexit_state["epoch_seed"],
+                            stage=current_stage, stage_good_epochs=stage_good_epochs)
             print(f">>> atexit: saved at epoch {atexit_state['epoch']} batch {actual_step} <<<")
         except Exception as e:
             print(f">>> atexit: FAILED to save checkpoint: {e} <<<")
     atexit.register(atexit_save)
 
-    # Generate held-out validation data ONCE with a fixed seed.
-    # This ensures val is truly independent of training data across all epochs.
+    # Generate held-out validation data ONCE at max stage with a fixed seed.
+    # Val always at hardest stage so metrics are comparable across stage transitions.
     VAL_SEED = 7777777
-    generate_data(args.generator, args.data_dir, 0, n_val, args.stage, VAL_SEED, args.mix_pct)
-    print(f"Fixed validation set: {n_val} samples (seed {VAL_SEED}), reused every epoch")
+    generate_data(args.generator, args.data_dir, 0, n_val, args.max_stage, VAL_SEED, args.mix_pct)
+    print(f"Fixed validation set: {n_val} samples (stage {args.max_stage}, seed {VAL_SEED}), reused every epoch")
+    print(f"Training stage: {current_stage} (auto-advance at AR>{args.stage_advance_ar:.0%} for {args.stage_patience} epochs, max={args.max_stage})")
 
     print(f"\nTraining for {args.epochs} epochs (ReduceLROnPlateau, patience={args.lr_patience})")
     print(f"Grad accumulation: {args.grad_accum}, effective batch: {args.batch_size * args.grad_accum}")
@@ -231,7 +238,7 @@ def train(args):
                 epoch_seed = resume_epoch_seed
             start_index = resume_epoch_step
             print(f"Resuming epoch {epoch} from batch {start_index} (seed={epoch_seed})")
-        generate_data(args.generator, args.data_dir, n_train, 0, args.stage, epoch_seed, args.mix_pct)
+        generate_data(args.generator, args.data_dir, n_train, 0, current_stage, epoch_seed, args.mix_pct)
 
         train_loader, epoch_seed = create_dataloader(
             data_dir=train_data_dir, shuffle=True,
@@ -299,8 +306,9 @@ def train(args):
                 fname = interrupt_filename()
                 save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss,
                                 args.output_dir, fname, epoch_complete=False,
-                                epoch_step=actual_step, epoch_seed=epoch_seed)
-                print(f"\n>>> Checkpoint saved ({fname}): epoch {epoch} batch {actual_step}/{n_batches_per_epoch} <<<")
+                                epoch_step=actual_step, epoch_seed=epoch_seed,
+                                stage=current_stage, stage_good_epochs=stage_good_epochs)
+                print(f"\n>>> Checkpoint saved ({fname}): epoch {epoch} batch {actual_step}/{n_batches_per_epoch} stage={current_stage} <<<")
                 if sig_state["stop"]:
                     print("Exiting cleanly.")
                     return model
@@ -328,8 +336,21 @@ def train(args):
         if new_lr < old_lr:
             print(f"  LR reduced: {old_lr:.2e} -> {new_lr:.2e}")
 
+        # Auto-advance curriculum stage.
+        ar_rate = ar_exact / max(ar_total, 1)
+        if current_stage < args.max_stage:
+            if ar_rate >= args.stage_advance_ar:
+                stage_good_epochs += 1
+            else:
+                stage_good_epochs = 0
+            if stage_good_epochs >= args.stage_patience:
+                current_stage += 1
+                stage_good_epochs = 0
+                print(f"  >>> Stage advanced to {current_stage} (AR={ar_rate:.0%} for {args.stage_patience} epochs)")
+
         log_entry = {
             "epoch": epoch,
+            "stage": current_stage,
             "train_loss": avg_train_loss,
             "val_loss": avg_val_loss,
             "val_exact_match": val_exact,
@@ -341,17 +362,20 @@ def train(args):
         }
         log_entries.append(log_entry)
 
-        print(f"Epoch {epoch}: train_loss={avg_train_loss:.4f} val_loss={avg_val_loss:.4f} val_exact={val_exact:.2%} ar={ar_exact}/{ar_total}exact {ar_xml_ok}/{ar_total}xml lr={new_lr:.2e}")
+        print(f"Epoch {epoch}: stage={current_stage} train_loss={avg_train_loss:.4f} val_loss={avg_val_loss:.4f} val_exact={val_exact:.2%} ar={ar_exact}/{ar_total}exact {ar_xml_ok}/{ar_total}xml lr={new_lr:.2e}")
 
-        # Save best.
-        if avg_val_loss < best_val_loss:
+        # Save best (by AR exact match, the only reliable metric).
+        if ar_exact > best_ar_exact or (ar_exact == best_ar_exact and avg_val_loss < best_val_loss):
+            best_ar_exact = ar_exact
             best_val_loss = avg_val_loss
-            save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, args.output_dir, "best.pt")
-            print(f"  -> New best model saved (val_loss={avg_val_loss:.4f})")
+            save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, args.output_dir, "best.pt",
+                            stage=current_stage, stage_good_epochs=stage_good_epochs)
+            print(f"  -> New best model saved (ar={ar_exact}/{ar_total} val_loss={avg_val_loss:.4f})")
 
         # Save periodic checkpoint.
         if epoch % args.save_every == 0:
-            save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, args.output_dir, f"epoch_{epoch}.pt")
+            save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, args.output_dir, f"epoch_{epoch}.pt",
+                            stage=current_stage, stage_good_epochs=stage_good_epochs)
 
         # Epoch complete — atexit not needed until next epoch starts.
         atexit_state["active"] = False
@@ -492,7 +516,7 @@ def interrupt_filename():
     return f"interrupt_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pt"
 
 
-def save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, output_dir, filename, epoch_complete=True, epoch_step=0, epoch_seed=None):
+def save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, output_dir, filename, epoch_complete=True, epoch_step=0, epoch_seed=None, stage=1, stage_good_epochs=0):
     path = os.path.join(output_dir, filename)
     torch.save({
         "epoch": epoch,
@@ -501,6 +525,8 @@ def save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, bes
         "epoch_seed": epoch_seed,
         "global_step": global_step,
         "best_val_loss": best_val_loss,
+        "stage": stage,
+        "stage_good_epochs": stage_good_epochs,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
@@ -550,7 +576,13 @@ def main():
     parser.add_argument("--generator", type=str, default="/app/generate",
                         help="Path to Go generator binary")
     parser.add_argument("--stage", type=int, default=1,
-                        help="Curriculum stage for data generation (1-5)")
+                        help="Starting curriculum stage for data generation (1-5)")
+    parser.add_argument("--max-stage", type=int, default=5,
+                        help="Maximum curriculum stage (auto-advance stops here)")
+    parser.add_argument("--stage-advance-ar", type=float, default=0.5,
+                        help="AR exact rate threshold to advance stage (0-1)")
+    parser.add_argument("--stage-patience", type=int, default=3,
+                        help="Consecutive epochs above threshold before advancing")
     parser.add_argument("--train-samples", type=int, default=200000,
                         help="Number of training samples to generate per epoch")
     parser.add_argument("--mix-pct", type=float, default=10,
