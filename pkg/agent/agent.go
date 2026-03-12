@@ -65,18 +65,21 @@ const (
 
 // Generator produces agent schema training data.
 type Generator struct {
-	rng   *rand.Rand
-	langs map[string]languages.Generator
-	stage Stage
+	rng     *rand.Rand
+	langs   map[string]languages.Generator
+	stage   Stage
+	augment bool
 }
 
 // NewGenerator creates an agent data generator for the given curriculum stage.
-func NewGenerator(rng *rand.Rand, stage Stage) *Generator {
+// When augment is true, text fields use randomized dictionary words and
+// shuffled content with special character injection to prevent memorization.
+func NewGenerator(rng *rand.Rand, stage Stage, augment bool) *Generator {
 	langMap := make(map[string]languages.Generator)
 	for _, g := range languages.All() {
 		langMap[g.Name()] = g
 	}
-	return &Generator{rng: rng, langs: langMap, stage: stage}
+	return &Generator{rng: rng, langs: langMap, stage: stage, augment: augment}
 }
 
 // Generate produces a clean JSON string and its target XML.

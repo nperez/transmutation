@@ -145,15 +145,17 @@ case "${1:-help}" in
         # Clean up stopped container with same name if present.
         docker rm "$CONTAINER_NAME" 2>/dev/null || true
 
-        RESUME_FLAG=$(find_resume_flag)
-        if [ -n "$RESUME_FLAG" ]; then
-            LR="1e-4"
-            WARMUP="500"
-            echo "Resuming: $RESUME_FLAG (lr=$LR, warmup=$WARMUP)"
+        # Skip auto-resume if user passed --resume explicitly.
+        if echo "$@" | grep -q -- '--resume'; then
+            RESUME_FLAG=""
+            echo "Using explicit --resume from args"
         else
-            LR="3e-4"
-            WARMUP="2000"
-            echo "Starting fresh training (lr=$LR, warmup=$WARMUP)"
+            RESUME_FLAG=$(find_resume_flag)
+            if [ -n "$RESUME_FLAG" ]; then
+                echo "Resuming: $RESUME_FLAG"
+            else
+                echo "Starting fresh training"
+            fi
         fi
 
         CID=$(run_gpu_detached training/train.py \
@@ -167,8 +169,8 @@ case "${1:-help}" in
             --epochs 100 \
             --train-samples 50000 \
             --val-samples 2500 \
-            --lr "$LR" \
-            --warmup-steps "$WARMUP" \
+            --lr 3e-4 \
+            --warmup-steps 2000 \
             --save-every 5 \
             --fp16 \
             --max-stage 5 \
@@ -176,6 +178,10 @@ case "${1:-help}" in
             --stage-patience 3 \
             --content-weight 10.0 \
             --token-noise 0.15 \
+            --professor-forcing \
+            --mix-pct 25 \
+            --mix-corrupt-pct 50 \
+            --augment-pct 75 \
             --ar-eval-samples 50 \
             $RESUME_FLAG \
             "$@")
@@ -304,8 +310,15 @@ for e in entries[-5:]:
             CKPT=$(find_resume_flag | sed 's/--resume //')
             CKPT="${CKPT:-models/best.pt}"
         fi
-        echo "Exporting $CKPT to ONNX..."
-        run_gpu training/export.py \
+        echo "Exporting $CKPT to ONNX (CPU)..."
+        # Run on CPU so export works while training holds the GPU.
+        docker run --rm \
+            -v "$PROJECT_DIR/data:/app/data:ro" \
+            -v "$PROJECT_DIR/models:/app/models" \
+            -v "$SCRIPT_DIR:/app/training:ro" \
+            -v "$PROJECT_DIR/tmp/generate:/app/generate:ro" \
+            "$TRAIN_IMAGE" \
+            training/export.py \
             --checkpoint "$CKPT" \
             --tokenizer models/tokenizer.model \
             --output-dir models/onnx
@@ -332,7 +345,8 @@ for e in entries[-5:]:
         "$GENERATE_BIN" -stage "$STAGE" -stdout -train "$GEN_COUNT" -val 0 -seed "$$" > "$TMPFILE"
 
         echo "CPU inference: $CHECKPOINT ($N_SAMPLES samples, stage $STAGE)..."
-        cat "$TMPFILE" | run_cpu_stdin training/infer_cpu.py "$CHECKPOINT" "$N_SAMPLES" "$@"
+        cat "$TMPFILE" | run_cpu_stdin training/infer_cpu.py "$CHECKPOINT" \
+            -n "$N_SAMPLES" "$@"
         ;;
 
     go-infer)
@@ -465,8 +479,10 @@ Training:
   status            Show checkpoints, metrics, container state.
 
 Inference:
-  infer [N] [stage]     CPU inference on N samples (default 10, stage 3).
-  go-infer [N] [stage]  Go ONNX inference on N samples (default 10, stage 3).
+  infer [N] [stage] [--beam-width K] [--length-penalty A]
+                        CPU inference on N samples (default 10, stage 3).
+  go-infer [N] [stage] [-beam-width K] [-length-penalty A]
+                        Go ONNX inference on N samples (default 10, stage 3).
 
 Data:
   haiku-gen [N]     Generate N samples via Claude Haiku (default 100).

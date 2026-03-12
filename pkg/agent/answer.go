@@ -29,7 +29,11 @@ func (g *Generator) simpleAnswer() string {
 	n := 10 + g.rng.IntN(16) // 10-25 sentences
 	parts := make([]string, n)
 	for i := range parts {
-		parts[i] = randtext.Sentence(g.rng)
+		if g.augment {
+			parts[i] = randtext.AugmentedSentence(g.rng)
+		} else {
+			parts[i] = randtext.Sentence(g.rng)
+		}
 	}
 	return strings.Join(parts, " ")
 }
@@ -49,11 +53,19 @@ func (g *Generator) markdownAnswer() string {
 		if i == 0 && g.rng.Float64() < 0.3 {
 			level = "#"
 		}
-		b.WriteString(level + " " + randtext.MarkdownHeader(g.rng) + "\n\n")
+		if g.augment {
+			b.WriteString(level + " " + randtext.AugmentedMarkdownHeader(g.rng) + "\n\n")
+		} else {
+			b.WriteString(level + " " + randtext.MarkdownHeader(g.rng) + "\n\n")
+		}
 
 		// Intro sentence.
 		if g.rng.Float64() < 0.7 {
-			b.WriteString(randtext.IntroSentence(g.rng) + "\n\n")
+			if g.augment {
+				b.WriteString(randtext.AugmentedIntroSentence(g.rng) + "\n\n")
+			} else {
+				b.WriteString(randtext.IntroSentence(g.rng) + "\n\n")
+			}
 		}
 
 		// Section body — pick a content type.
@@ -80,7 +92,11 @@ func (g *Generator) mdParagraph(b *strings.Builder) {
 		if i > 0 {
 			b.WriteByte(' ')
 		}
-		b.WriteString(randtext.Sentence(g.rng))
+		if g.augment {
+			b.WriteString(randtext.AugmentedSentence(g.rng))
+		} else {
+			b.WriteString(randtext.Sentence(g.rng))
+		}
 	}
 
 	// Maybe add inline code references.
@@ -120,14 +136,22 @@ func (g *Generator) mdCodeBlock(b *strings.Builder) {
 func (g *Generator) mdBulletList(b *strings.Builder) {
 	n := 3 + g.rng.IntN(4) // 3-6 items
 	for range n {
-		b.WriteString("- " + randtext.ListItem(g.rng) + "\n")
+		if g.augment {
+			b.WriteString("- " + randtext.AugmentedListItem(g.rng) + "\n")
+		} else {
+			b.WriteString("- " + randtext.ListItem(g.rng) + "\n")
+		}
 	}
 }
 
 func (g *Generator) mdNumberedList(b *strings.Builder) {
 	n := 3 + g.rng.IntN(4) // 3-6 items
 	for i := range n {
-		b.WriteString(fmt.Sprintf("%d. %s\n", i+1, randtext.ListItem(g.rng)))
+		if g.augment {
+			b.WriteString(fmt.Sprintf("%d. %s\n", i+1, randtext.AugmentedListItem(g.rng)))
+		} else {
+			b.WriteString(fmt.Sprintf("%d. %s\n", i+1, randtext.ListItem(g.rng)))
+		}
 	}
 }
 
@@ -150,7 +174,11 @@ func (g *Generator) mdTable(b *strings.Builder) {
 	for range numRows {
 		cells := make([]string, numCols)
 		for j := range cells {
-			cells[j] = randtext.TableCell(g.rng)
+			if g.augment {
+				cells[j] = randtext.AugmentedTableCell(g.rng)
+			} else {
+				cells[j] = randtext.TableCell(g.rng)
+			}
 		}
 		b.WriteString("| " + strings.Join(cells, " | ") + " |\n")
 	}

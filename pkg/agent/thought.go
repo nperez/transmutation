@@ -18,12 +18,21 @@ package agent
 import "nickandperla.net/transmutation/pkg/randtext"
 
 func (g *Generator) answerThought() string {
-	// 3-6 sentences of reasoning about a random topic.
+	if g.augment {
+		return randtext.AugmentedThought(g.rng, 3, 6)
+	}
 	return randtext.Thought(g.rng, 3, 6)
 }
 
 func (g *Generator) toolThought(toolName string) string {
-	// Start with a tool-specific reason, then elaborate.
+	if g.augment {
+		s := randtext.AugmentedSentence(g.rng)
+		nElab := 2 + g.rng.IntN(3)
+		for range nElab {
+			s += " " + randtext.AugmentedSentence(g.rng)
+		}
+		return s
+	}
 	s := randtext.ToolReason(g.rng, toolName)
 	nElab := 2 + g.rng.IntN(3)
 	for range nElab {

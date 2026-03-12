@@ -201,6 +201,126 @@ def greedy_decode(model, src_ids, sp, max_len=2048, device="cpu"):
     return tgt_ids[1:]
 
 
+def _decoder_step(model, x, layer_states, memory):
+    """Run one decoder step through all layers. x: (B, 1, d_model)."""
+    B = x.size(0)
+    mem = memory.expand(B, -1, -1) if memory.size(0) != B else memory
+
+    for layer, state in zip(model.decoder_layers, layer_states):
+        residual = x
+        x = layer.self_norm(x)
+        x = mamba_step_cpu(layer.self_mamba, x, state)
+        x = residual + x
+
+        residual = x
+        x = layer.cross_norm(x)
+        x, _ = layer.cross_attn(x, mem, mem)
+        x = residual + x
+
+        residual = x
+        x = layer.ff_norm(x)
+        x = layer.ff(x)
+        x = residual + x
+
+    x = model.decoder_norm(x)
+    return model.output_proj(x)[:, 0, :]  # (B, vocab)
+
+
+def beam_decode(model, src_ids, sp, max_len=2048, beam_width=3,
+                length_penalty=0.6, device="cpu"):
+    """Beam search decoding. Falls back to greedy when beam_width <= 1."""
+    if beam_width <= 1:
+        return greedy_decode(model, src_ids, sp, max_len=max_len, device=device)
+
+    bos_id = sp.bos_id()
+    eos_id = sp.eos_id()
+
+    with torch.no_grad():
+        src = torch.tensor([src_ids], dtype=torch.long, device=device)
+        memory = model.encode(src)  # (1, src_len, d_model)
+
+        # Start with a single beam (batch=1).
+        layer_states = []
+        for layer in model.decoder_layers:
+            layer_states.append(init_mamba_state(layer.self_mamba, 1, device))
+
+        scores = torch.zeros(1, device=device)  # (K,)
+        seqs = [[]]  # token lists, BOS excluded
+        completed = []  # (score, token_list)
+
+        current_token = torch.tensor([[bos_id]], dtype=torch.long, device=device)
+
+        for _ in range(max_len):
+            K = current_token.size(0)
+            x = model.embedding(current_token) * model.pos_scale  # (K, 1, d_model)
+            logits = _decoder_step(model, x, layer_states, memory)  # (K, vocab)
+            log_probs = F.log_softmax(logits, dim=-1)
+            vocab_size = log_probs.size(-1)
+
+            # Combined scores: (K, vocab)
+            combined = scores.unsqueeze(-1) + log_probs
+
+            # Top candidates across all beams.
+            flat = combined.view(-1)
+            n_candidates = min(beam_width * 2, flat.size(0))
+            topk_scores, topk_flat = flat.topk(n_candidates)
+
+            new_scores = []
+            new_seqs = []
+            parent_indices = []
+
+            for s, f in zip(topk_scores.tolist(), topk_flat.tolist()):
+                beam_idx = f // vocab_size
+                token_id = f % vocab_size
+
+                if token_id == eos_id:
+                    completed.append((s, list(seqs[beam_idx])))
+                elif len(new_scores) < beam_width:
+                    new_scores.append(s)
+                    new_seqs.append(seqs[beam_idx] + [token_id])
+                    parent_indices.append(beam_idx)
+
+            if not new_scores:
+                break
+
+            scores = torch.tensor(new_scores, device=device)
+            seqs = new_seqs
+
+            # Reindex Mamba states to match surviving beams.
+            idx = torch.tensor(parent_indices, dtype=torch.long, device=device)
+            for state in layer_states:
+                state["h"] = state["h"][idx].clone()
+                state["conv_buf"] = state["conv_buf"][idx].clone()
+
+            current_token = torch.tensor(
+                [[s[-1]] for s in seqs], dtype=torch.long, device=device,
+            )
+
+            # Early stop: no active beam can beat the best completed sequence
+            # (log-probs are non-positive, so active scores only decrease).
+            if completed:
+                best_completed = max(c[0] for c in completed)
+                best_active = scores.max().item()
+                if best_completed >= best_active:
+                    break
+
+        # Add remaining active beams as completed.
+        for s, seq in zip(scores.tolist(), seqs):
+            completed.append((s, seq))
+
+        if not completed:
+            return []
+
+        # Return best by length-normalized score.
+        def normed(score, length):
+            if length == 0 or length_penalty == 0:
+                return score
+            return score / length ** length_penalty
+
+        best = max(completed, key=lambda c: normed(c[0], len(c[1])))
+        return best[1]
+
+
 def load_model(checkpoint, device):
     sp = spm.SentencePieceProcessor()
     sp.load("models/tokenizer.model")
@@ -235,25 +355,41 @@ def read_records(sp, max_src_len):
 
 
 def main():
-    checkpoint = sys.argv[1] if len(sys.argv) > 1 else "models/epoch_1.pt"
-    n_samples = int(sys.argv[2]) if len(sys.argv) > 2 else 10
-    max_src_len = int(sys.argv[3]) if len(sys.argv) > 3 else 1536
+    import argparse
+    parser = argparse.ArgumentParser(description="CPU inference for transmutation model")
+    parser.add_argument("checkpoint", nargs="?", default="models/epoch_1.pt")
+    parser.add_argument("-n", type=int, default=10, help="number of samples")
+    parser.add_argument("--max-src-len", type=int, default=1536)
+    parser.add_argument("--beam-width", type=int, default=1,
+                        help="beam width (1 = greedy)")
+    parser.add_argument("--length-penalty", type=float, default=0.6,
+                        help="length normalization exponent for beam search")
+    args = parser.parse_args()
 
     device = torch.device("cpu")
-    model, sp = load_model(checkpoint, device)
+    model, sp = load_model(args.checkpoint, device)
+
+    if args.beam_width > 1:
+        print(f"Beam search: width={args.beam_width}, length_penalty={args.length_penalty}")
+    print()
 
     xml_ok_count = 0
     exact_count = 0
     total = 0
 
-    for i, rec in enumerate(read_records(sp, max_src_len)):
-        if i >= n_samples:
+    for i, rec in enumerate(read_records(sp, args.max_src_len)):
+        if i >= args.n:
             break
         total += 1
 
-        src_ids = sp.encode(rec["input"])[:max_src_len]
+        src_ids = sp.encode(rec["input"])[:args.max_src_len]
         t0 = time.monotonic()
-        pred_ids = greedy_decode(model, src_ids, sp, device=device)
+        if args.beam_width > 1:
+            pred_ids = beam_decode(model, src_ids, sp, device=device,
+                                   beam_width=args.beam_width,
+                                   length_penalty=args.length_penalty)
+        else:
+            pred_ids = greedy_decode(model, src_ids, sp, device=device)
         elapsed = time.monotonic() - t0
         pred = sp.decode(pred_ids)
         target = rec["target"]

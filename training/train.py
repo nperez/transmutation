@@ -40,11 +40,14 @@ from infer_cpu import greedy_decode, patch_mamba_for_cpu
 from model import build_model
 
 
-def generate_data(generator_bin, data_dir, train_count, val_count, stage, seed, mix_pct=10, mix_dir=None):
+def generate_data(generator_bin, data_dir, train_count, val_count, stage, seed,
+                   mix_pct=10, mix_dir=None, mix_corrupt_pct=0, augment_pct=0):
     """Call the Go generator to write training and/or validation data.
 
     Pass train_count=0 to skip train generation, val_count=0 to skip val.
     mix_dir overrides the default haiku directory (data_dir/haiku).
+    mix_corrupt_pct controls what % of mixed lines get corrupted in flight.
+    augment_pct controls what % of samples use augmented random content.
     """
     cmd = [
         generator_bin,
@@ -54,12 +57,16 @@ def generate_data(generator_bin, data_dir, train_count, val_count, stage, seed, 
         "-out", data_dir,
         "-seed", str(seed),
     ]
+    if augment_pct > 0:
+        cmd.extend(["-augment-pct", str(augment_pct)])
     # Mix in haiku corpus if it exists.
     if mix_dir is None:
         mix_dir = os.path.join(data_dir, "haiku")
     has_haiku = os.path.isdir(mix_dir) and any(f.endswith(".jsonl") for f in os.listdir(mix_dir))
     if has_haiku:
         cmd.extend(["-mix", mix_dir, "-mix-pct", str(mix_pct)])
+        if mix_corrupt_pct > 0:
+            cmd.extend(["-mix-corrupt-pct", str(mix_corrupt_pct)])
 
     parts = []
     if train_count > 0:
@@ -137,6 +144,8 @@ def train(args):
     use_content_weight = args.content_weight != 1.0
     if use_content_weight:
         print(f"Content weight: {args.content_weight}x (structural tokens 0-{args.structural_max_id} at 1.0x)")
+    if args.professor_forcing:
+        print(f"Professor forcing: ON (noise={args.token_noise}, using model predictions)")
 
     # Mixed precision.
     scaler = GradScaler("cuda", enabled=args.fp16)
@@ -179,10 +188,16 @@ def train(args):
         if os.path.exists(log_path):
             with open(log_path) as f:
                 log_entries = json.load(f)
-        # Override optimizer LR with command-line value (allows fine-tuning at lower LR).
-        for pg in optimizer.param_groups:
-            pg["lr"] = args.lr
-        print(f"Resuming from epoch {start_epoch}, step {resume_epoch_step}, global_step={global_step}, best_val_loss={best_val_loss:.4f}, lr={args.lr}, stage={current_stage}")
+        resumed_lr = optimizer.param_groups[0]["lr"]
+        if args.override_lr is not None:
+            for pg in optimizer.param_groups:
+                pg["lr"] = args.override_lr
+            # Reset scheduler so it doesn't immediately reduce the new LR.
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode="min", factor=0.5, patience=args.lr_patience)
+            print(f"Resuming from epoch {start_epoch}, step {resume_epoch_step}, global_step={global_step}, best_val_loss={best_val_loss:.4f}, lr={resumed_lr}→{args.override_lr} (override), stage={current_stage}")
+        else:
+            print(f"Resuming from epoch {start_epoch}, step {resume_epoch_step}, global_step={global_step}, best_val_loss={best_val_loss:.4f}, lr={resumed_lr}, stage={current_stage}")
 
     # Signal handling: preserve state on any interruption.
     # SIGUSR1 = save checkpoint, keep training
@@ -231,7 +246,8 @@ def train(args):
     # Generate held-out validation data ONCE at max stage with a fixed seed.
     # Val always at hardest stage so metrics are comparable across stage transitions.
     VAL_SEED = 7777777
-    generate_data(args.generator, args.data_dir, 0, n_val, args.max_stage, VAL_SEED, args.mix_pct, mix_dir=haiku_val_dir)
+    generate_data(args.generator, args.data_dir, 0, n_val, args.max_stage, VAL_SEED, args.mix_pct, mix_dir=haiku_val_dir,
+                  augment_pct=args.augment_pct)
     print(f"Fixed validation set: {n_val} samples (stage {args.max_stage}, seed {VAL_SEED}), reused every epoch")
     print(f"Training stage: {current_stage} (auto-advance at AR>{args.stage_advance_ar:.0%} for {args.stage_patience} epochs, max={args.max_stage})")
 
@@ -249,7 +265,9 @@ def train(args):
                 epoch_seed = resume_epoch_seed
             start_index = resume_epoch_step
             print(f"Resuming epoch {epoch} from batch {start_index} (seed={epoch_seed})")
-        generate_data(args.generator, args.data_dir, n_train, 0, current_stage, epoch_seed, args.mix_pct, mix_dir=haiku_train_dir)
+        generate_data(args.generator, args.data_dir, n_train, 0, current_stage, epoch_seed,
+                      args.mix_pct, mix_dir=haiku_train_dir, mix_corrupt_pct=args.mix_corrupt_pct,
+                      augment_pct=args.augment_pct)
 
         train_loader, epoch_seed = create_dataloader(
             data_dir=train_data_dir, shuffle=True,
@@ -272,9 +290,25 @@ def train(args):
             src_mask = batch["src_key_padding_mask"].to(device)
 
             if args.token_noise > 0:
-                tgt_in = corrupt_content_tokens(
-                    tgt_in, args.token_noise, args.structural_max_id, vocab_size, pad_id,
-                )
+                if args.professor_forcing:
+                    # Extra forward pass (no grad) to get model's own predictions.
+                    with torch.no_grad():
+                        with autocast("cuda", enabled=args.fp16):
+                            pf_logits = model(src, tgt_in, src_mask)
+                        # pf_logits[:, i] predicts target[i], which is tgt_in[:, i+1].
+                        # Shift right so replacement_ids aligns with tgt_in.
+                        pred_ids = pf_logits.argmax(dim=-1)
+                        replacement_ids = torch.cat(
+                            [tgt_in[:, :1], pred_ids[:, :-1]], dim=1,
+                        )
+                    tgt_in = corrupt_content_tokens(
+                        tgt_in, args.token_noise, args.structural_max_id,
+                        vocab_size, pad_id, replacement_ids=replacement_ids,
+                    )
+                else:
+                    tgt_in = corrupt_content_tokens(
+                        tgt_in, args.token_noise, args.structural_max_id, vocab_size, pad_id,
+                    )
 
             with autocast("cuda", enabled=args.fp16):
                 logits = model(src, tgt_in, src_mask)
@@ -333,9 +367,12 @@ def train(args):
         val_loss, val_tokens, val_exact = validate(model, val_loader, criterion, vocab_size, device, args.fp16, sp)
         avg_val_loss = val_loss / max(val_tokens, 1)
 
-        # Autoregressive eval on a handful of validation samples.
+        # Autoregressive eval on fresh augmented samples.
         ar_exact, ar_xml_ok, ar_total = autoregressive_eval(
-            model, val_loader.dataset, sp, n_samples=args.ar_eval_samples, device=device,
+            model, sp, n_samples=args.ar_eval_samples, device=device,
+            generator_bin=args.generator, stage=current_stage,
+            max_src_len=args.max_src_len, max_tgt_len=args.max_tgt_len,
+            output_dir=args.output_dir, epoch=epoch,
         )
 
         # Step the plateau scheduler based on AR error rate, not val loss.
@@ -440,11 +477,14 @@ def validate(model, loader, criterion, vocab_size, device, fp16, sp):
     return total_loss, total_tokens, exact_rate
 
 
-def corrupt_content_tokens(tgt_in, noise_prob, structural_max_id, vocab_size, pad_id):
-    """Replace content tokens in decoder input with random tokens.
+def corrupt_content_tokens(tgt_in, noise_prob, structural_max_id, vocab_size, pad_id,
+                           replacement_ids=None):
+    """Replace content tokens in decoder input with noise tokens.
 
     Only content tokens (ID > structural_max_id) are candidates.
     BOS (position 0) and padding are never touched.
+    If replacement_ids is provided (professor forcing), use those instead of
+    uniform random tokens.
     """
     content_mask = tgt_in > structural_max_id  # content tokens only
     content_mask[:, 0] = False  # never corrupt BOS
@@ -453,11 +493,12 @@ def corrupt_content_tokens(tgt_in, noise_prob, structural_max_id, vocab_size, pa
     noise_mask = torch.rand_like(tgt_in, dtype=torch.float) < noise_prob
     replace_mask = content_mask & noise_mask
 
-    random_ids = torch.randint(
-        structural_max_id + 1, vocab_size, tgt_in.shape,
-        device=tgt_in.device, dtype=tgt_in.dtype,
-    )
-    return torch.where(replace_mask, random_ids, tgt_in)
+    if replacement_ids is None:
+        replacement_ids = torch.randint(
+            structural_max_id + 1, vocab_size, tgt_in.shape,
+            device=tgt_in.device, dtype=tgt_in.dtype,
+        )
+    return torch.where(replace_mask, replacement_ids, tgt_in)
 
 
 def weighted_content_loss(logits, tgt_labels, vocab_size, content_weight, structural_max_id):
@@ -480,9 +521,33 @@ def weighted_content_loss(logits, tgt_labels, vocab_size, content_weight, struct
 
 
 @torch.no_grad()
-def autoregressive_eval(model, dataset, sp, n_samples=10, device="cuda"):
-    """Run greedy autoregressive decoding on a few validation samples."""
+def autoregressive_eval(model, sp, n_samples=10, device="cuda",
+                        generator_bin="/app/generate", stage=5,
+                        max_src_len=2048, max_tgt_len=4096,
+                        output_dir=None, epoch=0):
+    """Run greedy autoregressive decoding on fresh augmented samples.
+
+    If output_dir is set, writes per-sample results to
+    output_dir/ar_inferences/epoch_N.jsonl for failure analysis.
+    """
     model.eval()
+
+    # Generate fresh augmented samples via the Go binary.
+    seed = int(time.time()) % 2**32
+    cmd = [
+        generator_bin,
+        "-stage", str(stage),
+        "-train", str(n_samples),
+        "-val", "0",
+        "-stdout",
+        "-seed", str(seed),
+        "-augment-pct", "100",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    records = []
+    for line in result.stdout.strip().split("\n"):
+        if line.strip():
+            records.append(json.loads(line))
 
     # Copy model to CPU for autoregressive decoding (Mamba CUDA kernels
     # don't support single-step mode, but the CPU forward pass does).
@@ -493,13 +558,13 @@ def autoregressive_eval(model, dataset, sp, n_samples=10, device="cuda"):
     exact_count = 0
     xml_ok_count = 0
     total = 0
+    inferences = []
 
-    for i in range(min(n_samples, len(dataset))):
-        record = dataset.records[i]
-        src_ids = sp.encode(record["input"])[:dataset.max_src_len]
+    for record in records[:n_samples]:
+        src_ids = sp.encode(record["input"])[:max_src_len]
         target = record["target"]
 
-        pred_ids = greedy_decode(cpu_model, src_ids, sp, max_len=dataset.max_tgt_len, device="cpu")
+        pred_ids = greedy_decode(cpu_model, src_ids, sp, max_len=max_tgt_len, device="cpu")
         pred = sp.decode(pred_ids)
 
         norm_pred = re.sub(r"\s+", " ", pred.strip())
@@ -509,7 +574,7 @@ def autoregressive_eval(model, dataset, sp, n_samples=10, device="cuda"):
         try:
             ET.fromstring(pred.strip())
             xml_ok = True
-        except ET.ParseError:
+        except ET.ParseError as e:
             xml_ok = False
 
         if exact:
@@ -517,6 +582,23 @@ def autoregressive_eval(model, dataset, sp, n_samples=10, device="cuda"):
         if xml_ok:
             xml_ok_count += 1
         total += 1
+
+        inferences.append({
+            "input": record["input"],
+            "expected": target,
+            "predicted": pred,
+            "exact": exact,
+            "xml_ok": xml_ok,
+        })
+
+    # Write inference log.
+    if output_dir:
+        ar_dir = os.path.join(output_dir, "ar_inferences")
+        os.makedirs(ar_dir, exist_ok=True)
+        ar_path = os.path.join(ar_dir, f"epoch_{epoch}.jsonl")
+        with open(ar_path, "w") as f:
+            for inf in inferences:
+                f.write(json.dumps(inf) + "\n")
 
     del cpu_model
     return exact_count, xml_ok_count, total
@@ -563,6 +645,8 @@ def main():
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--override-lr", type=float, default=None,
+                        help="Force this LR on resume (resets scheduler)")
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-steps", type=int, default=1000)
     parser.add_argument("--lr-patience", type=int, default=2,
@@ -582,6 +666,8 @@ def main():
                         help="Token IDs 0..N are considered structural (XML tags, special tokens)")
     parser.add_argument("--token-noise", type=float, default=0.0,
                         help="Probability of replacing a content token in decoder input with a random content token (0=off)")
+    parser.add_argument("--professor-forcing", action="store_true", default=False,
+                        help="Use model predictions instead of random tokens for noise (requires --token-noise > 0)")
 
     # Data generation.
     parser.add_argument("--generator", type=str, default="/app/generate",
@@ -598,6 +684,10 @@ def main():
                         help="Number of training samples to generate per epoch")
     parser.add_argument("--mix-pct", type=float, default=10,
                         help="Percentage of haiku corpus to mix per epoch (0-100)")
+    parser.add_argument("--mix-corrupt-pct", type=float, default=0,
+                        help="Percentage of mixed haiku lines to corrupt in flight (0-100)")
+    parser.add_argument("--augment-pct", type=float, default=0,
+                        help="Percentage of samples using augmented random content (0-100)")
     parser.add_argument("--val-samples", type=int, default=10000,
                         help="Number of validation samples to generate per epoch")
     parser.add_argument("--max-src-len", type=int, default=2048)

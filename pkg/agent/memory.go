@@ -21,7 +21,11 @@ func (g *Generator) generateMemory() []string {
 	n := 4 + g.rng.IntN(3) // 4-6 entries
 	entries := make([]string, n)
 	for i := range entries {
-		entries[i] = randtext.MemoryEntry(g.rng)
+		if g.augment {
+			entries[i] = randtext.AugmentedMemoryEntry(g.rng)
+		} else {
+			entries[i] = randtext.MemoryEntry(g.rng)
+		}
 	}
 	return entries
 }

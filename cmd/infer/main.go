@@ -27,6 +27,7 @@ import (
 	"os"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -53,6 +54,8 @@ func main() {
 		dInner        int
 		dState        int
 		dConv         int
+		beamWidth     int
+		lengthPenalty float64
 	)
 	flag.StringVar(&encoderPath, "encoder", "models/onnx/encoder.onnx", "path to encoder ONNX")
 	flag.StringVar(&decoderPath, "decoder", "models/onnx/decoder.onnx", "path to decoder ONNX")
@@ -65,6 +68,8 @@ func main() {
 	flag.IntVar(&dInner, "d-inner", 768, "Mamba d_inner (d_model * expand)")
 	flag.IntVar(&dState, "d-state", 16, "Mamba d_state")
 	flag.IntVar(&dConv, "d-conv", 4, "Mamba d_conv")
+	flag.IntVar(&beamWidth, "beam-width", 1, "beam width (1 = greedy)")
+	flag.Float64Var(&lengthPenalty, "length-penalty", 0.6, "length normalization exponent for beam search")
 	flag.Parse()
 
 	// Initialize tokenizer.
@@ -124,6 +129,9 @@ func main() {
 	defer decSession.Destroy()
 
 	fmt.Println("ONNX sessions loaded")
+	if beamWidth > 1 {
+		fmt.Printf("Beam search: width=%d, length_penalty=%.2f\n", beamWidth, lengthPenalty)
+	}
 
 	// Read and process samples from stdin.
 	scanner := bufio.NewScanner(os.Stdin)
@@ -168,8 +176,15 @@ func main() {
 			continue
 		}
 
-		// Decode (greedy, single-step autoregressive).
-		predIDs, err := greedyDecode(decSession, allK, allV, bosID, eosID, maxTgtLen, nLayers, dInner, dState, dConv)
+		// Decode (greedy or beam search).
+		var predIDs []int64
+		if beamWidth > 1 {
+			predIDs, err = beamDecode(decSession, allK, allV, bosID, eosID,
+				maxTgtLen, nLayers, dInner, dState, dConv, beamWidth, lengthPenalty)
+		} else {
+			predIDs, err = greedyDecode(decSession, allK, allV, bosID, eosID,
+				maxTgtLen, nLayers, dInner, dState, dConv)
+		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "decoder error: %v\n", err)
 			continue
@@ -345,6 +360,235 @@ func argmax(data []float32) int {
 		}
 	}
 	return maxIdx
+}
+
+func logSoftmax(logits []float32) []float64 {
+	max := float64(logits[0])
+	for _, v := range logits[1:] {
+		if float64(v) > max {
+			max = float64(v)
+		}
+	}
+	var sumExp float64
+	for _, v := range logits {
+		sumExp += math.Exp(float64(v) - max)
+	}
+	logSumExp := max + math.Log(sumExp)
+
+	out := make([]float64, len(logits))
+	for i, v := range logits {
+		out[i] = float64(v) - logSumExp
+	}
+	return out
+}
+
+// topKIndices returns the indices of the k largest values in data.
+func topKIndices(data []float64, k int) []int {
+	type iv struct {
+		idx int
+		val float64
+	}
+	items := make([]iv, len(data))
+	for i, v := range data {
+		items[i] = iv{i, v}
+	}
+	sort.Slice(items, func(a, b int) bool { return items[a].val > items[b].val })
+	if k > len(items) {
+		k = len(items)
+	}
+	out := make([]int, k)
+	for i := 0; i < k; i++ {
+		out[i] = items[i].idx
+	}
+	return out
+}
+
+type beamState struct {
+	score    float64
+	ids      []int64
+	hData    []float32
+	convData []float32
+}
+
+// beamDecode runs beam search decoding. Each beam runs a separate ONNX
+// decoder step since the exported model has batch=1.
+func beamDecode(
+	session *ort.DynamicAdvancedSession,
+	allK, allV *ort.Tensor[float32],
+	bosID, eosID int64,
+	maxLen, nLayers, dInner, dState, dConv, beamWidth int,
+	lengthPenalty float64,
+) ([]int64, error) {
+	hSize := nLayers * dInner * dState
+	convSize := nLayers * dInner * (dConv - 1)
+
+	// Reusable tensors for single-beam decoder steps.
+	tokenData := []int64{bosID}
+	tokenTensor, err := ort.NewTensor(ort.NewShape(1, 1), tokenData)
+	if err != nil {
+		return nil, fmt.Errorf("create token tensor: %w", err)
+	}
+	defer tokenTensor.Destroy()
+
+	hBuf := make([]float32, hSize)
+	hTensor, err := ort.NewTensor(
+		ort.NewShape(int64(nLayers), int64(dInner), int64(dState)), hBuf,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create h tensor: %w", err)
+	}
+	defer hTensor.Destroy()
+
+	convBuf := make([]float32, convSize)
+	convTensor, err := ort.NewTensor(
+		ort.NewShape(int64(nLayers), int64(dInner), int64(dConv-1)), convBuf,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create conv tensor: %w", err)
+	}
+	defer convTensor.Destroy()
+
+	// Start with a single beam.
+	active := []*beamState{{
+		score:    0,
+		ids:      nil,
+		hData:    make([]float32, hSize),
+		convData: make([]float32, convSize),
+	}}
+	var completed []*beamState
+
+	type candidate struct {
+		score     float64
+		parentIdx int
+		tokenID   int
+	}
+
+	for step := range maxLen {
+		var candidates []candidate
+
+		for bi, b := range active {
+			// Load this beam's state into the reusable tensors.
+			copy(hTensor.GetData(), b.hData)
+			copy(convTensor.GetData(), b.convData)
+
+			// Token: BOS on first step, last token otherwise.
+			if step == 0 {
+				tokenTensor.GetData()[0] = bosID
+			} else {
+				tokenTensor.GetData()[0] = b.ids[len(b.ids)-1]
+			}
+
+			// Run one decoder step.
+			outputs := []ort.Value{nil, nil, nil}
+			if err := session.Run(
+				[]ort.Value{tokenTensor, allK, allV, hTensor, convTensor},
+				outputs,
+			); err != nil {
+				return nil, fmt.Errorf("decoder run (beam %d, step %d): %w", bi, step, err)
+			}
+
+			// Extract logits and compute log-softmax.
+			logitsTensor, ok := outputs[0].(*ort.Tensor[float32])
+			if !ok {
+				return nil, fmt.Errorf("unexpected logits type")
+			}
+			logProbs := logSoftmax(logitsTensor.GetData())
+			logitsTensor.Destroy()
+
+			// Save updated state back to beam.
+			hOut, ok := outputs[1].(*ort.Tensor[float32])
+			if !ok {
+				return nil, fmt.Errorf("unexpected h_out type")
+			}
+			copy(b.hData, hOut.GetData())
+			hOut.Destroy()
+
+			convOut, ok := outputs[2].(*ort.Tensor[float32])
+			if !ok {
+				return nil, fmt.Errorf("unexpected conv_out type")
+			}
+			copy(b.convData, convOut.GetData())
+			convOut.Destroy()
+
+			// Top-K tokens from this beam.
+			topK := topKIndices(logProbs, beamWidth)
+			for _, idx := range topK {
+				candidates = append(candidates, candidate{
+					score:     b.score + logProbs[idx],
+					parentIdx: bi,
+					tokenID:   idx,
+				})
+			}
+		}
+
+		// Sort candidates by score (descending).
+		sort.Slice(candidates, func(i, j int) bool {
+			return candidates[i].score > candidates[j].score
+		})
+
+		// Select top beamWidth non-EOS candidates.
+		var newActive []*beamState
+		for _, c := range candidates {
+			parent := active[c.parentIdx]
+			if int64(c.tokenID) == eosID {
+				completed = append(completed, &beamState{
+					score: c.score,
+					ids:   append([]int64(nil), parent.ids...),
+				})
+			} else if len(newActive) < beamWidth {
+				newActive = append(newActive, &beamState{
+					score:    c.score,
+					ids:      append(append([]int64(nil), parent.ids...), int64(c.tokenID)),
+					hData:    append([]float32(nil), parent.hData...),
+					convData: append([]float32(nil), parent.convData...),
+				})
+			}
+		}
+
+		active = newActive
+		if len(active) == 0 {
+			break
+		}
+
+		// Early stop: best completed raw score >= best active raw score.
+		// Active scores can only decrease (log-probs are non-positive).
+		if len(completed) > 0 {
+			bestCompleted := completed[0].score
+			for _, c := range completed[1:] {
+				if c.score > bestCompleted {
+					bestCompleted = c.score
+				}
+			}
+			if bestCompleted >= active[0].score {
+				break
+			}
+		}
+	}
+
+	// Add remaining active beams.
+	for _, b := range active {
+		completed = append(completed, b)
+	}
+
+	if len(completed) == 0 {
+		return nil, nil
+	}
+
+	// Return best by length-normalized score.
+	var bestIdx int
+	bestScore := math.Inf(-1)
+	for i, c := range completed {
+		length := float64(len(c.ids))
+		if length == 0 {
+			length = 1
+		}
+		normed := c.score / math.Pow(length, lengthPenalty)
+		if normed > bestScore {
+			bestScore = normed
+			bestIdx = i
+		}
+	}
+	return completed[bestIdx].ids, nil
 }
 
 func isValidXML(s string) bool {

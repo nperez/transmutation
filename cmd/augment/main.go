@@ -1,0 +1,259 @@
+// Copyright (C) 2026 Nicholas Perez
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"encoding/xml"
+	"flag"
+	"fmt"
+	"math/rand/v2"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"nickandperla.net/transmutation/pkg/randtext"
+	"nickandperla.net/transmutation/pkg/xmlconv"
+)
+
+type TrainingPair struct {
+	Input  string `json:"input"`
+	Target string `json:"target"`
+}
+
+var specialProb float64
+
+func main() {
+	var (
+		haikuDir  string
+		samplePct float64
+		augRatio  int
+		seed      uint64
+		isVal     bool
+	)
+
+	flag.StringVar(&haikuDir, "dir", "data/haiku", "haiku JSONL directory")
+	flag.Float64Var(&samplePct, "sample-pct", 5, "percentage of corpus to sample (0-100)")
+	flag.IntVar(&augRatio, "aug-ratio", 10, "augmented variants per natural sample")
+	flag.Uint64Var(&seed, "seed", 42, "random seed")
+	flag.BoolVar(&isVal, "val", false, "generate val split (uses offset seed, disjoint from train)")
+	flag.Float64Var(&specialProb, "special-prob", 0.15, "probability of XML special char injection per word boundary (0-1)")
+	flag.Parse()
+
+	samples, err := loadHaiku(haikuDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error loading haiku: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Fprintf(os.Stderr, "Loaded %d haiku samples\n", len(samples))
+
+	// Deterministic shuffle of indices — same seed always gives same order.
+	// Val uses offset seed so train and val sample disjoint subsets.
+	sampSeed := seed
+	if isVal {
+		sampSeed = seed + 7777777
+	}
+	rng := rand.New(rand.NewPCG(sampSeed, sampSeed^0xdeadbeef))
+
+	indices := make([]int, len(samples))
+	for i := range indices {
+		indices[i] = i
+	}
+	rng.Shuffle(len(indices), func(i, j int) {
+		indices[i], indices[j] = indices[j], indices[i]
+	})
+
+	keep := int(float64(len(samples)) * samplePct / 100)
+	if keep <= 0 {
+		fmt.Fprintf(os.Stderr, "error: sample-pct=%.1f would keep 0 of %d samples\n", samplePct, len(samples))
+		os.Exit(1)
+	}
+	if keep > len(samples) {
+		keep = len(samples)
+	}
+
+	selected := indices[:keep]
+
+	bw := bufio.NewWriterSize(os.Stdout, 256*1024)
+	defer bw.Flush()
+	enc := json.NewEncoder(bw)
+
+	natural := 0
+	augmented := 0
+	augFailed := 0
+
+	for _, idx := range selected {
+		sample := samples[idx]
+
+		// Emit the natural (unmodified) sample.
+		enc.Encode(sample)
+		natural++
+
+		// Emit augRatio augmented variants.
+		for v := range augRatio {
+			augSeed := seed + uint64(idx)*uint64(augRatio+1) + uint64(v) + 1
+			augRng := rand.New(rand.NewPCG(augSeed, augSeed^0xcafebabe))
+
+			aug, err := augmentSample(sample, augRng)
+			if err != nil {
+				augFailed++
+				continue
+			}
+			enc.Encode(aug)
+			augmented++
+		}
+	}
+
+	bw.Flush()
+
+	split := "train"
+	if isVal {
+		split = "val"
+	}
+	fmt.Fprintf(os.Stderr, "Haiku augment (%s): %d natural + %d augmented = %d total (sampled %d = %.1f%% of %d",
+		split, natural, augmented, natural+augmented, keep, samplePct, len(samples))
+	if augFailed > 0 {
+		fmt.Fprintf(os.Stderr, ", %d augment failures", augFailed)
+	}
+	fmt.Fprintf(os.Stderr, ")\n")
+}
+
+func loadHaiku(dir string) ([]TrainingPair, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("readdir %s: %w", dir, err)
+	}
+
+	var all []TrainingPair
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		f, err := os.Open(filepath.Join(dir, e.Name()))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warn: skip %s: %v\n", e.Name(), err)
+			continue
+		}
+		scanner := bufio.NewScanner(f)
+		scanner.Buffer(make([]byte, 0, 512*1024), 10*1024*1024)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
+			}
+			var pair TrainingPair
+			if err := json.Unmarshal([]byte(line), &pair); err != nil {
+				continue
+			}
+			if pair.Input == "" || pair.Target == "" {
+				continue
+			}
+			all = append(all, pair)
+		}
+		f.Close()
+	}
+
+	if len(all) == 0 {
+		return nil, fmt.Errorf("no valid samples found in %s", dir)
+	}
+	return all, nil
+}
+
+// augmentSample takes a natural haiku sample, replaces all string values
+// with augmented content (dict words or shuffled + special char injection),
+// then regenerates XML from the modified JSON.
+func augmentSample(sample TrainingPair, rng *rand.Rand) (TrainingPair, error) {
+	var obj any
+	if err := json.Unmarshal([]byte(sample.Input), &obj); err != nil {
+		return TrainingPair{}, fmt.Errorf("parse input: %w", err)
+	}
+
+	augmentValues(obj, rng)
+
+	pretty, err := json.MarshalIndent(obj, "", "  ")
+	if err != nil {
+		return TrainingPair{}, fmt.Errorf("marshal: %w", err)
+	}
+
+	xmlOut, err := xmlconv.Convert(pretty)
+	if err != nil {
+		return TrainingPair{}, fmt.Errorf("xmlconv: %w", err)
+	}
+
+	// Verify the XML is parseable.
+	dec := xml.NewDecoder(strings.NewReader("<root>" + xmlOut + "</root>"))
+	for {
+		_, err := dec.Token()
+		if err != nil {
+			if err.Error() == "EOF" {
+				break
+			}
+			return TrainingPair{}, fmt.Errorf("invalid xml: %w", err)
+		}
+	}
+
+	return TrainingPair{Input: string(pretty), Target: xmlOut}, nil
+}
+
+// augmentValues recursively walks a parsed JSON value and replaces all
+// string values with augmented content. Keys are preserved.
+func augmentValues(v any, rng *rand.Rand) {
+	switch val := v.(type) {
+	case map[string]any:
+		for k, child := range val {
+			if s, ok := child.(string); ok {
+				val[k] = augmentString(s, rng)
+			} else {
+				augmentValues(child, rng)
+			}
+		}
+	case []any:
+		for i, child := range val {
+			if s, ok := child.(string); ok {
+				val[i] = augmentString(s, rng)
+			} else {
+				augmentValues(child, rng)
+			}
+		}
+	}
+}
+
+// augmentString replaces a string value with either dictionary words or
+// shuffled words from the original, both with XML special char injection
+// at the configured specialProb rate.
+func augmentString(s string, rng *rand.Rand) string {
+	words := strings.Fields(s)
+	n := len(words)
+	if n == 0 {
+		n = 1 + rng.IntN(3)
+	}
+
+	if rng.Float64() < 0.5 {
+		// Dictionary words.
+		newWords := make([]string, n)
+		for i := range newWords {
+			newWords[i] = randtext.DictWord(rng)
+		}
+		return randtext.InjectSpecialChars(rng, strings.Join(newWords, " "), specialProb)
+	}
+
+	// Shuffle original words + inject special chars.
+	rng.Shuffle(len(words), func(i, j int) {
+		words[i], words[j] = words[j], words[i]
+	})
+	return randtext.InjectSpecialChars(rng, strings.Join(words, " "), specialProb)
+}

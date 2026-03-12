@@ -27,7 +27,7 @@ func TestGenerateAllStages(t *testing.T) {
 	for stage := StageSimple; stage <= StageWrapper; stage++ {
 		for seed := range uint64(50) {
 			rng := rand.New(rand.NewPCG(seed, seed+1))
-			gen := NewGenerator(rng, stage)
+			gen := NewGenerator(rng, stage, false)
 			cleanJSON, xmlOut := gen.Generate()
 
 			// JSON must be valid.
@@ -79,7 +79,7 @@ func TestStageContentDistribution(t *testing.T) {
 	// Stage 1 should only produce answers (no tools).
 	for seed := range uint64(100) {
 		rng := rand.New(rand.NewPCG(seed, seed+1))
-		gen := NewGenerator(rng, StageSimple)
+		gen := NewGenerator(rng, StageSimple, false)
 		cleanJSON, _ := gen.Generate()
 
 		var obj map[string]any
@@ -94,7 +94,7 @@ func TestStageContentDistribution(t *testing.T) {
 	toolCount := 0
 	for seed := range uint64(200) {
 		rng := rand.New(rand.NewPCG(seed, seed+1))
-		gen := NewGenerator(rng, StageTools)
+		gen := NewGenerator(rng, StageTools, false)
 		cleanJSON, _ := gen.Generate()
 
 		var obj map[string]any
@@ -109,5 +109,35 @@ func TestStageContentDistribution(t *testing.T) {
 	}
 	if toolCount < 50 {
 		t.Errorf("stage 2: only %d tool calls across 200 seeds (expected ~120)", toolCount)
+	}
+}
+
+func TestAugmentedGeneration(t *testing.T) {
+	// Augmented samples must produce valid JSON and XML across all stages.
+	for stage := StageSimple; stage <= StageWrapper; stage++ {
+		for seed := range uint64(50) {
+			rng := rand.New(rand.NewPCG(seed, seed+1))
+			gen := NewGenerator(rng, stage, true)
+			cleanJSON, xmlOut := gen.Generate()
+
+			var raw any
+			if err := json.Unmarshal([]byte(cleanJSON), &raw); err != nil {
+				t.Errorf("augmented stage %d seed %d: invalid JSON: %v\nJSON:\n%s", stage, seed, err, cleanJSON)
+				continue
+			}
+
+			wrapped := "<root>" + xmlOut + "</root>"
+			decoder := xml.NewDecoder(strings.NewReader(wrapped))
+			for {
+				_, err := decoder.Token()
+				if err != nil {
+					if err.Error() == "EOF" {
+						break
+					}
+					t.Errorf("augmented stage %d seed %d: invalid XML: %v\nXML:\n%s", stage, seed, err, xmlOut)
+					break
+				}
+			}
+		}
 	}
 }

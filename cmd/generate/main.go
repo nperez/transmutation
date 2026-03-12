@@ -45,6 +45,7 @@ type TrainingPair struct {
 }
 
 var stage int
+var augmentPct float64
 
 func main() {
 	var (
@@ -66,9 +67,14 @@ func main() {
 	flag.IntVar(&stage, "stage", 0, "curriculum stage (1-5); 0 = legacy random JSON")
 	flag.BoolVar(&wrapStdin, "wrap", false, "read JSON from stdin, convert to JSONL training pairs on stdout")
 	var mixPct float64
+	var mixCorruptPct float64
+	var augmentPctFlag float64
 	flag.StringVar(&mixDir, "mix", "", "directory of extra JSONL files to copy into train output")
 	flag.Float64Var(&mixPct, "mix-pct", 100, "percentage of mix lines to include (0-100)")
+	flag.Float64Var(&mixCorruptPct, "mix-corrupt-pct", 0, "percentage of mixed lines to corrupt in flight (0-100)")
+	flag.Float64Var(&augmentPctFlag, "augment-pct", 0, "percentage of samples using augmented random content (0-100)")
 	flag.Parse()
+	augmentPct = augmentPctFlag
 
 	if stage < 0 || stage > 5 {
 		fmt.Fprintf(os.Stderr, "error: stage must be 0-5\n")
@@ -120,9 +126,13 @@ func main() {
 		fmt.Printf("Train: %d pairs in %s (%.0f pairs/sec)\n", trainCount, trainDur, float64(trainCount)/trainDur.Seconds())
 
 		if mixDir != "" {
-			mixed := mixExtraData(mixDir, filepath.Join(outDir, "train"), mixPct, seed)
+			mixed, corrupted := mixExtraData(mixDir, filepath.Join(outDir, "train"), mixPct, seed, mixCorruptPct)
 			if mixed > 0 {
-				fmt.Printf("Mixed (train): %d extra pairs from %s (%.0f%%)\n", mixed, mixDir, mixPct)
+				corruptLabel := ""
+				if corrupted > 0 {
+					corruptLabel = fmt.Sprintf(", %d corrupted", corrupted)
+				}
+				fmt.Printf("Mixed (train): %d extra pairs from %s (%.0f%%%s)\n", mixed, mixDir, mixPct, corruptLabel)
 			}
 		}
 	}
@@ -134,7 +144,7 @@ func main() {
 		fmt.Printf("Val:   %d pairs in %s (%.0f pairs/sec)\n", valCount, valDur, float64(valCount)/valDur.Seconds())
 
 		if mixDir != "" {
-			mixed := mixExtraData(mixDir, filepath.Join(outDir, "val"), mixPct, seed+2000000)
+			mixed, _ := mixExtraData(mixDir, filepath.Join(outDir, "val"), mixPct, seed+2000000, 0)
 			if mixed > 0 {
 				fmt.Printf("Mixed (val): %d extra pairs from %s (%.0f%%)\n", mixed, mixDir, mixPct)
 			}
@@ -225,7 +235,8 @@ func generateToWriter(w io.Writer, count int, baseSeed uint64, generated *atomic
 
 // generateAgentPair produces a training pair using the agent response schema.
 func generateAgentPair(rng *rand.Rand) TrainingPair {
-	gen := agent.NewGenerator(rng, agent.Stage(stage))
+	augment := augmentPct > 0 && rng.Float64()*100 < augmentPct
+	gen := agent.NewGenerator(rng, agent.Stage(stage), augment)
 	cleanJSON, xmlOut := gen.Generate()
 
 	corrCfg := stageCorruptionConfig(rng)
@@ -336,12 +347,14 @@ func randomCorruptionConfig(rng *rand.Rand) corrupt.Config {
 
 // mixExtraData samples lines from JSONL files in srcDir and writes a single
 // mixed shard to dstDir. pct controls what percentage of lines to include
-// (0-100). seed ensures different samples each epoch.
-func mixExtraData(srcDir, dstDir string, pct float64, seed uint64) int {
+// (0-100). corruptPct controls what percentage of included lines get
+// randomly corrupted in flight (0-100). seed ensures different samples each epoch.
+// Returns (lines written, lines corrupted).
+func mixExtraData(srcDir, dstDir string, pct float64, seed uint64, corruptPct float64) (int, int) {
 	entries, err := os.ReadDir(srcDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warn: cannot read mix dir %s: %v\n", srcDir, err)
-		return 0
+		return 0, 0
 	}
 
 	// Collect all lines from all JSONL files.
@@ -362,14 +375,14 @@ func mixExtraData(srcDir, dstDir string, pct float64, seed uint64) int {
 	}
 
 	if len(allLines) == 0 {
-		return 0
+		return 0, 0
 	}
 
 	// Sample lines.
 	rng := rand.New(rand.NewPCG(seed, seed^0xdeadbeef))
 	keep := int(float64(len(allLines)) * pct / 100)
 	if keep <= 0 {
-		return 0
+		return 0, 0
 	}
 	if keep >= len(allLines) {
 		keep = len(allLines)
@@ -382,18 +395,60 @@ func mixExtraData(srcDir, dstDir string, pct float64, seed uint64) int {
 	}
 	sampled := allLines[:keep]
 
-	// Write single mixed shard.
+	// Write single mixed shard, optionally corrupting some lines.
 	dst := filepath.Join(dstDir, "mix_haiku.jsonl")
 	var b strings.Builder
+	corrupted := 0
 	for _, line := range sampled {
+		if corruptPct > 0 && rng.Float64()*100 < corruptPct {
+			if out, ok := corruptMixLine(line, rng); ok {
+				line = out
+				corrupted++
+			}
+		}
 		b.WriteString(line)
 		b.WriteByte('\n')
 	}
 	if err := os.WriteFile(dst, []byte(b.String()), 0o644); err != nil {
 		fmt.Fprintf(os.Stderr, "warn: cannot write %s: %v\n", dst, err)
-		return 0
+		return 0, 0
 	}
-	return keep
+	return keep, corrupted
+}
+
+// corruptMixLine takes a JSONL line (a TrainingPair), applies random
+// corruption to the Input field, and returns the re-serialized line.
+func corruptMixLine(line string, rng *rand.Rand) (string, bool) {
+	var pair TrainingPair
+	if err := json.Unmarshal([]byte(line), &pair); err != nil {
+		return "", false
+	}
+	cfg := mixCorruptionConfig(rng)
+	pair.Input = corrupt.Apply(pair.Input, cfg, rng)
+	out, err := json.Marshal(pair)
+	if err != nil {
+		return "", false
+	}
+	return string(out), true
+}
+
+// mixCorruptionConfig returns a corruption config for haiku mix lines.
+// More aggressive than stage 5 (which is 90% clean) since the caller
+// already controls what percentage of lines get corrupted.
+func mixCorruptionConfig(rng *rand.Rand) corrupt.Config {
+	r := rng.Float64()
+	switch {
+	case r < 0.40:
+		return corrupt.SubtleConfig()
+	case r < 0.75:
+		return corrupt.LightConfig()
+	case r < 0.90:
+		cfg := corrupt.LightConfig()
+		cfg.WrapperProb = 1.0
+		return cfg
+	default:
+		return corrupt.MediumConfig()
+	}
 }
 
 // wrapFromStdin reads JSON objects from stdin (one per line or as a stream),

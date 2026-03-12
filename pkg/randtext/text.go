@@ -103,7 +103,7 @@ func VerbPhrase(rng *rand.Rand) string {
 // and lexically unique sentence from compositional generation.
 func Sentence(rng *rand.Rand) string {
 	var s string
-	switch rng.IntN(20) {
+	switch rng.IntN(25) {
 	case 0:
 		s = fmt.Sprintf("The %s %s the %s %s.",
 			pick(rng, nouns), pick(rng, verbs), pick(rng, adjectives), pick(rng, nouns))
@@ -176,6 +176,25 @@ func Sentence(rng *rand.Rand) string {
 		s = fmt.Sprintf("The %s reported %s %s %s the last %s.",
 			pick(rng, nouns), pick(rng, quantities), pick(rng, nouns)+"s",
 			pick(rng, prepositions), pick(rng, nouns))
+	case 20:
+		s = fmt.Sprintf("Filter where %s > %s && %s < %s for the %s.",
+			pick(rng, nouns), pick(rng, quantities),
+			pick(rng, nouns), pick(rng, quantities), pick(rng, nouns))
+	case 21:
+		s = fmt.Sprintf("The %s's %s shouldn't exceed the %s's %s.",
+			pick(rng, nouns), pick(rng, nouns),
+			pick(rng, nouns), pick(rng, nouns))
+	case 22:
+		s = fmt.Sprintf("Check if %s >= %s before the %s %s.",
+			pick(rng, nouns), pick(rng, quantities),
+			pick(rng, nouns), pick(rng, verbs)+"s")
+	case 23:
+		s = fmt.Sprintf("The <%s> element wraps the %s & %s fields.",
+			pick(rng, nouns), pick(rng, nouns), pick(rng, nouns))
+	case 24:
+		s = fmt.Sprintf("Use the %s->%s pattern when %s isn't %s.",
+			pick(rng, nouns), pick(rng, nouns),
+			pick(rng, nouns), pick(rng, adjectives))
 	}
 	return s
 }
@@ -217,7 +236,7 @@ func ListItem(rng *rand.Rand) string {
 
 // MemoryEntry generates a random context memory statement.
 func MemoryEntry(rng *rand.Rand) string {
-	switch rng.IntN(12) {
+	switch rng.IntN(18) {
 	case 0:
 		return fmt.Sprintf("User prefers %s for %s. Established during %s discussion.",
 			TechName(rng), Topic(rng), Topic(rng))
@@ -252,6 +271,21 @@ func MemoryEntry(rng *rand.Rand) string {
 	case 10:
 		return fmt.Sprintf("Previous %s caused a %s outage. Root cause was %s %s.",
 			Noun(rng), Quantity(rng), Adjective(rng), Noun(rng))
+	case 12:
+		return fmt.Sprintf("Threshold rule: if %s > %s && %s < %s, trigger %s.",
+			Noun(rng), Quantity(rng), Noun(rng), Quantity(rng), Noun(rng))
+	case 13:
+		return fmt.Sprintf("The %s's %s config shouldn't be modified during %s.",
+			Noun(rng), Noun(rng), Noun(rng))
+	case 14:
+		return fmt.Sprintf("Alert condition: %s >= %s || %s <= %s. Notify %s team.",
+			Noun(rng), Quantity(rng), Noun(rng), Quantity(rng), Noun(rng))
+	case 15:
+		return fmt.Sprintf("Pipeline uses <%s> & <%s> tags for %s encoding.",
+			Noun(rng), Noun(rng), Adjective(rng))
+	case 16:
+		return fmt.Sprintf("The %s->%s mapping is %s. Don't change without %s approval.",
+			Noun(rng), Noun(rng), Adjective(rng), Noun(rng))
 	default:
 		return fmt.Sprintf("The %s %s uses %s. Do not change without updating %s.",
 			Noun(rng), Noun(rng), TechName(rng), Noun(rng))
@@ -329,7 +363,7 @@ func TableCell(rng *rand.Rand) string {
 
 // ToolReason generates a random reason for using a tool.
 func ToolReason(rng *rand.Rand, toolName string) string {
-	switch rng.IntN(6) {
+	switch rng.IntN(8) {
 	case 0:
 		return fmt.Sprintf("I need to %s the %s to find the relevant %s.",
 			Verb(rng), Noun(rng), Noun(rng))
@@ -345,9 +379,16 @@ func ToolReason(rng *rand.Rand, toolName string) string {
 	case 4:
 		return fmt.Sprintf("A %s would be the best way to %s this %s.",
 			toolName, Verb(rng), Noun(rng))
-	default:
+	case 6:
 		return fmt.Sprintf("To %s the %s, I need to %s the %s first.",
 			Verb(rng), Noun(rng), Verb(rng), Noun(rng))
+	case 7:
+		return fmt.Sprintf("The %s's %s > %s, so I should %s before it %s.",
+			Noun(rng), Noun(rng), Quantity(rng),
+			VerbPhrase(rng), Verb(rng)+"s")
+	default:
+		return fmt.Sprintf("I need to check if %s < %s && %s the %s.",
+			Noun(rng), Quantity(rng), Verb(rng), Noun(rng))
 	}
 }
 
