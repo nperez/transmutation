@@ -41,11 +41,12 @@ var corruptPct float64
 
 func main() {
 	var (
-		haikuDir  string
-		samplePct float64
-		augRatio  int
-		seed      uint64
-		isVal     bool
+		haikuDir   string
+		samplePct  float64
+		augRatio   int
+		seed       uint64
+		isVal      bool
+		sampleType string
 	)
 
 	flag.StringVar(&haikuDir, "dir", "data/haiku", "haiku JSONL directory")
@@ -55,9 +56,10 @@ func main() {
 	flag.BoolVar(&isVal, "val", false, "generate val split (uses offset seed, disjoint from train)")
 	flag.Float64Var(&specialProb, "special-prob", 0.15, "probability of XML special char injection per word boundary (0-1)")
 	flag.Float64Var(&corruptPct, "corrupt-pct", 0, "percentage of samples to corrupt input JSON (0-100)")
+	flag.StringVar(&sampleType, "type", "all", "sample type filter: answer, tool, or all")
 	flag.Parse()
 
-	samples, err := loadHaiku(haikuDir)
+	samples, err := loadHaiku(haikuDir, sampleType)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error loading haiku: %v\n", err)
 		os.Exit(1)
@@ -156,7 +158,21 @@ func main() {
 	fmt.Fprintf(os.Stderr, ")\n")
 }
 
-func loadHaiku(dir string) ([]TrainingPair, error) {
+// isToolSample checks if a haiku input JSON contains a non-null tool field.
+func isToolSample(input string) bool {
+	// Parse the input JSON to check the tool field.
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(input), &obj); err != nil {
+		return false
+	}
+	raw, ok := obj["tool"]
+	if !ok {
+		return false
+	}
+	return string(raw) != "null"
+}
+
+func loadHaiku(dir string, sampleType string) ([]TrainingPair, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("readdir %s: %w", dir, err)
@@ -186,13 +202,23 @@ func loadHaiku(dir string) ([]TrainingPair, error) {
 			if pair.Input == "" || pair.Target == "" {
 				continue
 			}
+			// Filter by type.
+			if sampleType != "all" {
+				isTool := isToolSample(pair.Input)
+				if sampleType == "answer" && isTool {
+					continue
+				}
+				if sampleType == "tool" && !isTool {
+					continue
+				}
+			}
 			all = append(all, pair)
 		}
 		f.Close()
 	}
 
 	if len(all) == 0 {
-		return nil, fmt.Errorf("no valid samples found in %s", dir)
+		return nil, fmt.Errorf("no valid %s samples found in %s", sampleType, dir)
 	}
 	return all, nil
 }

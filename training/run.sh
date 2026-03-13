@@ -22,6 +22,21 @@ TRAIN_IMAGE="transmutation-train"
 INFER_IMAGE="transmutation-infer"
 CONTAINER_NAME="transmutation-train"
 
+# ── Current run ──────────────────────────────────────────────────────────────
+# Each run gets its own directory under models/ (checkpoints, tokenizer, ONNX,
+# training log, AR inferences). Override with TRANSMUTATION_RUN=runN.
+if [ -n "${TRANSMUTATION_RUN:-}" ]; then
+    RUN="$TRANSMUTATION_RUN"
+else
+    # Auto-detect: highest numbered models/runN directory.
+    RUN=$(for d in "$PROJECT_DIR/models"/run*/; do basename "$d"; done 2>/dev/null | sort -V | tail -1)
+    if [ -z "$RUN" ]; then
+        echo "Error: no run directories found in models/. Set TRANSMUTATION_RUN=runN" >&2
+        exit 1
+    fi
+fi
+RUN_DIR="models/$RUN"
+
 # ── Wheels ───────────────────────────────────────────────────────────────────
 
 WHEELS_DIR="$SCRIPT_DIR/wheels"
@@ -127,13 +142,13 @@ find_train_container() {
 find_resume_flag() {
     # Find the most recent checkpoint of any type by modification time.
     local latest
-    latest=$(ls -t "$PROJECT_DIR/models"/interrupt_*.pt \
-                    "$PROJECT_DIR/models"/interrupt.pt \
-                    "$PROJECT_DIR/models"/best.pt \
-                    "$PROJECT_DIR/models"/epoch_*.pt \
+    latest=$(ls -t "$PROJECT_DIR/$RUN_DIR"/interrupt_*.pt \
+                    "$PROJECT_DIR/$RUN_DIR"/interrupt.pt \
+                    "$PROJECT_DIR/$RUN_DIR"/best.pt \
+                    "$PROJECT_DIR/$RUN_DIR"/epoch_*.pt \
                     2>/dev/null | head -1 || true)
     if [ -n "$latest" ]; then
-        echo "--resume models/$(basename "$latest")"
+        echo "--resume $RUN_DIR/$(basename "$latest")"
     fi
 }
 
@@ -170,10 +185,12 @@ case "${1:-help}" in
             fi
         fi
 
+        mkdir -p "$PROJECT_DIR/$RUN_DIR"
+        echo "Run: $RUN ($RUN_DIR)"
         CID=$(run_gpu_detached training/train.py \
             --data-dir data \
-            --tokenizer models/tokenizer.model \
-            --output-dir models \
+            --tokenizer "$RUN_DIR/tokenizer.model" \
+            --output-dir "$RUN_DIR" \
             --augment-bin /app/augment \
             --batch-size 2 \
             --grad-accum 16 \
@@ -185,7 +202,7 @@ case "${1:-help}" in
             --save-every 5 \
             --fp16 \
             --stage 1 \
-            --max-stage 5 \
+            --max-stage 6 \
             --stage-advance-ar 0.7 \
             --stage-patience 2 \
             --content-weight 10.0 \
@@ -244,15 +261,18 @@ case "${1:-help}" in
         ;;
 
     status)
+        echo "=== Run: $RUN ($RUN_DIR) ==="
+        echo
         echo "=== Checkpoints ==="
-        if ls "$PROJECT_DIR/models"/*.pt 1>/dev/null 2>&1; then
+        if ls "$PROJECT_DIR/$RUN_DIR"/*.pt 1>/dev/null 2>&1; then
             docker run --rm \
                 -v "$PROJECT_DIR/models:/app/models:ro" \
                 "$TRAIN_IMAGE" -c "
 import torch, os
-for f in sorted(os.listdir('models')):
+run_dir = '$RUN_DIR'
+for f in sorted(os.listdir(run_dir)):
     if not f.endswith('.pt'): continue
-    path = os.path.join('models', f)
+    path = os.path.join(run_dir, f)
     sz_mb = os.path.getsize(path) / 1024 / 1024
     c = torch.load(path, map_location='cpu', weights_only=True)
     ep = c.get('epoch', '?')
@@ -271,13 +291,13 @@ for f in sorted(os.listdir('models')):
         fi
         echo
         echo "=== ONNX Models ==="
-        ls -lh "$PROJECT_DIR/models/onnx"/*.onnx 2>/dev/null || echo "  (none)"
+        ls -lh "$PROJECT_DIR/$RUN_DIR/onnx"/*.onnx 2>/dev/null || echo "  (none)"
         echo
         echo "=== Training Log ==="
-        if [ -f "$PROJECT_DIR/models/training_log.json" ]; then
+        if [ -f "$PROJECT_DIR/$RUN_DIR/training_log.json" ]; then
             python3 -c "
 import json, sys
-entries = json.load(open('$PROJECT_DIR/models/training_log.json'))
+entries = json.load(open('$PROJECT_DIR/$RUN_DIR/training_log.json'))
 for e in entries[-5:]:
     ar = f\"ar={e.get('ar_exact','?')}/{e.get('ar_total','?')}exact {e.get('ar_xml_ok','?')}/{e.get('ar_total','?')}xml\" if 'ar_total' in e else ''
     print(f\"  epoch={e['epoch']} train={e['train_loss']:.4f} val={e['val_loss']:.4f} exact={e.get('val_exact_match',0):.1%} {ar} lr={e['lr']:.2e}\")
@@ -312,10 +332,11 @@ for e in entries[-5:]:
         "$AUGMENT_BIN" -dir "$PROJECT_DIR/data/haiku" \
             -sample-pct 10 -aug-ratio 5 -special-prob 0.30 -seed 42 -val \
             > "$PROJECT_DIR/data/val/haiku_augmented.jsonl"
-        echo "Training tokenizer on haiku corpus..."
+        mkdir -p "$PROJECT_DIR/$RUN_DIR"
+        echo "Training tokenizer on haiku corpus (-> $RUN_DIR)..."
         run_gpu training/tokenizer_train.py \
             --data-dir data \
-            --output-dir models \
+            --output-dir "$RUN_DIR" \
             --vocab-size 8000
         ;;
 
@@ -326,7 +347,7 @@ for e in entries[-5:]:
             CKPT="$1"
         else
             CKPT=$(find_resume_flag | sed 's/--resume //')
-            CKPT="${CKPT:-models/best.pt}"
+            CKPT="${CKPT:-$RUN_DIR/best.pt}"
         fi
         echo "Exporting $CKPT to ONNX (CPU)..."
         # Run on CPU so export works while training holds the GPU.
@@ -338,8 +359,8 @@ for e in entries[-5:]:
             "$TRAIN_IMAGE" \
             training/export.py \
             --checkpoint "$CKPT" \
-            --tokenizer models/tokenizer.model \
-            --output-dir models/onnx
+            --tokenizer "$RUN_DIR/tokenizer.model" \
+            --output-dir "$RUN_DIR/onnx"
         ;;
 
     infer)
@@ -353,7 +374,7 @@ for e in entries[-5:]:
         if [ -n "${1:-}" ]; then shift; fi
 
         RESUME_CKPT=$(find_resume_flag | sed 's/--resume //')
-        CHECKPOINT="${RESUME_CKPT:-models/best.pt}"
+        CHECKPOINT="${RESUME_CKPT:-$RUN_DIR/best.pt}"
 
         GEN_COUNT=$(( N_SAMPLES * 3 ))
         TMPFILE="$PROJECT_DIR/tmp/infer_input_$$.jsonl"
@@ -391,9 +412,9 @@ for e in entries[-5:]:
             --entrypoint sh \
             "$INFER_IMAGE" \
             -c "cat /app/input.jsonl | infer \
-                -encoder models/onnx/encoder_int8.onnx \
-                -decoder models/onnx/decoder_int8.onnx \
-                -tokenizer models/tokenizer.model \
+                -encoder $RUN_DIR/onnx/encoder_int8.onnx \
+                -decoder $RUN_DIR/onnx/decoder_int8.onnx \
+                -tokenizer $RUN_DIR/tokenizer.model \
                 -ort-lib /usr/local/lib/libonnxruntime.so \
                 -n $N_SAMPLES \
                 $*"
@@ -401,17 +422,18 @@ for e in entries[-5:]:
 
     all)
         build_train
+        mkdir -p "$PROJECT_DIR/$RUN_DIR"
         echo "=== Step 1: Tokenizer ==="
         run_gpu training/tokenizer_train.py \
             --data-dir data \
-            --output-dir models \
+            --output-dir "$RUN_DIR" \
             --vocab-size 8000
 
         echo "=== Step 2: Train ==="
         run_gpu training/train.py \
             --data-dir data \
-            --tokenizer models/tokenizer.model \
-            --output-dir models \
+            --tokenizer "$RUN_DIR/tokenizer.model" \
+            --output-dir "$RUN_DIR" \
             --batch-size 2 \
             --grad-accum 16 \
             --max-src-len 1536 \
@@ -424,9 +446,9 @@ for e in entries[-5:]:
 
         echo "=== Step 3: Export ==="
         run_gpu training/export.py \
-            --checkpoint models/best.pt \
-            --tokenizer models/tokenizer.model \
-            --output-dir models/onnx
+            --checkpoint "$RUN_DIR/best.pt" \
+            --tokenizer "$RUN_DIR/tokenizer.model" \
+            --output-dir "$RUN_DIR/onnx"
 
         echo "=== Done ==="
         ;;
@@ -484,6 +506,33 @@ for e in entries[-5:]:
         echo "Done."
         ;;
 
+    # Clean checkpoints, logs, ONNX, and AR inferences for a run.
+    # Does NOT remove the tokenizer — that requires retraining.
+    clean-run)
+        shift
+        TARGET="${1:-$RUN}"
+        TARGET_DIR="$PROJECT_DIR/models/$TARGET"
+        if [ ! -d "$TARGET_DIR" ]; then
+            echo "Error: $TARGET_DIR does not exist"
+            exit 1
+        fi
+        echo "Cleaning $TARGET ($TARGET_DIR)..."
+        rm -f "$TARGET_DIR"/*.pt "$TARGET_DIR"/training_log.json
+        rm -rf "$TARGET_DIR"/ar_inferences "$TARGET_DIR"/onnx
+        echo "Done. Tokenizer preserved."
+        ;;
+
+    new-run)
+        # Create the next run directory.
+        LAST=$(for d in "$PROJECT_DIR/models"/run*/; do basename "$d"; done 2>/dev/null | sort -V | tail -1)
+        LAST_NUM=${LAST#run}
+        NEXT_NUM=$(( LAST_NUM + 1 ))
+        NEXT="run$NEXT_NUM"
+        mkdir -p "$PROJECT_DIR/models/$NEXT"
+        echo "Created models/$NEXT"
+        echo "Set TRANSMUTATION_RUN=$NEXT or it will auto-detect as current run."
+        ;;
+
     help|*)
         cat <<'USAGE'
 Usage: ./training/run.sh <command> [args...]
@@ -508,6 +557,14 @@ Data:
   haiku-clean       Remove haiku corpus (all splits).
   clean-generated   Remove train/val data (preserves haiku).
   clean-all         Remove all data (train, val, haiku).
+
+Runs:
+  new-run           Create next run directory (models/runN+1).
+  clean-run [name]  Clean checkpoints/logs/ONNX for a run (keeps tokenizer).
+  status            Show current run's checkpoints, metrics, container state.
+
+  Current run auto-detected as highest models/runN.
+  Override with TRANSMUTATION_RUN=runN.
 
 Other:
   export [ckpt]     Export checkpoint to ONNX (default: best.pt).

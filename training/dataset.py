@@ -134,6 +134,9 @@ def create_dataloader(
         if epoch_seed is None:
             epoch_seed = torch.randint(0, 2**31, (1,)).item()
         sampler = ResumableRandomSampler(dataset, seed=epoch_seed, start_index=start_index)
+    elif start_index > 0:
+        # Sequential skip: yield indices from start_index onward.
+        sampler = list(range(start_index, len(dataset)))
     return DataLoader(
         dataset,
         batch_size=batch_size,

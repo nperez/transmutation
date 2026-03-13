@@ -24,7 +24,22 @@ XML was chosen as the output format because it cleanly handles embedded content 
 
 ## Run 1 Results
 
-Run 1 used synthetic data generation with a 5-stage curriculum. Training was done on an RTX 2060 (6GB VRAM) with batch_size=2 and gradient accumulation of 16.
+Run 1 used synthetic data generation with a 5-stage curriculum. Training was done on an RTX 2060 (6GB VRAM) with batch_size=2 and gradient accumulation of 16 (effective batch size 32).
+
+### Training Budget
+
+| Metric | Value |
+|--------|-------|
+| Optimizer steps | 138,343 |
+| Training samples | ~4.4M (138,343 × 32) |
+| Training tokens (src+tgt) | ~5.2B |
+| Target tokens (loss-contributing) | ~3.0B |
+| Validation tokens | ~0.6B |
+| Epochs | 53 |
+| Steps/epoch (stages 1-2) | ~6,250 (200k samples) |
+| Steps/epoch (stages 3-5) | ~2,000-3,000 (64k-96k samples) |
+
+Token estimates based on ~1,170 tokens per sample (measured ~4,100 chars/sample at ~3.5 chars/token with 8k BPE vocab).
 
 ### Curriculum Stages
 

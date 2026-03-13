@@ -26,7 +26,6 @@ import signal
 import subprocess
 import time
 import xml.etree.ElementTree as ET
-from pathlib import Path
 
 import sentencepiece as spm
 import torch
@@ -42,21 +41,22 @@ from model import build_model
 
 # ── Haiku-first curriculum stages ────────────────────────────────────────────
 #
-# Each stage increases difficulty by adjusting augmentation ratio, special
-# character injection probability, and input corruption percentage.
+# Mirrors the run1 synthetic curriculum using real haiku data:
 #
-# Stage 1: Natural haiku only — learn basic JSON→XML structure on real data.
-# Stage 2: 1:5 augmentation — begin generalizing beyond memorized content.
-# Stage 3: 1:10 augmentation + moderate special chars — CDATA practice.
-# Stage 4: Full augmentation + special chars + light corruption.
-# Stage 5: Full augmentation + high special chars + heavier corruption.
+# Stage 1: Answer-only, natural — learn flat JSON→XML on simpler structure.
+# Stage 2: Tool-only, natural — learn nested tool structures.
+# Stage 3: Full mix, 1:5 augmentation — generalize content, intro special chars.
+# Stage 4: Full mix, 1:10 augmentation + moderate special chars — CDATA practice.
+# Stage 5: Full mix, 1:10 aug + high special chars + light corruption.
+# Stage 6: Full mix, 1:10 aug + high special chars + heavier corruption.
 
 HAIKU_STAGES = {
-    1: {"aug_ratio": 0,  "special_prob": 0.0,  "corrupt_pct": 0,  "sample_pct": 10},
-    2: {"aug_ratio": 5,  "special_prob": 0.15, "corrupt_pct": 0,  "sample_pct": 5},
-    3: {"aug_ratio": 10, "special_prob": 0.30, "corrupt_pct": 0,  "sample_pct": 5},
-    4: {"aug_ratio": 10, "special_prob": 0.40, "corrupt_pct": 10, "sample_pct": 5},
-    5: {"aug_ratio": 10, "special_prob": 0.40, "corrupt_pct": 20, "sample_pct": 5},
+    1: {"type": "answer", "aug_ratio": 0,  "special_prob": 0.0,  "corrupt_pct": 0,  "sample_pct": 10},
+    2: {"type": "tool",   "aug_ratio": 0,  "special_prob": 0.0,  "corrupt_pct": 0,  "sample_pct": 10},
+    3: {"type": "all",    "aug_ratio": 5,  "special_prob": 0.15, "corrupt_pct": 0,  "sample_pct": 5},
+    4: {"type": "all",    "aug_ratio": 10, "special_prob": 0.30, "corrupt_pct": 0,  "sample_pct": 5},
+    5: {"type": "all",    "aug_ratio": 10, "special_prob": 0.40, "corrupt_pct": 10, "sample_pct": 5},
+    6: {"type": "all",    "aug_ratio": 10, "special_prob": 0.40, "corrupt_pct": 20, "sample_pct": 5},
 }
 
 
@@ -78,6 +78,7 @@ def generate_haiku_data(augment_bin, data_dir, split, stage, seed):
         "-aug-ratio", str(params["aug_ratio"]),
         "-special-prob", str(params["special_prob"]),
         "-corrupt-pct", str(params["corrupt_pct"]),
+        "-type", str(params.get("type", "all")),
         "-seed", str(seed),
     ]
     if split == "val":
@@ -173,6 +174,8 @@ def train(args):
     start_epoch = 1
     resume_epoch_seed = None
     resume_epoch_step = 0
+    resume_training_done = False
+    resume_val_state = None
     current_stage = args.stage
     stage_good_epochs = 0  # consecutive epochs above stage-advance threshold
 
@@ -197,6 +200,8 @@ def train(args):
         if not completed_epoch:
             resume_epoch_seed = ckpt.get("epoch_seed")
             resume_epoch_step = ckpt.get("epoch_step", 0)
+            resume_training_done = ckpt.get("training_done", False)
+            resume_val_state = ckpt.get("val_state")
         # Reload existing log.
         log_path = os.path.join(args.output_dir, "training_log.json")
         if os.path.exists(log_path):
@@ -217,10 +222,10 @@ def train(args):
     # SIGUSR1 = save checkpoint, keep training
     # SIGTERM/SIGINT/SIGHUP/SIGUSR2 = save checkpoint, exit cleanly
     sig_state = {"save": False, "stop": False}
-    def handle_save(signum, frame):
+    def handle_save(signum, _frame):
         sig_state["save"] = True
         print(f"\n>>> {signal.Signals(signum).name} received — saving checkpoint, continuing <<<")
-    def handle_stop(signum, frame):
+    def handle_stop(signum, _frame):
         sig_state["save"] = True
         sig_state["stop"] = True
         print(f"\n>>> {signal.Signals(signum).name} received — saving checkpoint and exiting <<<")
@@ -230,7 +235,7 @@ def train(args):
     print("Signals: USR1=checkpoint, TERM/INT/HUP/USR2=checkpoint+exit")
 
     # atexit safety net: save state if process exits unexpectedly (e.g. unhandled exception).
-    atexit_state = {"epoch": 0, "step": 0, "epoch_seed": None, "active": False}
+    atexit_state = {"epoch": 0, "step": 0, "epoch_seed": None, "active": False, "training_done": False, "val_state": None}
     def atexit_save():
         if not atexit_state["active"]:
             return
@@ -242,8 +247,10 @@ def train(args):
                             atexit_state["epoch"], global_step, best_val_loss,
                             args.output_dir, fname, epoch_complete=False,
                             epoch_step=actual_step, epoch_seed=atexit_state["epoch_seed"],
-                            stage=current_stage, stage_good_epochs=stage_good_epochs)
-            print(f">>> atexit: saved at epoch {atexit_state['epoch']} batch {actual_step} <<<")
+                            stage=current_stage, stage_good_epochs=stage_good_epochs,
+                            training_done=atexit_state["training_done"],
+                            val_state=atexit_state.get("val_state"))
+            print(f">>> atexit: saved at epoch {atexit_state['epoch']} batch {actual_step} (training_done={atexit_state['training_done']}) <<<")
         except Exception as e:
             print(f">>> atexit: FAILED to save checkpoint: {e} <<<")
     atexit.register(atexit_save)
@@ -262,128 +269,172 @@ def train(args):
         epoch_seed = epoch * 1000 + 42
         start_index = 0
 
-        # Generate fresh training data for this epoch (val is fixed).
-        if epoch == start_epoch and resume_epoch_step > 0:
+        # If resuming an epoch where training already finished, skip to validation.
+        if epoch == start_epoch and resume_training_done:
             if resume_epoch_seed is not None:
                 epoch_seed = resume_epoch_seed
-            start_index = resume_epoch_step
-            print(f"Resuming epoch {epoch} from batch {start_index} (seed={epoch_seed})")
-        generate_haiku_data(args.augment_bin, args.data_dir, "train", current_stage, epoch_seed)
+            print(f"Resuming epoch {epoch} post-training (skipping to validation)")
+            atexit_state.update(epoch=epoch, epoch_seed=epoch_seed, step=0, active=True, training_done=True)
+            avg_train_loss = 0.0
+            # Jump straight to validation (below the training block).
+        else:
+            # Generate fresh training data for this epoch (val is fixed).
+            if epoch == start_epoch and resume_epoch_step > 0:
+                if resume_epoch_seed is not None:
+                    epoch_seed = resume_epoch_seed
+                start_index = resume_epoch_step
+                print(f"Resuming epoch {epoch} from batch {start_index} (seed={epoch_seed})")
+            generate_haiku_data(args.augment_bin, args.data_dir, "train", current_stage, epoch_seed)
 
-        train_loader, epoch_seed = create_dataloader(
-            data_dir=train_data_dir, shuffle=True,
-            epoch_seed=epoch_seed, start_index=start_index, **dl_kwargs,
-        )
-        atexit_state.update(epoch=epoch, epoch_seed=epoch_seed, step=start_index, active=True)
+            train_loader, epoch_seed = create_dataloader(
+                data_dir=train_data_dir, shuffle=True,
+                epoch_seed=epoch_seed, start_index=start_index, **dl_kwargs,
+            )
+            atexit_state.update(epoch=epoch, epoch_seed=epoch_seed, step=start_index, active=True, training_done=False)
 
-        # Train.
-        model.train()
-        train_loss = 0.0
-        train_tokens = 0
-        optimizer.zero_grad()
+            # Train.
+            model.train()
+            train_loss = 0.0
+            train_tokens = 0
+            optimizer.zero_grad()
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch} train", leave=False)
-        for step, batch in enumerate(pbar):
-            atexit_state["step"] = start_index + step
-            src = batch["src_ids"].to(device)
-            tgt_in = batch["tgt_input"].to(device)
-            tgt_labels = batch["tgt_labels"].to(device)
-            src_mask = batch["src_key_padding_mask"].to(device)
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch} train", leave=False)
+            for step, batch in enumerate(pbar):
+                atexit_state["step"] = start_index + step
+                src = batch["src_ids"].to(device)
+                tgt_in = batch["tgt_input"].to(device)
+                tgt_labels = batch["tgt_labels"].to(device)
+                src_mask = batch["src_key_padding_mask"].to(device)
 
-            if args.token_noise > 0:
-                if args.professor_forcing:
-                    # Extra forward pass (no grad) to get model's own predictions.
-                    with torch.no_grad():
-                        with autocast("cuda", enabled=args.fp16):
-                            pf_logits = model(src, tgt_in, src_mask)
-                        # pf_logits[:, i] predicts target[i], which is tgt_in[:, i+1].
-                        # Shift right so replacement_ids aligns with tgt_in.
-                        pred_ids = pf_logits.argmax(dim=-1)
-                        replacement_ids = torch.cat(
-                            [tgt_in[:, :1], pred_ids[:, :-1]], dim=1,
+                if args.token_noise > 0:
+                    if args.professor_forcing:
+                        # Extra forward pass (no grad) to get model's own predictions.
+                        with torch.no_grad():
+                            with autocast("cuda", enabled=args.fp16):
+                                pf_logits = model(src, tgt_in, src_mask)
+                            # pf_logits[:, i] predicts target[i], which is tgt_in[:, i+1].
+                            # Shift right so replacement_ids aligns with tgt_in.
+                            pred_ids = pf_logits.argmax(dim=-1)
+                            replacement_ids = torch.cat(
+                                [tgt_in[:, :1], pred_ids[:, :-1]], dim=1,
+                            )
+                        tgt_in = corrupt_content_tokens(
+                            tgt_in, args.token_noise, args.structural_max_id,
+                            vocab_size, pad_id, replacement_ids=replacement_ids,
                         )
-                    tgt_in = corrupt_content_tokens(
-                        tgt_in, args.token_noise, args.structural_max_id,
-                        vocab_size, pad_id, replacement_ids=replacement_ids,
-                    )
-                else:
-                    tgt_in = corrupt_content_tokens(
-                        tgt_in, args.token_noise, args.structural_max_id, vocab_size, pad_id,
-                    )
+                    else:
+                        tgt_in = corrupt_content_tokens(
+                            tgt_in, args.token_noise, args.structural_max_id, vocab_size, pad_id,
+                        )
 
-            with autocast("cuda", enabled=args.fp16):
-                logits = model(src, tgt_in, src_mask)
-                if use_content_weight:
-                    loss = weighted_content_loss(
-                        logits, tgt_labels, vocab_size,
-                        args.content_weight, args.structural_max_id,
-                    )
-                else:
-                    loss = criterion(logits.reshape(-1, vocab_size), tgt_labels.reshape(-1))
-                loss = loss / args.grad_accum
+                with autocast("cuda", enabled=args.fp16):
+                    logits = model(src, tgt_in, src_mask)
+                    if use_content_weight:
+                        loss = weighted_content_loss(
+                            logits, tgt_labels, vocab_size,
+                            args.content_weight, args.structural_max_id,
+                        )
+                    else:
+                        loss = criterion(logits.reshape(-1, vocab_size), tgt_labels.reshape(-1))
+                    loss = loss / args.grad_accum
 
-            scaler.scale(loss).backward()
+                scaler.scale(loss).backward()
 
-            n_tokens = (tgt_labels != -100).sum().item()
-            train_loss += loss.item() * args.grad_accum * n_tokens
-            train_tokens += n_tokens
+                n_tokens = (tgt_labels != -100).sum().item()
+                train_loss += loss.item() * args.grad_accum * n_tokens
+                train_tokens += n_tokens
 
-            if (start_index + step + 1) % args.grad_accum == 0:
-                scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
-                global_step += 1
+                if (start_index + step + 1) % args.grad_accum == 0:
+                    scaler.unscale_(optimizer)
+                    nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                    global_step += 1
 
-                # Linear warmup: scale LR during initial steps.
-                if global_step <= warmup_steps:
-                    warmup_lr = args.lr * global_step / warmup_steps
-                    for pg in optimizer.param_groups:
-                        pg["lr"] = warmup_lr
+                    # Linear warmup: scale LR during initial steps.
+                    if global_step <= warmup_steps:
+                        warmup_lr = args.lr * global_step / warmup_steps
+                        for pg in optimizer.param_groups:
+                            pg["lr"] = warmup_lr
 
-            cur_lr = optimizer.param_groups[0]["lr"]
-            pbar.set_postfix(loss=f"{loss.item() * args.grad_accum:.4f}", lr=f"{cur_lr:.2e}")
+                cur_lr = optimizer.param_groups[0]["lr"]
+                pbar.set_postfix(loss=f"{loss.item() * args.grad_accum:.4f}", lr=f"{cur_lr:.2e}")
 
-            # Handle signal-triggered checkpoint.
-            if sig_state["save"]:
-                sig_state["save"] = False
-                actual_step = start_index + step + 1
-                fname = interrupt_filename()
-                save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss,
-                                args.output_dir, fname, epoch_complete=False,
-                                epoch_step=actual_step, epoch_seed=epoch_seed,
-                                stage=current_stage, stage_good_epochs=stage_good_epochs)
-                print(f"\n>>> Checkpoint saved ({fname}): epoch {epoch} batch {actual_step} stage={current_stage} <<<")
-                if sig_state["stop"]:
-                    print("Exiting cleanly.")
-                    return model
+                # Handle signal-triggered checkpoint.
+                if sig_state["save"]:
+                    sig_state["save"] = False
+                    actual_step = start_index + step + 1
+                    fname = interrupt_filename()
+                    save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss,
+                                    args.output_dir, fname, epoch_complete=False,
+                                    epoch_step=actual_step, epoch_seed=epoch_seed,
+                                    stage=current_stage, stage_good_epochs=stage_good_epochs)
+                    print(f"\n>>> Checkpoint saved ({fname}): epoch {epoch} batch {actual_step} stage={current_stage} <<<")
+                    if sig_state["stop"]:
+                        print("Exiting cleanly.")
+                        return model
 
-        avg_train_loss = train_loss / max(train_tokens, 1)
+            avg_train_loss = train_loss / max(train_tokens, 1)
+            atexit_state["training_done"] = True
 
         # Validate (fixed held-out val set, generated once before training).
+        atexit_state["training_done"] = True
+        atexit_state["val_state"] = None
+        val_state_for_resume = None
+        if epoch == start_epoch and resume_val_state is not None:
+            val_state_for_resume = resume_val_state
+            resume_val_state = None  # only use once
+        val_start_index = val_state_for_resume["batch"] * args.batch_size if val_state_for_resume else 0
         val_loader, _ = create_dataloader(
-            data_dir=val_data_dir, shuffle=False, **dl_kwargs,
+            data_dir=val_data_dir, shuffle=False, start_index=val_start_index, **dl_kwargs,
         )
-        val_loss, val_tokens, val_exact = validate(model, val_loader, criterion, vocab_size, device, args.fp16, sp)
+        val_loss, val_tokens, val_exact = validate(
+            model, val_loader, criterion, vocab_size, device, args.fp16,
+            sig_state=sig_state, atexit_state=atexit_state,
+            resume_val_state=val_state_for_resume)
         avg_val_loss = val_loss / max(val_tokens, 1)
 
+        # Check for stop signal after validation (may have aborted early).
+        if sig_state["stop"]:
+            fname = interrupt_filename()
+            save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss,
+                            args.output_dir, fname, epoch_complete=False,
+                            stage=current_stage, stage_good_epochs=stage_good_epochs,
+                            training_done=True,
+                            val_state=atexit_state.get("val_state"))
+            print(f"\n>>> Checkpoint saved ({fname}): epoch {epoch} (training_done, val_state saved) <<<")
+            print("Exiting cleanly.")
+            return model
+
+        atexit_state["val_state"] = None  # validation complete, clear partial state
+
         # Autoregressive eval on fresh augmented haiku samples.
-        ar_exact, ar_xml_ok, ar_total = autoregressive_eval(
-            model, sp, n_samples=args.ar_eval_samples, device=device,
-            augment_bin=args.augment_bin, data_dir=args.data_dir,
-            max_src_len=args.max_src_len, max_tgt_len=args.max_tgt_len,
-            output_dir=args.output_dir, epoch=epoch,
-        )
+        # Skip when val_exact is 0% — model can't possibly produce correct AR output.
+        if val_exact > 0:
+            ar_exact, ar_xml_ok, ar_total = autoregressive_eval(
+                model, sp, n_samples=args.ar_eval_samples,
+                augment_bin=args.augment_bin, data_dir=args.data_dir,
+                max_src_len=args.max_src_len, max_tgt_len=args.max_tgt_len,
+                output_dir=args.output_dir, epoch=epoch, stage=current_stage,
+            )
+        else:
+            ar_exact, ar_xml_ok, ar_total = 0, 0, args.ar_eval_samples
+            print("Skipping AR eval (val_exact=0%)", flush=True)
 
         # Step the plateau scheduler based on AR error rate, not val loss.
         # Val loss is near-zero with teacher forcing even when AR inference is bad.
-        ar_error = 1.0 - (ar_exact / max(ar_total, 1))
-        old_lr = optimizer.param_groups[0]["lr"]
-        scheduler.step(ar_error)
-        new_lr = optimizer.param_groups[0]["lr"]
-        if new_lr < old_lr:
-            print(f"  LR reduced: {old_lr:.2e} -> {new_lr:.2e}")
+        # Skip stepping when AR eval was skipped (val_exact=0%) — the metric is
+        # meaningless and would prematurely cut LR every patience epochs.
+        cur_lr = optimizer.param_groups[0]["lr"]
+        if val_exact > 0:
+            ar_error = 1.0 - (ar_exact / max(ar_total, 1))
+            scheduler.step(ar_error)
+            new_lr = optimizer.param_groups[0]["lr"]
+            if new_lr < cur_lr:
+                print(f"  LR reduced: {cur_lr:.2e} -> {new_lr:.2e}")
+        else:
+            new_lr = cur_lr
 
         # Auto-advance curriculum stage.
         ar_rate = ar_exact / max(ar_total, 1)
@@ -397,7 +448,7 @@ def train(args):
                 stage_good_epochs = 0
                 new_params = HAIKU_STAGES[current_stage]
                 print(f"  >>> Stage advanced to {current_stage} (AR={ar_rate:.0%} for {args.stage_patience} epochs)")
-                print(f"      aug={new_params['aug_ratio']} sp={new_params['special_prob']} cor={new_params['corrupt_pct']}%")
+                print(f"      type={new_params.get('type', 'all')} aug={new_params['aug_ratio']} sp={new_params['special_prob']} cor={new_params['corrupt_pct']}%")
 
         log_entry = {
             "epoch": epoch,
@@ -446,14 +497,28 @@ def train(args):
 
 
 @torch.no_grad()
-def validate(model, loader, criterion, vocab_size, device, fp16, sp):
+def validate(model, loader, criterion, vocab_size, device, fp16,
+             sig_state=None, atexit_state=None, resume_val_state=None):
     model.eval()
+    start_batch = 0
     total_loss = 0.0
     total_tokens = 0
     exact_matches = 0
     total_samples = 0
 
-    for batch in tqdm(loader, desc="Validating", leave=False):
+    if resume_val_state is not None:
+        start_batch = resume_val_state["batch"]
+        total_loss = resume_val_state["total_loss"]
+        total_tokens = resume_val_state["total_tokens"]
+        exact_matches = resume_val_state["exact_matches"]
+        total_samples = resume_val_state["total_samples"]
+        print(f"  Resuming validation from batch {start_batch} ({total_samples} samples done)")
+
+    for batch_idx, batch in enumerate(tqdm(loader, desc="Validating", leave=False)):
+        if sig_state and sig_state["stop"]:
+            print("\n>>> Stop signal during validation — aborting early <<<")
+            break
+
         src = batch["src_ids"].to(device)
         tgt_in = batch["tgt_input"].to(device)
         tgt_labels = batch["tgt_labels"].to(device)
@@ -475,6 +540,15 @@ def validate(model, loader, criterion, vocab_size, device, fp16, sp):
             if torch.equal(preds[i][m], tgt_labels[i][m]):
                 exact_matches += 1
             total_samples += 1
+
+        if atexit_state is not None:
+            atexit_state["val_state"] = {
+                "batch": start_batch + batch_idx + 1,
+                "total_loss": total_loss,
+                "total_tokens": total_tokens,
+                "exact_matches": exact_matches,
+                "total_samples": total_samples,
+            }
 
     exact_rate = exact_matches / max(total_samples, 1)
     return total_loss, total_tokens, exact_rate
@@ -524,27 +598,31 @@ def weighted_content_loss(logits, tgt_labels, vocab_size, content_weight, struct
 
 
 @torch.no_grad()
-def autoregressive_eval(model, sp, n_samples=10, device="cuda",
+def autoregressive_eval(model, sp, n_samples=10,
                         augment_bin="/app/augment", data_dir="data",
                         max_src_len=2048, max_tgt_len=4096,
-                        output_dir=None, epoch=0):
+                        output_dir=None, epoch=0, stage=None):
     """Run greedy autoregressive decoding on fresh augmented haiku samples.
 
-    Uses the augment binary to generate fresh samples with full augmentation
-    and special char injection. Writes per-sample results to
+    Uses the augment binary to generate fresh samples matching the current
+    stage's type and difficulty. Writes per-sample results to
     output_dir/ar_inferences/epoch_N.jsonl for failure analysis.
     """
     model.eval()
 
-    # Generate fresh augmented samples — use max difficulty, time-based seed.
+    # Generate fresh samples matching current stage difficulty.
     seed = int(time.time()) % 2**32
-    max_stage = max(HAIKU_STAGES.keys())
-    params = HAIKU_STAGES[max_stage]
+    if stage is None:
+        stage = max(HAIKU_STAGES.keys())
+    params = HAIKU_STAGES[stage]
     # Request more samples than needed since augment produces natural+augmented.
     # With aug_ratio=10, each sampled haiku yields 11 outputs.
     # We want n_samples augmented ones, so request enough to cover.
-    needed_haiku = max(1, (n_samples // max(params["aug_ratio"], 1)) + 2)
-    sample_pct = max(0.01, needed_haiku / 750)  # ~75k corpus
+    aug = max(params["aug_ratio"], 1)
+    needed_haiku = max(1, (n_samples // aug) + 2)
+    # Corpus size depends on type filter (~50k each for answer/tool, ~100k for all).
+    corpus_est = 50000 if params.get("type", "all") != "all" else 100000
+    sample_pct = max(0.01, needed_haiku / (corpus_est / 100))
 
     cmd = [
         augment_bin,
@@ -552,6 +630,7 @@ def autoregressive_eval(model, sp, n_samples=10, device="cuda",
         "-sample-pct", f"{sample_pct:.4f}",
         "-aug-ratio", str(params["aug_ratio"]),
         "-special-prob", str(params["special_prob"]),
+        "-type", str(params.get("type", "all")),
         "-seed", str(seed),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
@@ -571,11 +650,15 @@ def autoregressive_eval(model, sp, n_samples=10, device="cuda",
     total = 0
     inferences = []
 
-    for record in records[:n_samples]:
+    samples = records[:n_samples]
+    print(f"AR eval: decoding {len(samples)} samples on CPU...", flush=True)
+    for i, record in enumerate(samples):
         src_ids = sp.encode(record["input"])[:max_src_len]
         target = record["target"]
 
-        pred_ids = greedy_decode(cpu_model, src_ids, sp, max_len=max_tgt_len, device="cpu")
+        # Cap decode at 2x source length — target XML is roughly same length as input JSON.
+        sample_max = min(max_tgt_len, len(src_ids) * 2)
+        pred_ids = greedy_decode(cpu_model, src_ids, sp, max_len=sample_max, device="cpu")
         pred = sp.decode(pred_ids)
 
         norm_pred = re.sub(r"\s+", " ", pred.strip())
@@ -602,6 +685,11 @@ def autoregressive_eval(model, sp, n_samples=10, device="cuda",
             "xml_ok": xml_ok,
         })
 
+        status = "exact" if exact else ("xml_ok" if xml_ok else "FAIL")
+        print(f"  AR eval {i+1}/{len(samples)}: {len(src_ids)}→{len(pred_ids)} tokens [{status}]", flush=True)
+
+    print(f"AR eval done: {exact_count}/{total} exact, {xml_ok_count}/{total} xml_ok", flush=True)
+
     # Write inference log.
     if output_dir:
         ar_dir = os.path.join(output_dir, "ar_inferences")
@@ -620,13 +708,14 @@ def interrupt_filename():
     return f"interrupt_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pt"
 
 
-def save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, output_dir, filename, epoch_complete=True, epoch_step=0, epoch_seed=None, stage=1, stage_good_epochs=0):
+def save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, output_dir, filename, epoch_complete=True, epoch_step=0, epoch_seed=None, stage=1, stage_good_epochs=0, training_done=False, val_state=None):
     path = os.path.join(output_dir, filename)
-    torch.save({
+    ckpt = {
         "epoch": epoch,
         "epoch_complete": epoch_complete,
         "epoch_step": epoch_step,
         "epoch_seed": epoch_seed,
+        "training_done": training_done,
         "global_step": global_step,
         "best_val_loss": best_val_loss,
         "stage": stage,
@@ -635,7 +724,10 @@ def save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, bes
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "scaler_state_dict": scaler.state_dict(),
-    }, path)
+    }
+    if val_state is not None:
+        ckpt["val_state"] = val_state
+    torch.save(ckpt, path)
 
 
 def main():
@@ -685,7 +777,7 @@ def main():
                         help="Path to Go augment binary")
     parser.add_argument("--stage", type=int, default=1,
                         help="Starting curriculum stage (1-5)")
-    parser.add_argument("--max-stage", type=int, default=5,
+    parser.add_argument("--max-stage", type=int, default=6,
                         help="Maximum curriculum stage (auto-advance stops here)")
     parser.add_argument("--stage-advance-ar", type=float, default=0.7,
                         help="AR exact rate threshold to advance stage (0-1)")
