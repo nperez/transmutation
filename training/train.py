@@ -51,12 +51,12 @@ from model import build_model
 # Stage 6: Full mix, 1:10 aug + high special chars + heavier corruption.
 
 HAIKU_STAGES = {
-    1: {"type": "answer", "aug_ratio": 0,  "special_prob": 0.0,  "corrupt_pct": 0,  "sample_pct": 10},
-    2: {"type": "tool",   "aug_ratio": 0,  "special_prob": 0.0,  "corrupt_pct": 0,  "sample_pct": 10},
-    3: {"type": "all",    "aug_ratio": 5,  "special_prob": 0.15, "corrupt_pct": 0,  "sample_pct": 5},
-    4: {"type": "all",    "aug_ratio": 10, "special_prob": 0.30, "corrupt_pct": 0,  "sample_pct": 5},
-    5: {"type": "all",    "aug_ratio": 10, "special_prob": 0.40, "corrupt_pct": 10, "sample_pct": 5},
-    6: {"type": "all",    "aug_ratio": 10, "special_prob": 0.40, "corrupt_pct": 20, "sample_pct": 5},
+    1: {"type": "answer", "aug_ratio": 0,  "special_prob": 0.0,  "corrupt_pct": 0,  "sample_pct": 10, "content_weight": 1.0},
+    2: {"type": "tool",   "aug_ratio": 0,  "special_prob": 0.0,  "corrupt_pct": 0,  "sample_pct": 10, "content_weight": 2.0},
+    3: {"type": "all",    "aug_ratio": 5,  "special_prob": 0.15, "corrupt_pct": 0,  "sample_pct": 5,  "content_weight": 4.0},
+    4: {"type": "all",    "aug_ratio": 10, "special_prob": 0.30, "corrupt_pct": 0,  "sample_pct": 5,  "content_weight": 6.0},
+    5: {"type": "all",    "aug_ratio": 10, "special_prob": 0.40, "corrupt_pct": 10, "sample_pct": 5,  "content_weight": 8.0},
+    6: {"type": "all",    "aug_ratio": 10, "special_prob": 0.40, "corrupt_pct": 20, "sample_pct": 5,  "content_weight": 10.0},
 }
 
 # Validation budget by training stage — small early (fast epochs), full later (precise eval).
@@ -161,9 +161,7 @@ def train(args):
     # Loss — optionally upweight content tokens (numbers, strings, code)
     # vs structural XML tokens (IDs 0-15: special + XML tags).
     criterion = nn.CrossEntropyLoss(ignore_index=-100)
-    use_content_weight = args.content_weight != 1.0
-    if use_content_weight:
-        print(f"Content weight: {args.content_weight}x (structural tokens 0-{args.structural_max_id} at 1.0x)")
+    print(f"Content weight: per-stage {[HAIKU_STAGES[s]['content_weight'] for s in sorted(HAIKU_STAGES)]}x (structural tokens 0-{args.structural_max_id} at 1.0x)")
     if args.professor_forcing:
         print(f"Professor forcing: ON (noise={args.token_noise}, using model predictions)")
 
@@ -337,10 +335,11 @@ def train(args):
 
                 with autocast("cuda", enabled=args.fp16):
                     logits = model(src, tgt_in, src_mask)
-                    if use_content_weight:
+                    stage_content_weight = HAIKU_STAGES[current_stage]["content_weight"]
+                    if stage_content_weight != 1.0:
                         loss = weighted_content_loss(
                             logits, tgt_labels, vocab_size,
-                            args.content_weight, args.structural_max_id,
+                            stage_content_weight, args.structural_max_id,
                         )
                     else:
                         loss = criterion(logits.reshape(-1, vocab_size), tgt_labels.reshape(-1))
@@ -460,7 +459,7 @@ def train(args):
                 stage_good_epochs = 0
                 new_params = HAIKU_STAGES[current_stage]
                 print(f"  >>> Stage advanced to {current_stage} (AR={ar_rate:.0%} for {args.stage_patience} epochs)")
-                print(f"      type={new_params.get('type', 'all')} aug={new_params['aug_ratio']} sp={new_params['special_prob']} cor={new_params['corrupt_pct']}%")
+                print(f"      type={new_params.get('type', 'all')} aug={new_params['aug_ratio']} sp={new_params['special_prob']} cor={new_params['corrupt_pct']}% cw={new_params['content_weight']}x")
 
         log_entry = {
             "epoch": epoch,
