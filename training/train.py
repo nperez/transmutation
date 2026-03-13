@@ -59,6 +59,11 @@ HAIKU_STAGES = {
     6: {"type": "all",    "aug_ratio": 10, "special_prob": 0.40, "corrupt_pct": 20, "sample_pct": 5},
 }
 
+# Validation budget by training stage — small early (fast epochs), full later (precise eval).
+# Full val set is generated once at max stage; this caps how many batches we actually run.
+# None = use full val set.
+VAL_MAX_BATCHES = {1: 50, 2: 500, 3: 5000, 4: 5000, 5: None, 6: None}
+
 
 def generate_haiku_data(augment_bin, data_dir, split, stage, seed):
     """Call the Go augment binary to produce training or validation data.
@@ -176,6 +181,7 @@ def train(args):
     resume_epoch_step = 0
     resume_training_done = False
     resume_val_state = None
+    resume_train_loss = 0.0
     current_stage = args.stage
     stage_good_epochs = 0  # consecutive epochs above stage-advance threshold
 
@@ -202,6 +208,7 @@ def train(args):
             resume_epoch_step = ckpt.get("epoch_step", 0)
             resume_training_done = ckpt.get("training_done", False)
             resume_val_state = ckpt.get("val_state")
+            resume_train_loss = ckpt.get("train_loss", 0.0)
         # Reload existing log.
         log_path = os.path.join(args.output_dir, "training_log.json")
         if os.path.exists(log_path):
@@ -235,7 +242,7 @@ def train(args):
     print("Signals: USR1=checkpoint, TERM/INT/HUP/USR2=checkpoint+exit")
 
     # atexit safety net: save state if process exits unexpectedly (e.g. unhandled exception).
-    atexit_state = {"epoch": 0, "step": 0, "epoch_seed": None, "active": False, "training_done": False, "val_state": None}
+    atexit_state = {"epoch": 0, "step": 0, "epoch_seed": None, "active": False, "training_done": False, "val_state": None, "train_loss": 0.0}
     def atexit_save():
         if not atexit_state["active"]:
             return
@@ -249,7 +256,8 @@ def train(args):
                             epoch_step=actual_step, epoch_seed=atexit_state["epoch_seed"],
                             stage=current_stage, stage_good_epochs=stage_good_epochs,
                             training_done=atexit_state["training_done"],
-                            val_state=atexit_state.get("val_state"))
+                            val_state=atexit_state.get("val_state"),
+                            train_loss=atexit_state.get("train_loss", 0.0))
             print(f">>> atexit: saved at epoch {atexit_state['epoch']} batch {actual_step} (training_done={atexit_state['training_done']}) <<<")
         except Exception as e:
             print(f">>> atexit: FAILED to save checkpoint: {e} <<<")
@@ -275,7 +283,7 @@ def train(args):
                 epoch_seed = resume_epoch_seed
             print(f"Resuming epoch {epoch} post-training (skipping to validation)")
             atexit_state.update(epoch=epoch, epoch_seed=epoch_seed, step=0, active=True, training_done=True)
-            avg_train_loss = 0.0
+            avg_train_loss = resume_train_loss
             # Jump straight to validation (below the training block).
         else:
             # Generate fresh training data for this epoch (val is fixed).
@@ -377,6 +385,7 @@ def train(args):
 
             avg_train_loss = train_loss / max(train_tokens, 1)
             atexit_state["training_done"] = True
+            atexit_state["train_loss"] = avg_train_loss
 
         # Validate (fixed held-out val set, generated once before training).
         atexit_state["training_done"] = True
@@ -389,10 +398,12 @@ def train(args):
         val_loader, _ = create_dataloader(
             data_dir=val_data_dir, shuffle=False, start_index=val_start_index, **dl_kwargs,
         )
+        val_max_batches = VAL_MAX_BATCHES.get(current_stage)
         val_loss, val_tokens, val_exact = validate(
             model, val_loader, criterion, vocab_size, device, args.fp16,
             sig_state=sig_state, atexit_state=atexit_state,
-            resume_val_state=val_state_for_resume)
+            resume_val_state=val_state_for_resume,
+            max_batches=val_max_batches)
         avg_val_loss = val_loss / max(val_tokens, 1)
 
         # Check for stop signal after validation (may have aborted early).
@@ -402,7 +413,8 @@ def train(args):
                             args.output_dir, fname, epoch_complete=False,
                             stage=current_stage, stage_good_epochs=stage_good_epochs,
                             training_done=True,
-                            val_state=atexit_state.get("val_state"))
+                            val_state=atexit_state.get("val_state"),
+                            train_loss=avg_train_loss)
             print(f"\n>>> Checkpoint saved ({fname}): epoch {epoch} (training_done, val_state saved) <<<")
             print("Exiting cleanly.")
             return model
@@ -498,7 +510,8 @@ def train(args):
 
 @torch.no_grad()
 def validate(model, loader, criterion, vocab_size, device, fp16,
-             sig_state=None, atexit_state=None, resume_val_state=None):
+             sig_state=None, atexit_state=None, resume_val_state=None,
+             max_batches=None):
     model.eval()
     start_batch = 0
     total_loss = 0.0
@@ -515,6 +528,8 @@ def validate(model, loader, criterion, vocab_size, device, fp16,
         print(f"  Resuming validation from batch {start_batch} ({total_samples} samples done)")
 
     for batch_idx, batch in enumerate(tqdm(loader, desc="Validating", leave=False)):
+        if max_batches is not None and start_batch + batch_idx >= max_batches:
+            break
         if sig_state and sig_state["stop"]:
             print("\n>>> Stop signal during validation — aborting early <<<")
             break
@@ -708,7 +723,7 @@ def interrupt_filename():
     return f"interrupt_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pt"
 
 
-def save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, output_dir, filename, epoch_complete=True, epoch_step=0, epoch_seed=None, stage=1, stage_good_epochs=0, training_done=False, val_state=None):
+def save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, output_dir, filename, epoch_complete=True, epoch_step=0, epoch_seed=None, stage=1, stage_good_epochs=0, training_done=False, val_state=None, train_loss=0.0):
     path = os.path.join(output_dir, filename)
     ckpt = {
         "epoch": epoch,
@@ -720,6 +735,7 @@ def save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, bes
         "best_val_loss": best_val_loss,
         "stage": stage,
         "stage_good_epochs": stage_good_epochs,
+        "train_loss": train_loss,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
