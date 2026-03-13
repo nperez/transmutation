@@ -116,7 +116,7 @@ func DictSentence(rng *rand.Rand) string {
 		words[0] = string(r)
 	}
 	text := strings.Join(words, " ") + "."
-	return InjectSpecialChars(rng, text, 0.15)
+	return InjectSpecialChars(rng, text, 0.40)
 }
 
 // ShuffleWords randomizes word order in text and injects special characters.
@@ -125,7 +125,7 @@ func ShuffleWords(rng *rand.Rand, text string) string {
 	rng.Shuffle(len(words), func(i, j int) {
 		words[i], words[j] = words[j], words[i]
 	})
-	return InjectSpecialChars(rng, strings.Join(words, " "), 0.15)
+	return InjectSpecialChars(rng, strings.Join(words, " "), 0.40)
 }
 
 // AugmentedSentence returns either a dictionary-word sentence or a shuffled
@@ -162,7 +162,7 @@ func AugmentedMemoryEntry(rng *rand.Rand) string {
 		for i := range words {
 			words[i] = DictWord(rng)
 		}
-		return InjectSpecialChars(rng, strings.Join(words, " "), 0.20)
+		return InjectSpecialChars(rng, strings.Join(words, " "), 0.50)
 	}
 	return ShuffleWords(rng, MemoryEntry(rng))
 }
@@ -195,7 +195,7 @@ func AugmentedListItem(rng *rand.Rand) string {
 	r := []rune(words[0])
 	r[0] = unicode.ToUpper(r[0])
 	words[0] = string(r)
-	return InjectSpecialChars(rng, strings.Join(words, " "), 0.15)
+	return InjectSpecialChars(rng, strings.Join(words, " "), 0.40)
 }
 
 // AugmentedTableCell returns an augmented table cell value.

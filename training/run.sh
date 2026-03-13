@@ -49,6 +49,7 @@ fetch_wheels() {
 # ── Build ────────────────────────────────────────────────────────────────────
 
 GENERATE_BIN="$PROJECT_DIR/tmp/generate"
+AUGMENT_BIN="$PROJECT_DIR/tmp/augment"
 
 build_generator() {
     local bin="$GENERATE_BIN"
@@ -58,9 +59,18 @@ build_generator() {
     fi
 }
 
+build_augment() {
+    local bin="$AUGMENT_BIN"
+    if [ ! -f "$bin" ] || [ "$(find "$PROJECT_DIR/cmd/augment" "$PROJECT_DIR/pkg" -newer "$bin" 2>/dev/null)" ]; then
+        echo "Building augment binary..."
+        (cd "$PROJECT_DIR" && CGO_ENABLED=0 go build -o "$bin" ./cmd/augment/)
+    fi
+}
+
 build_train() {
     fetch_wheels
     build_generator
+    build_augment
     echo "Building training image..."
     docker build -t "$TRAIN_IMAGE" "$SCRIPT_DIR"
 }
@@ -79,6 +89,7 @@ run_gpu() {
         -v "$PROJECT_DIR/models:/app/models" \
         -v "$SCRIPT_DIR:/app/training:ro" \
         -v "$PROJECT_DIR/tmp/generate:/app/generate:ro" \
+        -v "$PROJECT_DIR/tmp/augment:/app/augment:ro" \
         "$TRAIN_IMAGE" \
         "$@"
 }
@@ -91,6 +102,7 @@ run_gpu_detached() {
         -v "$PROJECT_DIR/models:/app/models" \
         -v "$SCRIPT_DIR:/app/training:ro" \
         -v "$PROJECT_DIR/tmp/generate:/app/generate:ro" \
+        -v "$PROJECT_DIR/tmp/augment:/app/augment:ro" \
         "$TRAIN_IMAGE" \
         "$@"
 }
@@ -162,26 +174,23 @@ case "${1:-help}" in
             --data-dir data \
             --tokenizer models/tokenizer.model \
             --output-dir models \
+            --augment-bin /app/augment \
             --batch-size 2 \
             --grad-accum 16 \
             --max-src-len 1536 \
             --max-tgt-len 2048 \
             --epochs 100 \
-            --train-samples 50000 \
-            --val-samples 2500 \
             --lr 3e-4 \
             --warmup-steps 2000 \
             --save-every 5 \
             --fp16 \
+            --stage 1 \
             --max-stage 5 \
-            --stage-advance-ar 0.5 \
-            --stage-patience 3 \
+            --stage-advance-ar 0.7 \
+            --stage-patience 2 \
             --content-weight 10.0 \
             --token-noise 0.15 \
             --professor-forcing \
-            --mix-pct 25 \
-            --mix-corrupt-pct 50 \
-            --augment-pct 75 \
             --ar-eval-samples 50 \
             $RESUME_FLAG \
             "$@")
@@ -294,7 +303,16 @@ for e in entries[-5:]:
 
     tokenizer)
         build_train
-        echo "Training tokenizer..."
+        echo "Generating haiku corpus for tokenizer training..."
+        # Generate a large augmented sample at max difficulty for tokenizer training.
+        mkdir -p "$PROJECT_DIR/data/train" "$PROJECT_DIR/data/val"
+        "$AUGMENT_BIN" -dir "$PROJECT_DIR/data/haiku" \
+            -sample-pct 30 -aug-ratio 5 -special-prob 0.30 -seed 42 \
+            > "$PROJECT_DIR/data/train/haiku_augmented.jsonl"
+        "$AUGMENT_BIN" -dir "$PROJECT_DIR/data/haiku" \
+            -sample-pct 10 -aug-ratio 5 -special-prob 0.30 -seed 42 -val \
+            > "$PROJECT_DIR/data/val/haiku_augmented.jsonl"
+        echo "Training tokenizer on haiku corpus..."
         run_gpu training/tokenizer_train.py \
             --data-dir data \
             --output-dir models \

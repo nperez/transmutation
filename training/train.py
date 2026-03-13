@@ -13,7 +13,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Training loop for the transmutation model."""
+"""Training loop for the transmutation model (haiku-first pipeline)."""
 
 import atexit
 import argparse
@@ -40,45 +40,64 @@ from infer_cpu import greedy_decode, patch_mamba_for_cpu
 from model import build_model
 
 
-def generate_data(generator_bin, data_dir, train_count, val_count, stage, seed,
-                   mix_pct=10, mix_dir=None, mix_corrupt_pct=0, augment_pct=0):
-    """Call the Go generator to write training and/or validation data.
+# ── Haiku-first curriculum stages ────────────────────────────────────────────
+#
+# Each stage increases difficulty by adjusting augmentation ratio, special
+# character injection probability, and input corruption percentage.
+#
+# Stage 1: Natural haiku only — learn basic JSON→XML structure on real data.
+# Stage 2: 1:5 augmentation — begin generalizing beyond memorized content.
+# Stage 3: 1:10 augmentation + moderate special chars — CDATA practice.
+# Stage 4: Full augmentation + special chars + light corruption.
+# Stage 5: Full augmentation + high special chars + heavier corruption.
 
-    Pass train_count=0 to skip train generation, val_count=0 to skip val.
-    mix_dir overrides the default haiku directory (data_dir/haiku).
-    mix_corrupt_pct controls what % of mixed lines get corrupted in flight.
-    augment_pct controls what % of samples use augmented random content.
+HAIKU_STAGES = {
+    1: {"aug_ratio": 0,  "special_prob": 0.0,  "corrupt_pct": 0,  "sample_pct": 10},
+    2: {"aug_ratio": 5,  "special_prob": 0.15, "corrupt_pct": 0,  "sample_pct": 5},
+    3: {"aug_ratio": 10, "special_prob": 0.30, "corrupt_pct": 0,  "sample_pct": 5},
+    4: {"aug_ratio": 10, "special_prob": 0.40, "corrupt_pct": 10, "sample_pct": 5},
+    5: {"aug_ratio": 10, "special_prob": 0.40, "corrupt_pct": 20, "sample_pct": 5},
+}
+
+
+def generate_haiku_data(augment_bin, data_dir, split, stage, seed):
+    """Call the Go augment binary to produce training or validation data.
+
+    The augment binary reads haiku JSONL from data_dir/haiku, samples a
+    percentage of the corpus, and outputs 1:N augmented variants to stdout.
+    Stage parameters control augmentation ratio, special char injection,
+    and corruption.
     """
+    params = HAIKU_STAGES[stage]
+    haiku_dir = os.path.join(data_dir, "haiku")
+
     cmd = [
-        generator_bin,
-        "-stage", str(stage),
-        "-train", str(train_count),
-        "-val", str(val_count),
-        "-out", data_dir,
+        augment_bin,
+        "-dir", haiku_dir,
+        "-sample-pct", str(params["sample_pct"]),
+        "-aug-ratio", str(params["aug_ratio"]),
+        "-special-prob", str(params["special_prob"]),
+        "-corrupt-pct", str(params["corrupt_pct"]),
         "-seed", str(seed),
     ]
-    if augment_pct > 0:
-        cmd.extend(["-augment-pct", str(augment_pct)])
-    # Mix in haiku corpus if it exists.
-    if mix_dir is None:
-        mix_dir = os.path.join(data_dir, "haiku")
-    has_haiku = os.path.isdir(mix_dir) and any(f.endswith(".jsonl") for f in os.listdir(mix_dir))
-    if has_haiku:
-        cmd.extend(["-mix", mix_dir, "-mix-pct", str(mix_pct)])
-        if mix_corrupt_pct > 0:
-            cmd.extend(["-mix-corrupt-pct", str(mix_corrupt_pct)])
+    if split == "val":
+        cmd.append("-val")
 
-    parts = []
-    if train_count > 0:
-        parts.append(f"{train_count} train")
-    if val_count > 0:
-        parts.append(f"{val_count} val")
-    label = " + ".join(parts)
-    haiku_label = f" + haiku mix ({mix_pct}%)" if has_haiku else ""
-    print(f"Generating {label} samples (stage {stage}, seed {seed}){haiku_label}...")
+    out_dir = os.path.join(data_dir, split)
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "haiku_augmented.jsonl")
+
+    label = f"stage {stage} aug={params['aug_ratio']} sp={params['special_prob']} cor={params['corrupt_pct']}%"
+    print(f"Generating {split} data ({label}, seed {seed})...")
 
     t0 = time.time()
-    subprocess.run(cmd, check=True)
+    with open(out_path, "w") as f:
+        result = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE, text=True, timeout=120)
+    # Print augment binary stats (written to stderr).
+    if result.stderr:
+        for line in result.stderr.strip().split("\n"):
+            print(f"  {line}")
+    result.check_returncode()
     print(f"  Generated in {time.time() - t0:.1f}s")
 
 
@@ -119,11 +138,6 @@ def train(args):
         num_workers=args.num_workers,
         pad_id=pad_id,
     )
-    n_train = args.train_samples
-    n_val = args.val_samples
-    n_batches_per_epoch = n_train // args.batch_size
-    print(f"Train samples/epoch: {n_train}")
-    print(f"Val samples/epoch:   {n_val}")
 
     # Optimizer + scheduler.
     optimizer = torch.optim.AdamW(
@@ -234,21 +248,10 @@ def train(args):
             print(f">>> atexit: FAILED to save checkpoint: {e} <<<")
     atexit.register(atexit_save)
 
-    # Haiku split directories: train and val get separate pools to prevent leakage.
-    haiku_train_dir = os.path.join(args.data_dir, "haiku_train")
-    haiku_val_dir = os.path.join(args.data_dir, "haiku_val")
-    # Fall back to unsplit haiku/ if split dirs don't exist.
-    if not os.path.isdir(haiku_train_dir):
-        haiku_train_dir = os.path.join(args.data_dir, "haiku")
-    if not os.path.isdir(haiku_val_dir):
-        haiku_val_dir = os.path.join(args.data_dir, "haiku")
-
     # Generate held-out validation data ONCE at max stage with a fixed seed.
-    # Val always at hardest stage so metrics are comparable across stage transitions.
     VAL_SEED = 7777777
-    generate_data(args.generator, args.data_dir, 0, n_val, args.max_stage, VAL_SEED, args.mix_pct, mix_dir=haiku_val_dir,
-                  augment_pct=args.augment_pct)
-    print(f"Fixed validation set: {n_val} samples (stage {args.max_stage}, seed {VAL_SEED}), reused every epoch")
+    generate_haiku_data(args.augment_bin, args.data_dir, "val", args.max_stage, VAL_SEED)
+    print(f"Fixed validation set (stage {args.max_stage}, seed {VAL_SEED}), reused every epoch")
     print(f"Training stage: {current_stage} (auto-advance at AR>{args.stage_advance_ar:.0%} for {args.stage_patience} epochs, max={args.max_stage})")
 
     print(f"\nTraining for {args.epochs} epochs (ReduceLROnPlateau, patience={args.lr_patience})")
@@ -265,9 +268,7 @@ def train(args):
                 epoch_seed = resume_epoch_seed
             start_index = resume_epoch_step
             print(f"Resuming epoch {epoch} from batch {start_index} (seed={epoch_seed})")
-        generate_data(args.generator, args.data_dir, n_train, 0, current_stage, epoch_seed,
-                      args.mix_pct, mix_dir=haiku_train_dir, mix_corrupt_pct=args.mix_corrupt_pct,
-                      augment_pct=args.augment_pct)
+        generate_haiku_data(args.augment_bin, args.data_dir, "train", current_stage, epoch_seed)
 
         train_loader, epoch_seed = create_dataloader(
             data_dir=train_data_dir, shuffle=True,
@@ -353,7 +354,7 @@ def train(args):
                                 args.output_dir, fname, epoch_complete=False,
                                 epoch_step=actual_step, epoch_seed=epoch_seed,
                                 stage=current_stage, stage_good_epochs=stage_good_epochs)
-                print(f"\n>>> Checkpoint saved ({fname}): epoch {epoch} batch {actual_step}/{n_batches_per_epoch} stage={current_stage} <<<")
+                print(f"\n>>> Checkpoint saved ({fname}): epoch {epoch} batch {actual_step} stage={current_stage} <<<")
                 if sig_state["stop"]:
                     print("Exiting cleanly.")
                     return model
@@ -367,10 +368,10 @@ def train(args):
         val_loss, val_tokens, val_exact = validate(model, val_loader, criterion, vocab_size, device, args.fp16, sp)
         avg_val_loss = val_loss / max(val_tokens, 1)
 
-        # Autoregressive eval on fresh augmented samples.
+        # Autoregressive eval on fresh augmented haiku samples.
         ar_exact, ar_xml_ok, ar_total = autoregressive_eval(
             model, sp, n_samples=args.ar_eval_samples, device=device,
-            generator_bin=args.generator, stage=current_stage,
+            augment_bin=args.augment_bin, data_dir=args.data_dir,
             max_src_len=args.max_src_len, max_tgt_len=args.max_tgt_len,
             output_dir=args.output_dir, epoch=epoch,
         )
@@ -394,7 +395,9 @@ def train(args):
             if stage_good_epochs >= args.stage_patience:
                 current_stage += 1
                 stage_good_epochs = 0
+                new_params = HAIKU_STAGES[current_stage]
                 print(f"  >>> Stage advanced to {current_stage} (AR={ar_rate:.0%} for {args.stage_patience} epochs)")
+                print(f"      aug={new_params['aug_ratio']} sp={new_params['special_prob']} cor={new_params['corrupt_pct']}%")
 
         log_entry = {
             "epoch": epoch,
@@ -522,28 +525,36 @@ def weighted_content_loss(logits, tgt_labels, vocab_size, content_weight, struct
 
 @torch.no_grad()
 def autoregressive_eval(model, sp, n_samples=10, device="cuda",
-                        generator_bin="/app/generate", stage=5,
+                        augment_bin="/app/augment", data_dir="data",
                         max_src_len=2048, max_tgt_len=4096,
                         output_dir=None, epoch=0):
-    """Run greedy autoregressive decoding on fresh augmented samples.
+    """Run greedy autoregressive decoding on fresh augmented haiku samples.
 
-    If output_dir is set, writes per-sample results to
+    Uses the augment binary to generate fresh samples with full augmentation
+    and special char injection. Writes per-sample results to
     output_dir/ar_inferences/epoch_N.jsonl for failure analysis.
     """
     model.eval()
 
-    # Generate fresh augmented samples via the Go binary.
+    # Generate fresh augmented samples — use max difficulty, time-based seed.
     seed = int(time.time()) % 2**32
+    max_stage = max(HAIKU_STAGES.keys())
+    params = HAIKU_STAGES[max_stage]
+    # Request more samples than needed since augment produces natural+augmented.
+    # With aug_ratio=10, each sampled haiku yields 11 outputs.
+    # We want n_samples augmented ones, so request enough to cover.
+    needed_haiku = max(1, (n_samples // max(params["aug_ratio"], 1)) + 2)
+    sample_pct = max(0.01, needed_haiku / 750)  # ~75k corpus
+
     cmd = [
-        generator_bin,
-        "-stage", str(stage),
-        "-train", str(n_samples),
-        "-val", "0",
-        "-stdout",
+        augment_bin,
+        "-dir", os.path.join(data_dir, "haiku"),
+        "-sample-pct", f"{sample_pct:.4f}",
+        "-aug-ratio", str(params["aug_ratio"]),
+        "-special-prob", str(params["special_prob"]),
         "-seed", str(seed),
-        "-augment-pct", "100",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     records = []
     for line in result.stdout.strip().split("\n"):
         if line.strip():
@@ -574,7 +585,7 @@ def autoregressive_eval(model, sp, n_samples=10, device="cuda",
         try:
             ET.fromstring(pred.strip())
             xml_ok = True
-        except ET.ParseError as e:
+        except ET.ParseError:
             xml_ok = False
 
         if exact:
@@ -628,7 +639,7 @@ def save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, bes
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train transmutation model")
+    parser = argparse.ArgumentParser(description="Train transmutation model (haiku-first)")
     parser.add_argument("--data-dir", default="data", help="Data directory")
     parser.add_argument("--tokenizer", default="models/tokenizer.model", help="Tokenizer model path")
     parser.add_argument("--output-dir", default="models", help="Output directory")
@@ -642,56 +653,47 @@ def main():
     parser.add_argument("--dropout", type=float, default=0.1)
 
     # Training.
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--override-lr", type=float, default=None,
                         help="Force this LR on resume (resets scheduler)")
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--warmup-steps", type=int, default=1000)
+    parser.add_argument("--warmup-steps", type=int, default=2000)
     parser.add_argument("--lr-patience", type=int, default=2,
                         help="ReduceLROnPlateau patience (epochs without improvement before LR decay)")
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
-    parser.add_argument("--grad-accum", type=int, default=4)
+    parser.add_argument("--grad-accum", type=int, default=16)
     parser.add_argument("--fp16", action="store_true", default=True)
     parser.add_argument("--no-fp16", action="store_false", dest="fp16")
-    parser.add_argument("--ar-eval-samples", type=int, default=10,
+    parser.add_argument("--ar-eval-samples", type=int, default=50,
                         help="Number of samples for autoregressive eval per epoch")
 
     # Loss weighting.
-    parser.add_argument("--content-weight", type=float, default=1.0,
+    parser.add_argument("--content-weight", type=float, default=10.0,
                         help="Weight multiplier for content tokens (numbers, strings). "
                              "Structural XML tokens (0..structural-max-id) stay at 1.0.")
     parser.add_argument("--structural-max-id", type=int, default=15,
                         help="Token IDs 0..N are considered structural (XML tags, special tokens)")
-    parser.add_argument("--token-noise", type=float, default=0.0,
+    parser.add_argument("--token-noise", type=float, default=0.15,
                         help="Probability of replacing a content token in decoder input with a random content token (0=off)")
-    parser.add_argument("--professor-forcing", action="store_true", default=False,
+    parser.add_argument("--professor-forcing", action="store_true", default=True,
                         help="Use model predictions instead of random tokens for noise (requires --token-noise > 0)")
 
-    # Data generation.
-    parser.add_argument("--generator", type=str, default="/app/generate",
-                        help="Path to Go generator binary")
+    # Haiku augmentation pipeline.
+    parser.add_argument("--augment-bin", type=str, default="/app/augment",
+                        help="Path to Go augment binary")
     parser.add_argument("--stage", type=int, default=1,
-                        help="Starting curriculum stage for data generation (1-5)")
+                        help="Starting curriculum stage (1-5)")
     parser.add_argument("--max-stage", type=int, default=5,
                         help="Maximum curriculum stage (auto-advance stops here)")
-    parser.add_argument("--stage-advance-ar", type=float, default=0.5,
+    parser.add_argument("--stage-advance-ar", type=float, default=0.7,
                         help="AR exact rate threshold to advance stage (0-1)")
-    parser.add_argument("--stage-patience", type=int, default=3,
+    parser.add_argument("--stage-patience", type=int, default=2,
                         help="Consecutive epochs above threshold before advancing")
-    parser.add_argument("--train-samples", type=int, default=200000,
-                        help="Number of training samples to generate per epoch")
-    parser.add_argument("--mix-pct", type=float, default=10,
-                        help="Percentage of haiku corpus to mix per epoch (0-100)")
-    parser.add_argument("--mix-corrupt-pct", type=float, default=0,
-                        help="Percentage of mixed haiku lines to corrupt in flight (0-100)")
-    parser.add_argument("--augment-pct", type=float, default=0,
-                        help="Percentage of samples using augmented random content (0-100)")
-    parser.add_argument("--val-samples", type=int, default=10000,
-                        help="Number of validation samples to generate per epoch")
-    parser.add_argument("--max-src-len", type=int, default=2048)
-    parser.add_argument("--max-tgt-len", type=int, default=4096)
+
+    parser.add_argument("--max-src-len", type=int, default=1536)
+    parser.add_argument("--max-tgt-len", type=int, default=2048)
     parser.add_argument("--num-workers", type=int, default=2)
 
     # Checkpointing.

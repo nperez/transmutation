@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"nickandperla.net/transmutation/pkg/corrupt"
 	"nickandperla.net/transmutation/pkg/randtext"
 	"nickandperla.net/transmutation/pkg/xmlconv"
 )
@@ -36,6 +37,7 @@ type TrainingPair struct {
 }
 
 var specialProb float64
+var corruptPct float64
 
 func main() {
 	var (
@@ -52,6 +54,7 @@ func main() {
 	flag.Uint64Var(&seed, "seed", 42, "random seed")
 	flag.BoolVar(&isVal, "val", false, "generate val split (uses offset seed, disjoint from train)")
 	flag.Float64Var(&specialProb, "special-prob", 0.15, "probability of XML special char injection per word boundary (0-1)")
+	flag.Float64Var(&corruptPct, "corrupt-pct", 0, "percentage of samples to corrupt input JSON (0-100)")
 	flag.Parse()
 
 	samples, err := loadHaiku(haikuDir)
@@ -95,15 +98,25 @@ func main() {
 	natural := 0
 	augmented := 0
 	augFailed := 0
+	corrupted := 0
 
 	for _, idx := range selected {
 		sample := samples[idx]
 
-		// Emit the natural (unmodified) sample.
-		enc.Encode(sample)
+		// Emit the natural (unmodified) sample, optionally corrupted.
+		out := sample
+		if corruptPct > 0 {
+			cSeed := seed + uint64(idx)*uint64(augRatio+1) + 999999
+			cRng := rand.New(rand.NewPCG(cSeed, cSeed^0xf00d))
+			if cRng.Float64()*100 < corruptPct {
+				out.Input = corrupt.Apply(out.Input, corruptionConfig(cRng), cRng)
+				corrupted++
+			}
+		}
+		enc.Encode(out)
 		natural++
 
-		// Emit augRatio augmented variants.
+		// Emit augRatio augmented variants, optionally corrupted.
 		for v := range augRatio {
 			augSeed := seed + uint64(idx)*uint64(augRatio+1) + uint64(v) + 1
 			augRng := rand.New(rand.NewPCG(augSeed, augSeed^0xcafebabe))
@@ -112,6 +125,14 @@ func main() {
 			if err != nil {
 				augFailed++
 				continue
+			}
+			if corruptPct > 0 {
+				cSeed := augSeed ^ 0xf00d
+				cRng := rand.New(rand.NewPCG(cSeed, cSeed^0xbeef))
+				if cRng.Float64()*100 < corruptPct {
+					aug.Input = corrupt.Apply(aug.Input, corruptionConfig(cRng), cRng)
+					corrupted++
+				}
 			}
 			enc.Encode(aug)
 			augmented++
@@ -126,6 +147,9 @@ func main() {
 	}
 	fmt.Fprintf(os.Stderr, "Haiku augment (%s): %d natural + %d augmented = %d total (sampled %d = %.1f%% of %d",
 		split, natural, augmented, natural+augmented, keep, samplePct, len(samples))
+	if corrupted > 0 {
+		fmt.Fprintf(os.Stderr, ", %d corrupted", corrupted)
+	}
 	if augFailed > 0 {
 		fmt.Fprintf(os.Stderr, ", %d augment failures", augFailed)
 	}
@@ -256,4 +280,22 @@ func augmentString(s string, rng *rand.Rand) string {
 		words[i], words[j] = words[j], words[i]
 	})
 	return randtext.InjectSpecialChars(rng, strings.Join(words, " "), specialProb)
+}
+
+// corruptionConfig returns a corruption config with a distribution matching
+// the old stage 5 pipeline: mostly subtle/light, occasional medium.
+func corruptionConfig(rng *rand.Rand) corrupt.Config {
+	r := rng.Float64()
+	switch {
+	case r < 0.40:
+		return corrupt.SubtleConfig()
+	case r < 0.75:
+		return corrupt.LightConfig()
+	case r < 0.90:
+		cfg := corrupt.LightConfig()
+		cfg.WrapperProb = 1.0
+		return cfg
+	default:
+		return corrupt.MediumConfig()
+	}
 }
