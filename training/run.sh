@@ -197,13 +197,13 @@ case "${1:-help}" in
             --max-src-len 1536 \
             --max-tgt-len 2048 \
             --epochs 100 \
-            --lr 3e-4 \
-            --warmup-steps 2000 \
+            --lr 2e-4 \
+            --warmup-steps 500 \
             --save-every 5 \
             --fp16 \
             --stage 1 \
             --max-stage 6 \
-            --stage-advance-ar 0.7 \
+            --stage-advance-ar 0.55 \
             --stage-patience 2 \
             --content-weight 10.0 \
             --token-noise 0.15 \
@@ -439,7 +439,7 @@ for e in entries[-5:]:
             --max-src-len 1536 \
             --max-tgt-len 2048 \
             --epochs 30 \
-            --lr 3e-4 \
+            --lr 2e-4 \
             --warmup-steps 2000 \
             --save-every 1 \
             --fp16

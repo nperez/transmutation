@@ -51,13 +51,25 @@ from model import build_model
 # Stage 6: Full mix, 1:10 aug + high special chars + heavier corruption.
 
 HAIKU_STAGES = {
-    1: {"type": "answer", "aug_ratio": 0,  "special_prob": 0.0,  "corrupt_pct": 0,  "sample_pct": 10, "content_weight": 1.0},
-    2: {"type": "tool",   "aug_ratio": 0,  "special_prob": 0.0,  "corrupt_pct": 0,  "sample_pct": 10, "content_weight": 2.0},
-    3: {"type": "all",    "aug_ratio": 5,  "special_prob": 0.15, "corrupt_pct": 0,  "sample_pct": 5,  "content_weight": 4.0},
-    4: {"type": "all",    "aug_ratio": 10, "special_prob": 0.30, "corrupt_pct": 0,  "sample_pct": 5,  "content_weight": 6.0},
-    5: {"type": "all",    "aug_ratio": 10, "special_prob": 0.40, "corrupt_pct": 10, "sample_pct": 5,  "content_weight": 8.0},
-    6: {"type": "all",    "aug_ratio": 10, "special_prob": 0.40, "corrupt_pct": 20, "sample_pct": 5,  "content_weight": 10.0},
+    1: {"type": "answer", "aug_ratio": 0,  "special_prob": 0.0,  "corrupt_pct": 0,  "sample_pct": 50},
+    2: {"type": "tool",   "aug_ratio": 0,  "special_prob": 0.0,  "corrupt_pct": 0,  "sample_pct": 50},
+    3: {"type": "all",    "aug_ratio": 5,  "special_prob": 0.15, "corrupt_pct": 0,  "sample_pct": 5},
+    4: {"type": "all",    "aug_ratio": 10, "special_prob": 0.30, "corrupt_pct": 0,  "sample_pct": 5},
+    5: {"type": "all",    "aug_ratio": 10, "special_prob": 0.40, "corrupt_pct": 10, "sample_pct": 5},
+    6: {"type": "all",    "aug_ratio": 10, "special_prob": 0.40, "corrupt_pct": 20, "sample_pct": 5},
 }
+
+
+def compute_cw_boost(prev_val, curr_val, rate_threshold=0.10, max_boost=1.0):
+    """Compute content weight boost from val loss improvement rate.
+
+    Returns boost in [0, max_boost]. High improvement → 0 boost. Stalled → full boost.
+    Sawtooth pattern: accumulate boosts within a stage, reset on stage advance.
+    """
+    if prev_val <= 0:
+        return 0.0
+    improvement = (prev_val - curr_val) / prev_val
+    return max(0.0, min(max_boost, (1.0 - improvement / rate_threshold) * max_boost))
 
 # Validation budget by training stage — small early (fast epochs), full later (precise eval).
 # Full val set is generated once at max stage; this caps how many batches we actually run.
@@ -161,7 +173,7 @@ def train(args):
     # Loss — optionally upweight content tokens (numbers, strings, code)
     # vs structural XML tokens (IDs 0-15: special + XML tags).
     criterion = nn.CrossEntropyLoss(ignore_index=-100)
-    print(f"Content weight: per-stage {[HAIKU_STAGES[s]['content_weight'] for s in sorted(HAIKU_STAGES)]}x (structural tokens 0-{args.structural_max_id} at 1.0x)")
+    print(f"Content weight: adaptive sawtooth 1.0→{args.content_weight}x (resets on stage advance, structural tokens 0-{args.structural_max_id} at 1.0x)")
     if args.professor_forcing:
         print(f"Professor forcing: ON (noise={args.token_noise}, using model predictions)")
 
@@ -182,6 +194,8 @@ def train(args):
     resume_train_loss = 0.0
     current_stage = args.stage
     stage_good_epochs = 0  # consecutive epochs above stage-advance threshold
+    cw_boost = 0.0  # accumulated content weight boost (sawtooth: resets on stage advance)
+    prev_val_loss = None  # for computing improvement rate
 
     # Resume from checkpoint.
     if args.resume and os.path.exists(args.resume):
@@ -201,6 +215,8 @@ def train(args):
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
         current_stage = ckpt.get("stage", args.stage)
         stage_good_epochs = ckpt.get("stage_good_epochs", 0)
+        cw_boost = ckpt.get("cw_boost", 0.0)
+        prev_val_loss = ckpt.get("prev_val_loss")
         if not completed_epoch:
             resume_epoch_seed = ckpt.get("epoch_seed")
             resume_epoch_step = ckpt.get("epoch_step", 0)
@@ -255,7 +271,8 @@ def train(args):
                             stage=current_stage, stage_good_epochs=stage_good_epochs,
                             training_done=atexit_state["training_done"],
                             val_state=atexit_state.get("val_state"),
-                            train_loss=atexit_state.get("train_loss", 0.0))
+                            train_loss=atexit_state.get("train_loss", 0.0),
+                            cw_boost=cw_boost, prev_val_loss=prev_val_loss)
             print(f">>> atexit: saved at epoch {atexit_state['epoch']} batch {actual_step} (training_done={atexit_state['training_done']}) <<<")
         except Exception as e:
             print(f">>> atexit: FAILED to save checkpoint: {e} <<<")
@@ -335,11 +352,11 @@ def train(args):
 
                 with autocast("cuda", enabled=args.fp16):
                     logits = model(src, tgt_in, src_mask)
-                    stage_content_weight = HAIKU_STAGES[current_stage]["content_weight"]
-                    if stage_content_weight != 1.0:
+                    cw = min(args.content_weight, 1.0 + cw_boost)
+                    if cw > 1.0:
                         loss = weighted_content_loss(
                             logits, tgt_labels, vocab_size,
-                            stage_content_weight, args.structural_max_id,
+                            cw, args.structural_max_id,
                         )
                     else:
                         loss = criterion(logits.reshape(-1, vocab_size), tgt_labels.reshape(-1))
@@ -376,7 +393,8 @@ def train(args):
                     save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss,
                                     args.output_dir, fname, epoch_complete=False,
                                     epoch_step=actual_step, epoch_seed=epoch_seed,
-                                    stage=current_stage, stage_good_epochs=stage_good_epochs)
+                                    stage=current_stage, stage_good_epochs=stage_good_epochs,
+                                    cw_boost=cw_boost, prev_val_loss=prev_val_loss)
                     print(f"\n>>> Checkpoint saved ({fname}): epoch {epoch} batch {actual_step} stage={current_stage} <<<")
                     if sig_state["stop"]:
                         print("Exiting cleanly.")
@@ -413,7 +431,8 @@ def train(args):
                             stage=current_stage, stage_good_epochs=stage_good_epochs,
                             training_done=True,
                             val_state=atexit_state.get("val_state"),
-                            train_loss=avg_train_loss)
+                            train_loss=avg_train_loss,
+                            cw_boost=cw_boost, prev_val_loss=prev_val_loss)
             print(f"\n>>> Checkpoint saved ({fname}): epoch {epoch} (training_done, val_state saved) <<<")
             print("Exiting cleanly.")
             return model
@@ -459,7 +478,23 @@ def train(args):
                 stage_good_epochs = 0
                 new_params = HAIKU_STAGES[current_stage]
                 print(f"  >>> Stage advanced to {current_stage} (AR={ar_rate:.0%} for {args.stage_patience} epochs)")
-                print(f"      type={new_params.get('type', 'all')} aug={new_params['aug_ratio']} sp={new_params['special_prob']} cor={new_params['corrupt_pct']}% cw={new_params['content_weight']}x")
+                cw_boost = 0.0  # sawtooth reset: new stage = re-learn structure
+                prev_val_loss = None
+                print(f"      type={new_params.get('type', 'all')} aug={new_params['aug_ratio']} sp={new_params['special_prob']} cor={new_params['corrupt_pct']}% cw_boost reset→0")
+
+        # Sawtooth content weight: ramp when val improvement stalls.
+        # Compare every 2 epochs to give the model time to absorb higher cw.
+        cw_eval_interval = 2
+        if prev_val_loss is not None and epoch % cw_eval_interval == 0:
+            boost = compute_cw_boost(prev_val_loss, avg_val_loss)
+            old_cw = min(args.content_weight, 1.0 + cw_boost)
+            cw_boost += boost
+            new_cw = min(args.content_weight, 1.0 + cw_boost)
+            if new_cw > old_cw + 0.01:
+                print(f"  Content weight: {old_cw:.2f} -> {new_cw:.2f} (boost +{boost:.2f}, improvement {(prev_val_loss - avg_val_loss) / prev_val_loss:.1%} over {cw_eval_interval} epochs)")
+            prev_val_loss = avg_val_loss
+        elif prev_val_loss is None:
+            prev_val_loss = avg_val_loss
 
         log_entry = {
             "epoch": epoch,
@@ -471,24 +506,27 @@ def train(args):
             "ar_xml_ok": ar_xml_ok,
             "ar_total": ar_total,
             "lr": new_lr,
+            "content_weight": min(args.content_weight, 1.0 + cw_boost),
             "global_step": global_step,
         }
         log_entries.append(log_entry)
 
-        print(f"Epoch {epoch}: stage={current_stage} train_loss={avg_train_loss:.4f} val_loss={avg_val_loss:.4f} val_exact={val_exact:.2%} ar={ar_exact}/{ar_total}exact {ar_xml_ok}/{ar_total}xml lr={new_lr:.2e}")
+        print(f"Epoch {epoch}: stage={current_stage} train_loss={avg_train_loss:.4f} val_loss={avg_val_loss:.4f} val_exact={val_exact:.2%} ar={ar_exact}/{ar_total}exact {ar_xml_ok}/{ar_total}xml lr={new_lr:.2e} cw={min(args.content_weight, 1.0 + cw_boost):.1f}")
 
         # Save best (by AR exact match, the only reliable metric).
         if ar_exact > best_ar_exact or (ar_exact == best_ar_exact and avg_val_loss < best_val_loss):
             best_ar_exact = ar_exact
             best_val_loss = avg_val_loss
             save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, args.output_dir, "best.pt",
-                            stage=current_stage, stage_good_epochs=stage_good_epochs)
+                            stage=current_stage, stage_good_epochs=stage_good_epochs,
+                            cw_boost=cw_boost, prev_val_loss=prev_val_loss)
             print(f"  -> New best model saved (ar={ar_exact}/{ar_total} val_loss={avg_val_loss:.4f})")
 
         # Save periodic checkpoint.
         if epoch % args.save_every == 0:
             save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, args.output_dir, f"epoch_{epoch}.pt",
-                            stage=current_stage, stage_good_epochs=stage_good_epochs)
+                            stage=current_stage, stage_good_epochs=stage_good_epochs,
+                            cw_boost=cw_boost, prev_val_loss=prev_val_loss)
 
         # Epoch complete — atexit not needed until next epoch starts.
         atexit_state["active"] = False
@@ -722,7 +760,7 @@ def interrupt_filename():
     return f"interrupt_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pt"
 
 
-def save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, output_dir, filename, epoch_complete=True, epoch_step=0, epoch_seed=None, stage=1, stage_good_epochs=0, training_done=False, val_state=None, train_loss=0.0):
+def save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, output_dir, filename, epoch_complete=True, epoch_step=0, epoch_seed=None, stage=1, stage_good_epochs=0, training_done=False, val_state=None, train_loss=0.0, cw_boost=0.0, prev_val_loss=None):
     path = os.path.join(output_dir, filename)
     ckpt = {
         "epoch": epoch,
@@ -735,6 +773,8 @@ def save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, bes
         "stage": stage,
         "stage_good_epochs": stage_good_epochs,
         "train_loss": train_loss,
+        "cw_boost": cw_boost,
+        "prev_val_loss": prev_val_loss,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),

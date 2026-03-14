@@ -83,10 +83,62 @@ All failures after epoch 51 were traced to **input truncation** — inputs excee
 ### Lessons Learned
 
 - **CDATA wrapping** required heavy special character injection (0.40 probability at word boundaries) before the model reliably learned `<![CDATA[...]]>` rules. At the default 0.15, CDATA failures persisted for many epochs.
-- **Content-weighted loss** (10x weight on string/number tokens vs structural XML tokens) was critical — without it the model would copy structural tokens perfectly but mangle the actual data values.
+- **Content-weighted loss** (10x weight on string/number tokens vs structural XML tokens) was critical — without it the model would copy structural tokens perfectly but mangle the actual data values. Run 2 improved on this with adaptive sawtooth weighting (see above).
+- **Structure before content** — starting with content_weight=1.0 and ramping adaptively is far more efficient than starting at 10x. The model needs to learn where XML tags go before it can learn to copy content into them accurately.
+- **fp16 NaN at high LR** — LR 3e-4 caused fp16 overflow with small epochs (~160 steps). Lowered to 2e-4 with 500-step warmup. Larger epochs (~776 steps) also help by stabilizing gradient estimates.
 - **Professor forcing** (teacher forcing with scheduled sampling) improved AR eval performance significantly vs pure teacher forcing.
 - **Token noise** (0.15 probability of random token substitution in inputs during training) acted as regularization and improved robustness.
 - **Batch size 2 + grad_accum 16** was the practical max for 6GB VRAM with mixed precision.
+- **Validation budget scaling** — full validation set at every epoch wastes GPU time in early stages. Stage 1 needs only ~100 val samples for a coarse signal; scale up as stages advance.
+- **AR eval is the bottleneck** — CPU-based autoregressive decoding (required because Mamba CUDA kernels don't support single-step mode) takes ~15 min for 50 samples. Consider reducing AR eval samples or running less frequently.
+
+## Run 2 Results (in progress)
+
+Run 2 uses real haiku LLM outputs (~100k samples) with a 6-stage answer-first curriculum. Same hardware (RTX 2060 6GB), same model architecture.
+
+### Training Budget (so far)
+
+| Metric | Run 1 | Run 2 (epoch 25) | Run 2 / Run 1 |
+|--------|-------|-------------------|---------------|
+| Optimizer steps | 138,343 | ~20,190 | 15% |
+| Training tokens | ~5.2B | ~755M | 15% |
+| Epochs | 53 | 25 | 47% |
+| Stages completed | 5 | 4 (of 6) | — |
+
+### Key Metrics
+
+| Epoch | Stage | Train Loss | Val Exact | AR Exact | AR XML OK | CW |
+|-------|-------|-----------|-----------|----------|-----------|-----|
+| 1     | 1     | 81.57     | 0.0%      | 0/50     | 0/50      | 1.0 |
+| 10    | 1     | 2.14      | 0.0%      | 0/50     | 0/50      | 4.5 |
+| 11    | 1     | 0.44      | 1.0%      | 11/50    | 26/50     | 4.5 |
+| 16    | 1     | 0.15      | 1.0%      | 30/50    | 45/50     | 4.5 |
+| 21    | 1→2   | 0.12      | 5.0%      | 41/50    | 47/50     | 7.1 |
+| 22    | 2     | 0.08      | 5.0%      | 39/50    | 48/50     | — |
+| 23    | 2→3   | 0.06      | 6.1%      | 40/50    | 50/50     | — |
+| 24    | 3→4   | 0.10      | 73.5%     | 34/50    | 39/50     | — |
+| **25**| **4** | **0.09**  | **78.6%** | **45/50**| **50/50** | — |
+
+### Sawtooth Content Weight
+
+The adaptive content weight was the key innovation of run2. In stage 1:
+
+1. **Epochs 1-3**: cw=1.0, model learns structural XML transformation (val drops 375→6.4)
+2. **Epochs 4-9**: val flattens, sawtooth ramps cw from 1.0→4.5 over 5 epochs
+3. **Epoch 10**: content accuracy breakthrough — val crashes from 5.5→2.2 in one epoch
+4. **Epochs 11+**: AR eval activates, model converges to 82% AR exact at cw=4.5
+
+On stage advance (e.g., stage 1→2), content weight resets to 1.0 and the cycle repeats. The model re-learns structure for the new data type, then the sawtooth ramps content pressure as the structure plateaus.
+
+### Stage Transitions
+
+- **Stage 1→2** (epoch 21): Answer-only mastered at 82% AR exact. Sawtooth cw reached 7.1.
+- **Stage 2→3** (epoch 23): Tool structures learned in 2 epochs. 100% XML validity.
+- **Stage 3→4** (epoch 25): Full mix + augmentation. Val exact jumped 6%→79% in one epoch. 90% AR exact, 100% XML.
+
+### Comparison with Run 1
+
+Run 2 reached stage 4 in 20k steps vs run 1's ~25k steps for equivalent capability, on harder real-world data. The sawtooth content weight eliminated the need for manual intervention — run 1 required manual content_weight tuning, while run 2's weight adapted automatically to the learning dynamics.
 
 ## Data Pipelines
 
@@ -107,15 +159,25 @@ The `cmd/augment` tool handles sampling and augmentation:
 - Configurable XML special character injection (`-special-prob`)
 - Configurable JSON corruption (`-corrupt-pct`)
 
-**Haiku curriculum stages:**
+**Haiku curriculum stages (6-stage, answer-first):**
 
-| Stage | Aug Ratio | Special Prob | Corrupt % | Sample % |
-|-------|-----------|-------------|-----------|----------|
-| 1     | 0 (natural only) | 0.0  | 0         | 10       |
-| 2     | 1:5       | 0.15        | 0         | 5        |
-| 3     | 1:10      | 0.30        | 0         | 5        |
-| 4     | 1:10      | 0.40        | 10        | 5        |
-| 5     | 1:10      | 0.40        | 20        | 5        |
+| Stage | Type | Aug Ratio | Special Prob | Corrupt % | Sample % |
+|-------|------|-----------|-------------|-----------|----------|
+| 1     | answer | 0 (natural only) | 0.0  | 0   | 50       |
+| 2     | tool   | 0 (natural only) | 0.0  | 0   | 50       |
+| 3     | all    | 1:5       | 0.15        | 0         | 5        |
+| 4     | all    | 1:10      | 0.30        | 0         | 5        |
+| 5     | all    | 1:10      | 0.40        | 10        | 5        |
+| 6     | all    | 1:10      | 0.40        | 20        | 5        |
+
+Auto-advance when AR exact match >= 55% for 2 consecutive epochs.
+
+**Key training innovations (run2):**
+
+- **Sawtooth content weight** — content token loss weight starts at 1.0 (learn structure first) and ramps up adaptively when val improvement stalls. Resets to 1.0 on stage advance, creating a sawtooth pattern: each new stage re-learns structure at low weight, then gradually shifts focus to content accuracy. The ramp is computed every 2 epochs from the val loss improvement rate.
+- **Adaptive validation budget** — validation set generated once at max stage difficulty (55k samples), but early stages only validate on a small prefix (50-5000 batches). Full validation runs only at stages 5-6. This cuts epoch time from ~45 min to ~30 min in early stages.
+- **LR 2e-4 with 500-step warmup** — lower than run1's 3e-4 to avoid fp16 NaN at high gradient accumulation. 500 warmup steps (vs 2000) because epochs are larger.
+- **50% corpus sampling in stages 1-2** — larger epochs (~25k samples, ~776 steps) for more stable gradients. Stages 3+ use 5% with augmentation for variety.
 
 ### Synthetic Pipeline (Run 1, legacy)
 
@@ -209,7 +271,8 @@ transmutation/
 │   ├── run.sh         # Orchestrates all training steps
 │   └── wheels/        # Pre-built mamba_ssm + causal_conv1d wheels
 ├── models/
-│   └── run1/          # Archived run 1 (synthetic data, 53 epochs)
+│   ├── run1/          # Archived run 1 (synthetic data, 53 epochs)
+│   └── run2/          # Current run (haiku data, 6-stage curriculum)
 ├── data/
 │   └── haiku/         # ~100k real LLM haiku outputs (JSONL)
 ├── go.mod
