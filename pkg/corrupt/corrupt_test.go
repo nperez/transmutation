@@ -168,15 +168,23 @@ func TestAddTrailingCommasModifiesOutput(t *testing.T) {
 	}
 }
 
-func TestMangleBracketsDropsAtMostOne(t *testing.T) {
-	for seed := range uint64(50) {
+func TestMangleBracketsProducesMutation(t *testing.T) {
+	mutated := false
+	for seed := range uint64(100) {
 		rng := deterministicRNG(seed)
 		result := MangleBrackets(sampleJSON, rng)
-		origClose := strings.Count(sampleJSON, "}") + strings.Count(sampleJSON, "]")
-		resultClose := strings.Count(result, "}") + strings.Count(result, "]")
-		if origClose-resultClose > 1 {
-			t.Errorf("seed %d: dropped %d brackets, expected at most 1", seed, origClose-resultClose)
+		if result != sampleJSON {
+			mutated = true
+			// Result should still contain at least some brackets.
+			closers := strings.Count(result, "}") + strings.Count(result, "]")
+			if closers == 0 {
+				t.Errorf("seed %d: all brackets removed", seed)
+			}
+			break
 		}
+	}
+	if !mutated {
+		t.Error("MangleBrackets never mutated across 100 seeds")
 	}
 }
 

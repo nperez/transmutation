@@ -51,12 +51,11 @@ from model import build_model
 # Stage 6: Full mix, 1:10 aug + high special chars + heavier corruption.
 
 HAIKU_STAGES = {
-    1: {"type": "answer", "aug_ratio": 0,  "special_prob": 0.0,  "corrupt_pct": 0,  "sample_pct": 50},
-    2: {"type": "tool",   "aug_ratio": 0,  "special_prob": 0.0,  "corrupt_pct": 0,  "sample_pct": 50},
-    3: {"type": "all",    "aug_ratio": 5,  "special_prob": 0.15, "corrupt_pct": 0,  "sample_pct": 5},
-    4: {"type": "all",    "aug_ratio": 10, "special_prob": 0.30, "corrupt_pct": 0,  "sample_pct": 5},
-    5: {"type": "all",    "aug_ratio": 10, "special_prob": 0.40, "corrupt_pct": 10, "sample_pct": 5},
-    6: {"type": "all",    "aug_ratio": 10, "special_prob": 0.40, "corrupt_pct": 20, "sample_pct": 5},
+    1: {"type": "answer", "aug_ratio": 0,  "special_prob": 0.0,  "corrupt_pct": 0,  "compact_pct": 50, "sample_pct": 50},
+    2: {"type": "tool",   "aug_ratio": 0,  "special_prob": 0.0,  "corrupt_pct": 0,  "compact_pct": 50, "sample_pct": 50},
+    3: {"type": "all",    "aug_ratio": 5,  "special_prob": 0.15, "corrupt_pct": 0,  "compact_pct": 50, "sample_pct": 5},
+    4: {"type": "all",    "aug_ratio": 10, "special_prob": 0.30, "corrupt_pct": 10, "compact_pct": 50, "sample_pct": 5},
+    5: {"type": "all",    "aug_ratio": 10, "special_prob": 0.40, "corrupt_pct": 20, "compact_pct": 50, "sample_pct": 5},
 }
 
 
@@ -74,7 +73,7 @@ def compute_cw_boost(prev_val, curr_val, rate_threshold=0.10, max_boost=1.0):
 # Validation budget by training stage — small early (fast epochs), full later (precise eval).
 # Full val set is generated once at max stage; this caps how many batches we actually run.
 # None = use full val set.
-VAL_MAX_BATCHES = {1: 50, 2: 500, 3: 5000, 4: 5000, 5: None, 6: None}
+VAL_MAX_BATCHES = {1: 50, 2: 500, 3: 5000, 4: 5000, 5: None}
 
 
 def generate_haiku_data(augment_bin, data_dir, split, stage, seed):
@@ -95,9 +94,13 @@ def generate_haiku_data(augment_bin, data_dir, split, stage, seed):
         "-aug-ratio", str(params["aug_ratio"]),
         "-special-prob", str(params["special_prob"]),
         "-corrupt-pct", str(params["corrupt_pct"]),
+        "-compact-pct", str(params.get("compact_pct", 0)),
+        "-min-chars", str(params.get("min_chars", 0)),
         "-type", str(params.get("type", "all")),
         "-seed", str(seed),
     ]
+    if params.get("stratify", False):
+        cmd.append("-stratify")
     if split == "val":
         cmd.append("-val")
 
@@ -105,7 +108,10 @@ def generate_haiku_data(augment_bin, data_dir, split, stage, seed):
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "haiku_augmented.jsonl")
 
-    label = f"stage {stage} aug={params['aug_ratio']} sp={params['special_prob']} cor={params['corrupt_pct']}%"
+    mc = params.get("min_chars", 0)
+    label = f"stage {stage} aug={params['aug_ratio']} sp={params['special_prob']} cor={params['corrupt_pct']}% cmp={params.get('compact_pct', 0)}%"
+    if mc > 0:
+        label += f" min={mc}ch"
     print(f"Generating {split} data ({label}, seed {seed})...")
 
     t0 = time.time()
@@ -213,6 +219,7 @@ def train(args):
         start_epoch = ckpt["epoch"] + 1 if completed_epoch else ckpt["epoch"]
         global_step = ckpt.get("global_step", 0)
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
+        best_ar_exact = ckpt.get("best_ar_exact", 0)
         current_stage = ckpt.get("stage", args.stage)
         stage_good_epochs = ckpt.get("stage_good_epochs", 0)
         cw_boost = ckpt.get("cw_boost", 0.0)
@@ -272,7 +279,8 @@ def train(args):
                             training_done=atexit_state["training_done"],
                             val_state=atexit_state.get("val_state"),
                             train_loss=atexit_state.get("train_loss", 0.0),
-                            cw_boost=cw_boost, prev_val_loss=prev_val_loss)
+                            cw_boost=cw_boost, prev_val_loss=prev_val_loss,
+                            best_ar_exact=best_ar_exact)
             print(f">>> atexit: saved at epoch {atexit_state['epoch']} batch {actual_step} (training_done={atexit_state['training_done']}) <<<")
         except Exception as e:
             print(f">>> atexit: FAILED to save checkpoint: {e} <<<")
@@ -394,7 +402,8 @@ def train(args):
                                     args.output_dir, fname, epoch_complete=False,
                                     epoch_step=actual_step, epoch_seed=epoch_seed,
                                     stage=current_stage, stage_good_epochs=stage_good_epochs,
-                                    cw_boost=cw_boost, prev_val_loss=prev_val_loss)
+                                    cw_boost=cw_boost, prev_val_loss=prev_val_loss,
+                                    best_ar_exact=best_ar_exact)
                     print(f"\n>>> Checkpoint saved ({fname}): epoch {epoch} batch {actual_step} stage={current_stage} <<<")
                     if sig_state["stop"]:
                         print("Exiting cleanly.")
@@ -432,7 +441,8 @@ def train(args):
                             training_done=True,
                             val_state=atexit_state.get("val_state"),
                             train_loss=avg_train_loss,
-                            cw_boost=cw_boost, prev_val_loss=prev_val_loss)
+                            cw_boost=cw_boost, prev_val_loss=prev_val_loss,
+                            best_ar_exact=best_ar_exact)
             print(f"\n>>> Checkpoint saved ({fname}): epoch {epoch} (training_done, val_state saved) <<<")
             print("Exiting cleanly.")
             return model
@@ -480,7 +490,17 @@ def train(args):
                 print(f"  >>> Stage advanced to {current_stage} (AR={ar_rate:.0%} for {args.stage_patience} epochs)")
                 cw_boost = 0.0  # sawtooth reset: new stage = re-learn structure
                 prev_val_loss = None
-                print(f"      type={new_params.get('type', 'all')} aug={new_params['aug_ratio']} sp={new_params['special_prob']} cor={new_params['corrupt_pct']}% cw_boost reset→0")
+                # LR warm restart: reset to half base LR so the model can
+                # learn new patterns instead of being stuck at a decayed LR.
+                restart_lr = args.lr / 2
+                for pg in optimizer.param_groups:
+                    pg['lr'] = restart_lr
+                scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer, mode='min', factor=0.5,
+                    patience=args.lr_patience, min_lr=1e-6,
+                )
+                best_val_loss = float("inf")  # reset plateau tracker
+                print(f"      type={new_params.get('type', 'all')} aug={new_params['aug_ratio']} sp={new_params['special_prob']} cor={new_params['corrupt_pct']}% cw_boost reset→0 lr restart→{restart_lr:.1e}")
 
         # Sawtooth content weight: ramp when val improvement stalls.
         # Compare every 2 epochs to give the model time to absorb higher cw.
@@ -519,14 +539,16 @@ def train(args):
             best_val_loss = avg_val_loss
             save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, args.output_dir, "best.pt",
                             stage=current_stage, stage_good_epochs=stage_good_epochs,
-                            cw_boost=cw_boost, prev_val_loss=prev_val_loss)
+                            cw_boost=cw_boost, prev_val_loss=prev_val_loss,
+                            best_ar_exact=best_ar_exact)
             print(f"  -> New best model saved (ar={ar_exact}/{ar_total} val_loss={avg_val_loss:.4f})")
 
         # Save periodic checkpoint.
         if epoch % args.save_every == 0:
             save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, args.output_dir, f"epoch_{epoch}.pt",
                             stage=current_stage, stage_good_epochs=stage_good_epochs,
-                            cw_boost=cw_boost, prev_val_loss=prev_val_loss)
+                            cw_boost=cw_boost, prev_val_loss=prev_val_loss,
+                            best_ar_exact=best_ar_exact)
 
         # Epoch complete — atexit not needed until next epoch starts.
         atexit_state["active"] = False
@@ -652,7 +674,7 @@ def weighted_content_loss(logits, tgt_labels, vocab_size, content_weight, struct
 @torch.no_grad()
 def autoregressive_eval(model, sp, n_samples=10,
                         augment_bin="/app/augment", data_dir="data",
-                        max_src_len=2048, max_tgt_len=4096,
+                        max_src_len=1152, max_tgt_len=1536,
                         output_dir=None, epoch=0, stage=None):
     """Run greedy autoregressive decoding on fresh augmented haiku samples.
 
@@ -760,7 +782,7 @@ def interrupt_filename():
     return f"interrupt_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pt"
 
 
-def save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, output_dir, filename, epoch_complete=True, epoch_step=0, epoch_seed=None, stage=1, stage_good_epochs=0, training_done=False, val_state=None, train_loss=0.0, cw_boost=0.0, prev_val_loss=None):
+def save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, output_dir, filename, epoch_complete=True, epoch_step=0, epoch_seed=None, stage=1, stage_good_epochs=0, training_done=False, val_state=None, train_loss=0.0, cw_boost=0.0, prev_val_loss=None, best_ar_exact=0):
     path = os.path.join(output_dir, filename)
     ckpt = {
         "epoch": epoch,
@@ -775,6 +797,7 @@ def save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, bes
         "train_loss": train_loss,
         "cw_boost": cw_boost,
         "prev_val_loss": prev_val_loss,
+        "best_ar_exact": best_ar_exact,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
@@ -832,15 +855,15 @@ def main():
                         help="Path to Go augment binary")
     parser.add_argument("--stage", type=int, default=1,
                         help="Starting curriculum stage (1-5)")
-    parser.add_argument("--max-stage", type=int, default=6,
+    parser.add_argument("--max-stage", type=int, default=5,
                         help="Maximum curriculum stage (auto-advance stops here)")
     parser.add_argument("--stage-advance-ar", type=float, default=0.7,
                         help="AR exact rate threshold to advance stage (0-1)")
     parser.add_argument("--stage-patience", type=int, default=2,
                         help="Consecutive epochs above threshold before advancing")
 
-    parser.add_argument("--max-src-len", type=int, default=1536)
-    parser.add_argument("--max-tgt-len", type=int, default=2048)
+    parser.add_argument("--max-src-len", type=int, default=1152)
+    parser.add_argument("--max-tgt-len", type=int, default=1536)
     parser.add_argument("--num-workers", type=int, default=2)
 
     # Checkpointing.

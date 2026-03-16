@@ -30,8 +30,8 @@ class TransmutationDataset(Dataset):
         self,
         data_dir: str,
         tokenizer_path: str,
-        max_src_len: int = 2048,
-        max_tgt_len: int = 4096,
+        max_src_len: int = 1152,
+        max_tgt_len: int = 1536,
     ):
         self.max_src_len = max_src_len
         self.max_tgt_len = max_tgt_len
@@ -115,8 +115,8 @@ def create_dataloader(
     data_dir: str,
     tokenizer_path: str,
     batch_size: int = 16,
-    max_src_len: int = 2048,
-    max_tgt_len: int = 4096,
+    max_src_len: int = 1152,
+    max_tgt_len: int = 1536,
     shuffle: bool = True,
     num_workers: int = 2,
     pad_id: int = 0,

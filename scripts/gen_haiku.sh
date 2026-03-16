@@ -92,6 +92,7 @@ fi
 
 claude_cmd() {
     CLAUDECODE= MAX_THINKING_TOKENS=0 claude -p \
+        --no-session-persistence \
         --model=haiku \
         --tools='' \
         --disable-slash-commands \
@@ -100,57 +101,93 @@ claude_cmd() {
         "$@"
 }
 
-# --- Two prompt templates: answer mode vs tool mode ---
+# --- Single composable prompt template ---
+# Field instructions are injected by build_prompt() based on boolean flags.
 
-ANSWER_PROMPT='You are a data generator. Output exactly %d JSON objects, one per line.
+PROMPT_HEADER='You are a data generator. Output exactly %d JSON objects, one per line.
+Each line must be valid JSON. Output ONLY JSON lines, nothing else.
+Follow the field instructions EXACTLY — use the precise nesting shown.'
 
-Schema: {"thought": "...", "answer": "...", "tool": null, "memory": ["...", ...]}
+THOUGHT_INSTRUCTION='- "thought": 3-12 sentences of detailed reasoning. Use varied vocabulary and sentence structures. Mix short punchy sentences with longer analytical ones. Include comparisons with < > symbols, threshold references, and technical detail.'
 
-Every object MUST have "tool": null and "answer" as a non-null string.
+ANSWER_INSTRUCTION='- "answer": substantial response text, 5-20 sentences. MUST include a mix of: markdown headers, code blocks, bullet lists, tables, inline code, comparisons using < > operators, HTML/XML tag references, URLs with & parameters, and mathematical expressions. Use apostrophes, quotes, and special characters naturally.'
+ANSWER_NULL_INSTRUCTION='- "answer": MUST be null.'
 
-Constraints:
-- thought: 3-12 sentences of detailed reasoning. Use varied vocabulary and sentence structures. Mix short punchy sentences with longer analytical ones.
-- answer: substantial response text, 5-20 sentences. MUST include a mix of: markdown headers, code blocks, bullet lists, tables, inline code, comparisons using < > operators, HTML/XML tag references, URLs with & parameters, and mathematical expressions. Use apostrophes, quotes, and special characters naturally.
-- tool: MUST be null
-- memory: 4-10 short context strings. Include things like threshold rules (e.g. "Alert if latency > 500ms && error_rate < 0.1%%"), tag references (e.g. "Uses <config> & <auth> modules"), user preferences with apostrophes, and version/path strings.
-- Topics: cover DIFFERENT domains each sample. Go beyond tech: include medicine, law, finance, logistics, education, science, cooking, sports analytics, music production, agriculture, urban planning, journalism, game design, environmental science, linguistics, etc. The agent is a general-purpose assistant, not just a DevOps bot.
-- Use the seed words below as inspiration for topics and vocabulary. Do NOT repeat words across samples.
-- Each line must be valid JSON. Output ONLY JSON lines, nothing else.
+TOOL_INSTRUCTION='- "tool": MUST be a nested object: {"tool_name": "<name>", "arguments": {<args>}}. Pick a DIFFERENT tool_name for each sample from: %s. Vary the arguments structurally:
+  * Some: 1 arg (e.g. {"tool_name": "search", "arguments": {"query": "..."}})
+  * Some: 3-5 args (e.g. {"tool_name": "execute_sql", "arguments": {"query": "...", "database": "prod", "timeout_ms": 5000}})
+  * Some: nested objects (e.g. {"tool_name": "execute_python", "arguments": {"code": "...", "env": {"PATH": "/usr/bin"}}})
+  * Some: arrays (e.g. {"tool_name": "search", "arguments": {"query": "...", "sources": ["web", "docs"]}})
+  * Code args: include comments, string literals with special chars, varied complexity.'
+TOOL_NULL_INSTRUCTION='- "tool": MUST be null.'
 
-SEED WORDS: %s
+MEMORY_INSTRUCTION='- "memory": 4-10 short context strings. Include threshold rules (e.g. "Alert if latency > 500ms && error_rate < 0.1%%"), tag references (e.g. "Uses <config> & <auth> modules"), user preferences with apostrophes, and version/path strings.'
+MEMORY_NULL_INSTRUCTION='- "memory": MUST be null.'
+MEMORY_OMIT_INSTRUCTION='- Do NOT include a "memory" field at all.'
 
-DOMAIN WORDS: %s'
-
-TOOL_PROMPT='You are a data generator. Output exactly %d JSON objects, one per line.
-
-Every object MUST use the tool "%s". The answer field MUST be null.
-
-Schema: {"thought": "...", "answer": null, "tool": {"tool_name": "%s", "arguments": {%s}}, "memory": ["...", ...]}
-
-Constraints:
-- thought: 3-12 sentences of reasoning about why this tool is needed. Use varied vocabulary and natural language. Include comparisons with < > symbols, references to thresholds, and technical detail.
-- answer: MUST be null
-- tool: MUST be {"tool_name": "%s", "arguments": {<realistic args>}}. Tool arguments should contain substantial, realistic content — full queries, real code, genuine file paths. Code should include comments, string literals with special chars, and varied complexity.
-- memory: 4-10 short context strings. Include threshold rules with < > && operators, tag/element references, user preferences with apostrophes, and technical notes.
-- Topics: cover DIFFERENT domains each sample. Go beyond tech: medicine, finance, science, logistics, education, cooking, sports, music, agriculture, law, journalism, game design, environmental science, etc.
+PROMPT_FOOTER='- Topics: cover DIFFERENT domains each sample. Go beyond tech: medicine, law, finance, logistics, education, science, cooking, sports, music, agriculture, urban planning, journalism, game design, environmental science, linguistics, etc.
 - Use the seed words below as inspiration. Do NOT repeat vocabulary across samples.
-- Each line must be valid JSON. Output ONLY JSON lines, nothing else.
 
 SEED WORDS: %s
 
 DOMAIN WORDS: %s'
 
-# Argument hints per tool type so Haiku knows the schema.
-declare -A TOOL_ARG_HINTS
-TOOL_ARG_HINTS[execute_sql]='"query": "<full SQL query>"'
-TOOL_ARG_HINTS[execute_python]='"code": "<python code>"'
-TOOL_ARG_HINTS[execute_javascript]='"code": "<javascript code>"'
-TOOL_ARG_HINTS[execute_shell]='"command": "<shell command>"'
-TOOL_ARG_HINTS[execute_go]='"code": "<go code>"'
-TOOL_ARG_HINTS[search]='"query": "<search query>"'
-TOOL_ARG_HINTS[read_file]='"path": "<file path>"'
-TOOL_ARG_HINTS[write_file]='"path": "<file path>", "content": "<file content>"'
-TOOL_ARG_HINTS[http_request]='"url": "<url>", "method": "<GET|POST|PUT|DELETE>", "body": "<optional json body>"'
+# build_prompt count answer_mode tool_mode memory_mode seed_words domain_words
+#   answer_mode: "include" | "null"
+#   tool_mode:   "include" | "null"
+#   memory_mode: "include" | "null" | "omit"
+build_prompt() {
+    local count="$1" answer_mode="$2" tool_mode="$3" memory_mode="$4"
+    local seed_words="$5" domain_words="$6"
+
+    # Header
+    local prompt
+    prompt="${PROMPT_HEADER/\%d/$count}"
+    prompt="$prompt
+
+Field instructions:
+$THOUGHT_INSTRUCTION"
+
+    # Answer
+    if [ "$answer_mode" = "include" ]; then
+        prompt="$prompt
+$ANSWER_INSTRUCTION"
+    else
+        prompt="$prompt
+$ANSWER_NULL_INSTRUCTION"
+    fi
+
+    # Tool
+    if [ "$tool_mode" = "include" ]; then
+        local tool_list
+        tool_list=$(printf '%s\n' "${TOOL_NAMES[@]}" | shuf -n 5 | tr '\n' ', ' | sed 's/,$//')
+        prompt="$prompt
+${TOOL_INSTRUCTION/\%s/$tool_list}"
+    else
+        prompt="$prompt
+$TOOL_NULL_INSTRUCTION"
+    fi
+
+    # Memory
+    if [ "$memory_mode" = "include" ]; then
+        prompt="$prompt
+$MEMORY_INSTRUCTION"
+    elif [ "$memory_mode" = "null" ]; then
+        prompt="$prompt
+$MEMORY_NULL_INSTRUCTION"
+    else
+        prompt="$prompt
+$MEMORY_OMIT_INSTRUCTION"
+    fi
+
+    # Footer
+    local footer="${PROMPT_FOOTER/\%s/$seed_words}"
+    footer="${footer/\%s/$domain_words}"
+    prompt="$prompt
+$footer"
+
+    echo "$prompt"
+}
 
 # Generate one shard. Args: shard_num, mode (answer|tool_name), batch_size
 generate_shard() {
@@ -166,16 +203,19 @@ generate_shard() {
     pool2="${DOMAIN_POOLS[$((RANDOM % ${#DOMAIN_POOLS[@]}))]}"
     domain_words=$(echo "$pool1 $pool2" | tr ' ' '\n' | shuf -n 20 | tr '\n' ' ')
 
+    # Parse mode: "answer", "tool", "answer_nomem", "tool_nomem"
+    local answer_mode="null" tool_mode="null" memory_mode="include"
+    case "$mode" in
+        answer)         answer_mode="include"; tool_mode="null";    memory_mode="include" ;;
+        tool)           answer_mode="null";    tool_mode="include"; memory_mode="include" ;;
+        answer_nomem)   answer_mode="include"; tool_mode="null";    memory_mode="omit" ;;
+        tool_nomem)     answer_mode="null";    tool_mode="include"; memory_mode="omit" ;;
+        answer_nullmem) answer_mode="include"; tool_mode="null";    memory_mode="null" ;;
+        tool_nullmem)   answer_mode="null";    tool_mode="include"; memory_mode="null" ;;
+    esac
+
     local filled_prompt
-    if [ "$mode" = "answer" ]; then
-        # shellcheck disable=SC2059
-        filled_prompt=$(printf "$ANSWER_PROMPT" "$batch" "$seed_words" "$domain_words")
-    else
-        local tool_name="$mode"
-        local arg_hint="${TOOL_ARG_HINTS[$tool_name]}"
-        # shellcheck disable=SC2059
-        filled_prompt=$(printf "$TOOL_PROMPT" "$batch" "$tool_name" "$tool_name" "$arg_hint" "$tool_name" "$seed_words" "$domain_words")
-    fi
+    filled_prompt=$(build_prompt "$batch" "$answer_mode" "$tool_mode" "$memory_mode" "$seed_words" "$domain_words")
 
     RAW=$(claude_cmd "$filled_prompt" 2>/dev/null || true)
 
@@ -190,7 +230,7 @@ generate_shard() {
         return
     fi
 
-    WRAPPED=$(echo "$VALID" | "$GENERATE_BIN" -wrap 2>"$OUT_DIR/wrap_${shard_num}.log" || true)
+    WRAPPED=$(echo "$VALID" | "$GENERATE_BIN" -wrap -reject-file "$PROJECT_DIR/data/rejects/rejects.jsonl" 2>"$OUT_DIR/wrap_${shard_num}.log" || true)
     if [ -n "$WRAPPED" ]; then
         echo "$WRAPPED" > "$shard_file"
         N=$(echo "$WRAPPED" | wc -l)
@@ -240,13 +280,9 @@ while [ "$TOTAL_REQUESTED" -lt "$COUNT" ]; do
             break
         fi
 
-        # Alternate: even jobs = answer, odd jobs = random tool.
-        if [ $((J % 2)) -eq 0 ]; then
-            MODE="answer"
-        else
-            # Pick a random tool type.
-            MODE="${TOOL_NAMES[$((RANDOM % ${#TOOL_NAMES[@]}))]}"
-        fi
+        # Cycle through mode variants for diversity.
+        MODES=(answer tool answer_nomem tool_nomem answer_nullmem tool_nullmem answer tool tool)
+        MODE="${MODES[$((J % ${#MODES[@]}))]}"
 
         generate_shard "$SHARD" "$MODE" "$THIS_BATCH" &
         PIDS+=($!)
@@ -270,4 +306,8 @@ ACTUAL=0
 if ls "$OUT_DIR"/haiku_shard_*.jsonl 1>/dev/null 2>&1; then
     ACTUAL=$(wc -l "$OUT_DIR"/haiku_shard_*.jsonl 2>/dev/null | tail -1 | awk '{print $1}')
 fi
-echo "Done. $ACTUAL valid training pairs in $OUT_DIR"
+REJECTS=0
+if [ -f "$OUT_DIR/rejects.jsonl" ]; then
+    REJECTS=$(wc -l < "$OUT_DIR/rejects.jsonl")
+fi
+echo "Done. $ACTUAL valid training pairs, $REJECTS rejects saved in $OUT_DIR"

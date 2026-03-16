@@ -38,6 +38,7 @@ type TrainingPair struct {
 
 var specialProb float64
 var corruptPct float64
+var compactPct float64
 
 func main() {
 	var (
@@ -56,6 +57,9 @@ func main() {
 	flag.BoolVar(&isVal, "val", false, "generate val split (uses offset seed, disjoint from train)")
 	flag.Float64Var(&specialProb, "special-prob", 0.15, "probability of XML special char injection per word boundary (0-1)")
 	flag.Float64Var(&corruptPct, "corrupt-pct", 0, "percentage of samples to corrupt input JSON (0-100)")
+	flag.Float64Var(&compactPct, "compact-pct", 0, "percentage of samples to compact input to single-line JSON (0-100)")
+	var minChars int
+	flag.IntVar(&minChars, "min-chars", 0, "minimum input character length (0 = no filter)")
 	flag.StringVar(&sampleType, "type", "all", "sample type filter: answer, tool, or all")
 	flag.Parse()
 
@@ -64,7 +68,18 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error loading haiku: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Fprintf(os.Stderr, "Loaded %d haiku samples\n", len(samples))
+	if minChars > 0 {
+		filtered := samples[:0]
+		for _, s := range samples {
+			if len(s.Input) >= minChars {
+				filtered = append(filtered, s)
+			}
+		}
+		fmt.Fprintf(os.Stderr, "Loaded %d haiku samples, %d passed min-chars=%d filter\n", len(samples), len(filtered), minChars)
+		samples = filtered
+	} else {
+		fmt.Fprintf(os.Stderr, "Loaded %d haiku samples\n", len(samples))
+	}
 
 	// Deterministic shuffle of indices — same seed always gives same order.
 	// Val uses offset seed so train and val sample disjoint subsets.
@@ -73,14 +88,6 @@ func main() {
 		sampSeed = seed + 7777777
 	}
 	rng := rand.New(rand.NewPCG(sampSeed, sampSeed^0xdeadbeef))
-
-	indices := make([]int, len(samples))
-	for i := range indices {
-		indices[i] = i
-	}
-	rng.Shuffle(len(indices), func(i, j int) {
-		indices[i], indices[j] = indices[j], indices[i]
-	})
 
 	keep := int(float64(len(samples)) * samplePct / 100)
 	if keep <= 0 {
@@ -91,7 +98,7 @@ func main() {
 		keep = len(samples)
 	}
 
-	selected := indices[:keep]
+	selected := stratifiedSample(samples, keep, rng)
 
 	bw := bufio.NewWriterSize(os.Stdout, 256*1024)
 	defer bw.Flush()
@@ -101,32 +108,40 @@ func main() {
 	augmented := 0
 	augFailed := 0
 	corrupted := 0
+	compacted := 0
 
 	for _, idx := range selected {
 		sample := samples[idx]
 
-		// Emit the natural (unmodified) sample, optionally corrupted.
+		// Emit the natural (unmodified) sample, optionally compacted/corrupted.
 		out := sample
-		if corruptPct > 0 {
-			cSeed := seed + uint64(idx)*uint64(augRatio+1) + 999999
-			cRng := rand.New(rand.NewPCG(cSeed, cSeed^0xf00d))
-			if cRng.Float64()*100 < corruptPct {
-				out.Input = corrupt.Apply(out.Input, corruptionConfig(cRng), cRng)
-				corrupted++
-			}
+		cSeed := seed + uint64(idx)*uint64(augRatio+1) + 999999
+		cRng := rand.New(rand.NewPCG(cSeed, cSeed^0xf00d))
+		if compactPct > 0 && cRng.Float64()*100 < compactPct {
+			out.Input = compactJSON(out.Input)
+			compacted++
+		}
+		if corruptPct > 0 && cRng.Float64()*100 < corruptPct {
+			out.Input = corrupt.Apply(out.Input, corruptionConfig(cRng), cRng)
+			corrupted++
 		}
 		enc.Encode(out)
 		natural++
 
-		// Emit augRatio augmented variants, optionally corrupted.
+		// Emit augRatio augmented variants, optionally compacted/corrupted.
 		for v := range augRatio {
 			augSeed := seed + uint64(idx)*uint64(augRatio+1) + uint64(v) + 1
 			augRng := rand.New(rand.NewPCG(augSeed, augSeed^0xcafebabe))
 
 			aug, err := augmentSample(sample, augRng)
 			if err != nil {
+				fmt.Fprintf(os.Stderr, "  augment fail: %v\n", err)
 				augFailed++
 				continue
+			}
+			if compactPct > 0 && augRng.Float64()*100 < compactPct {
+				aug.Input = compactJSON(aug.Input)
+				compacted++
 			}
 			if corruptPct > 0 {
 				cSeed := augSeed ^ 0xf00d
@@ -149,6 +164,9 @@ func main() {
 	}
 	fmt.Fprintf(os.Stderr, "Haiku augment (%s): %d natural + %d augmented = %d total (sampled %d = %.1f%% of %d",
 		split, natural, augmented, natural+augmented, keep, samplePct, len(samples))
+	if compacted > 0 {
+		fmt.Fprintf(os.Stderr, ", %d compacted", compacted)
+	}
 	if corrupted > 0 {
 		fmt.Fprintf(os.Stderr, ", %d corrupted", corrupted)
 	}
@@ -306,6 +324,92 @@ func augmentString(s string, rng *rand.Rand) string {
 		words[i], words[j] = words[j], words[i]
 	})
 	return randtext.InjectSpecialChars(rng, strings.Join(words, " "), specialProb)
+}
+
+// Length bins for stratified sampling (input character counts).
+// Tuned to the haiku corpus distribution where pretty-printed JSON
+// starts around 2000 chars. Bins cover short→long evenly.
+var lengthBins = []int{0, 2500, 3500, 4500, 6000, 8000, 11000, 16000}
+
+// stratifiedSample bins samples by input character length and samples equally
+// from each bin. Bins with fewer samples than their quota contribute all they
+// have; surplus quota is redistributed to larger bins.
+func stratifiedSample(samples []TrainingPair, total int, rng *rand.Rand) []int {
+	numBins := len(lengthBins)
+	bins := make([][]int, numBins)
+	for i := range bins {
+		bins[i] = []int{}
+	}
+
+	// Assign each sample to a bin.
+	for idx, s := range samples {
+		charLen := len(s.Input)
+		bin := numBins - 1
+		for b := numBins - 1; b >= 0; b-- {
+			if charLen >= lengthBins[b] {
+				bin = b
+				break
+			}
+		}
+		bins[bin] = append(bins[bin], idx)
+	}
+
+	// Shuffle each bin.
+	for _, bin := range bins {
+		rng.Shuffle(len(bin), func(i, j int) {
+			bin[i], bin[j] = bin[j], bin[i]
+		})
+	}
+
+	// Sample equally, redistribute surplus from small bins.
+	perBin := total / numBins
+	var selected []int
+	surplus := 0
+	for _, bin := range bins {
+		quota := perBin
+		if len(bin) < quota {
+			surplus += quota - len(bin)
+			quota = len(bin)
+		}
+		selected = append(selected, bin[:quota]...)
+	}
+
+	// Distribute surplus across bins that have remaining capacity.
+	if surplus > 0 {
+		for i, bin := range bins {
+			used := perBin
+			if len(bin) < perBin {
+				continue // already exhausted
+			}
+			remaining := len(bin) - used
+			take := min(remaining, surplus)
+			if take > 0 {
+				selected = append(selected, bin[used:used+take]...)
+				surplus -= take
+				_ = i
+			}
+			if surplus <= 0 {
+				break
+			}
+		}
+	}
+
+	return selected
+}
+
+// compactJSON re-marshals pretty-printed JSON into single-line compact form.
+// This simulates real LLM output which is typically one-line JSON with escaped
+// newlines (\n) inside string values rather than pretty-printed.
+func compactJSON(prettyJSON string) string {
+	var obj any
+	if err := json.Unmarshal([]byte(prettyJSON), &obj); err != nil {
+		return prettyJSON // fallback: return as-is
+	}
+	compact, err := json.Marshal(obj)
+	if err != nil {
+		return prettyJSON
+	}
+	return string(compact)
 }
 
 // corruptionConfig returns a corruption config with a distribution matching

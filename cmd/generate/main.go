@@ -66,6 +66,8 @@ func main() {
 	flag.BoolVar(&toStdout, "stdout", false, "write JSONL to stdout instead of files")
 	flag.IntVar(&stage, "stage", 0, "curriculum stage (1-5); 0 = legacy random JSON")
 	flag.BoolVar(&wrapStdin, "wrap", false, "read JSON from stdin, convert to JSONL training pairs on stdout")
+	var rejectFile string
+	flag.StringVar(&rejectFile, "reject-file", "", "write rejected raw lines to this file (one per line)")
 	var mixPct float64
 	var mixCorruptPct float64
 	var augmentPctFlag float64
@@ -83,7 +85,7 @@ func main() {
 
 	// Wrap mode: read JSON objects from stdin, convert each to a training pair.
 	if wrapStdin {
-		if err := wrapFromStdin(); err != nil {
+		if err := wrapFromStdin(rejectFile); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
@@ -455,10 +457,30 @@ func mixCorruptionConfig(rng *rand.Rand) corrupt.Config {
 // validates each thoroughly, converts to XML, verifies XML validity,
 // and writes JSONL pairs to stdout. Rejects any sample that doesn't meet
 // quality gates.
-func wrapFromStdin() error {
+func wrapFromStdin(rejectPath string) error {
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024) // 10MB max line
 	enc := json.NewEncoder(os.Stdout)
+
+	// Open reject file if requested.
+	var rejectWriter *bufio.Writer
+	if rejectPath != "" {
+		f, err := os.OpenFile(rejectPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			return fmt.Errorf("open reject file: %w", err)
+		}
+		defer f.Close()
+		rejectWriter = bufio.NewWriter(f)
+		defer rejectWriter.Flush()
+	}
+
+	reject := func(line string, lineNum int, reason string) {
+		fmt.Fprintf(os.Stderr, "REJECT line %d: %s\n", lineNum, reason)
+		if rejectWriter != nil {
+			rejectWriter.WriteString(line)
+			rejectWriter.WriteByte('\n')
+		}
+	}
 
 	lineNum := 0
 	accepted := 0
@@ -473,7 +495,7 @@ func wrapFromStdin() error {
 
 		// Gate 1: valid JSON.
 		if !json.Valid([]byte(line)) {
-			fmt.Fprintf(os.Stderr, "REJECT line %d: invalid JSON\n", lineNum)
+			reject(line, lineNum, "invalid JSON")
 			rejected++
 			continue
 		}
@@ -481,29 +503,22 @@ func wrapFromStdin() error {
 		// Gate 2: must be a JSON object with expected schema fields.
 		var obj map[string]any
 		if err := json.Unmarshal([]byte(line), &obj); err != nil {
-			fmt.Fprintf(os.Stderr, "REJECT line %d: not a JSON object: %v\n", lineNum, err)
+			reject(line, lineNum, fmt.Sprintf("not a JSON object: %v", err))
 			rejected++
 			continue
 		}
 
 		// Check required fields exist.
 		if _, ok := obj["thought"]; !ok {
-			fmt.Fprintf(os.Stderr, "REJECT line %d: missing 'thought' field\n", lineNum)
+			reject(line, lineNum, "missing 'thought' field")
 			rejected++
 			continue
 		}
-		if _, ok := obj["memory"]; !ok {
-			fmt.Fprintf(os.Stderr, "REJECT line %d: missing 'memory' field\n", lineNum)
-			rejected++
-			continue
-		}
-
 		// Must have exactly one of answer/tool non-null.
 		answerNull := obj["answer"] == nil
 		toolNull := obj["tool"] == nil
 		if answerNull == toolNull {
-			fmt.Fprintf(os.Stderr, "REJECT line %d: need exactly one of answer/tool non-null (answer=%v, tool=%v)\n",
-				lineNum, !answerNull, !toolNull)
+			reject(line, lineNum, fmt.Sprintf("need exactly one of answer/tool non-null (answer=%v, tool=%v)", !answerNull, !toolNull))
 			rejected++
 			continue
 		}
@@ -511,23 +526,25 @@ func wrapFromStdin() error {
 		// thought must be a non-empty string.
 		thought, ok := obj["thought"].(string)
 		if !ok || len(thought) < 10 {
-			fmt.Fprintf(os.Stderr, "REJECT line %d: thought must be a string with 10+ chars\n", lineNum)
+			reject(line, lineNum, "thought must be a string with 10+ chars")
 			rejected++
 			continue
 		}
 
-		// memory must be a non-empty array.
-		mem, ok := obj["memory"].([]any)
-		if !ok || len(mem) < 1 {
-			fmt.Fprintf(os.Stderr, "REJECT line %d: memory must be a non-empty array\n", lineNum)
-			rejected++
-			continue
+		// memory is optional. If present, must be a non-empty array.
+		if mem, hasMem := obj["memory"]; hasMem && mem != nil {
+			memArr, ok := mem.([]any)
+			if !ok || len(memArr) < 1 {
+				reject(line, lineNum, "memory present but not a non-empty array")
+				rejected++
+				continue
+			}
 		}
 
 		// Gate 3: pretty-print for consistent formatting.
 		pretty, err := json.MarshalIndent(obj, "", "  ")
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "REJECT line %d: marshal error: %v\n", lineNum, err)
+			reject(line, lineNum, fmt.Sprintf("marshal error: %v", err))
 			rejected++
 			continue
 		}
@@ -535,7 +552,7 @@ func wrapFromStdin() error {
 		// Gate 4: convert to XML.
 		xmlOut, err := xmlconv.Convert(pretty)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "REJECT line %d: xmlconv error: %v\n", lineNum, err)
+			reject(line, lineNum, fmt.Sprintf("xmlconv error: %v", err))
 			rejected++
 			continue
 		}
@@ -548,7 +565,7 @@ func wrapFromStdin() error {
 			_, err := decoder.Token()
 			if err != nil {
 				if err.Error() != "EOF" {
-					fmt.Fprintf(os.Stderr, "REJECT line %d: generated XML is not parseable: %v\n", lineNum, err)
+					reject(line, lineNum, fmt.Sprintf("generated XML is not parseable: %v", err))
 					xmlValid = false
 				}
 				break

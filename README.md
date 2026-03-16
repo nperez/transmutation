@@ -19,7 +19,7 @@ XML was chosen as the output format because it cleanly handles embedded content 
 **Inference**: ONNX Runtime. The ONNX models can be loaded from any language with an ONNX runtime — Go, Python, Java, C#, Rust, etc. A Go inference harness is included.
 
 **Data generation**: Go. Two pipelines:
-- **Haiku-first** (current) — samples from a corpus of ~100k real LLM haiku outputs, augments by replacing string values with dictionary words or shuffled content while preserving JSON structure, with configurable XML special character injection and corruption
+- **Haiku-first** (current) — samples from a corpus of ~140k real LLM haiku outputs with length-stratified sampling, augments by replacing string values with dictionary words or shuffled content while preserving JSON structure, with configurable XML special character injection, JSON corruption, and compact (single-line) JSON output
 - **Synthetic** (legacy) — generates random agent response JSON with embedded code, markdown, and tool calls, applies configurable corruption and produces target XML
 
 ## Run 1 Results
@@ -92,53 +92,55 @@ All failures after epoch 51 were traced to **input truncation** — inputs excee
 - **Validation budget scaling** — full validation set at every epoch wastes GPU time in early stages. Stage 1 needs only ~100 val samples for a coarse signal; scale up as stages advance.
 - **AR eval is the bottleneck** — CPU-based autoregressive decoding (required because Mamba CUDA kernels don't support single-step mode) takes ~15 min for 50 samples. Consider reducing AR eval samples or running less frequently.
 
-## Run 2 Results (in progress)
+## Run 2 Results
 
-Run 2 uses real haiku LLM outputs (~100k samples) with a 6-stage answer-first curriculum. Same hardware (RTX 2060 6GB), same model architecture.
+Run 2 used real haiku LLM outputs (~140k samples) with an 8-stage answer-first curriculum. Same hardware (RTX 2060 6GB), same model architecture. Best model: epoch 32 (stage 6).
 
-### Training Budget (so far)
+### Training Budget
 
-| Metric | Run 1 | Run 2 (epoch 25) | Run 2 / Run 1 |
-|--------|-------|-------------------|---------------|
-| Optimizer steps | 138,343 | ~20,190 | 15% |
-| Training tokens | ~5.2B | ~755M | 15% |
-| Epochs | 53 | 25 | 47% |
-| Stages completed | 5 | 4 (of 6) | — |
+| Metric | Run 1 | Run 2 | Run 2 / Run 1 |
+|--------|-------|-------|---------------|
+| Optimizer steps | 138,343 | 50,795 | 37% |
+| Epochs | 53 | 39 | 74% |
+| Steps to 50/50 AR | 131,248 | 32,651 | **4x faster** |
+| Best val exact | 95.5% | 91.4% | — |
+| Real reject xml_ok | untested | 4/20 (20%) | — |
 
 ### Key Metrics
 
-| Epoch | Stage | Train Loss | Val Exact | AR Exact | AR XML OK | CW |
-|-------|-------|-----------|-----------|----------|-----------|-----|
-| 1     | 1     | 81.57     | 0.0%      | 0/50     | 0/50      | 1.0 |
-| 10    | 1     | 2.14      | 0.0%      | 0/50     | 0/50      | 4.5 |
-| 11    | 1     | 0.44      | 1.0%      | 11/50    | 26/50     | 4.5 |
-| 16    | 1     | 0.15      | 1.0%      | 30/50    | 45/50     | 4.5 |
-| 21    | 1→2   | 0.12      | 5.0%      | 41/50    | 47/50     | 7.1 |
-| 22    | 2     | 0.08      | 5.0%      | 39/50    | 48/50     | — |
-| 23    | 2→3   | 0.06      | 6.1%      | 40/50    | 50/50     | — |
-| 24    | 3→4   | 0.10      | 73.5%     | 34/50    | 39/50     | — |
-| **25**| **4** | **0.09**  | **78.6%** | **45/50**| **50/50** | — |
+| Epoch | Stage | Train Loss | Val Exact | AR Exact | AR XML OK |
+|-------|-------|-----------|-----------|----------|-----------|
+| 1     | 1     | 81.57     | 0.0%      | 0/50     | 0/50      |
+| 11    | 1     | 0.44      | 1.0%      | 11/50    | 26/50     |
+| 21    | 1→2   | 0.12      | 5.0%      | 41/50    | 47/50     |
+| 24    | 3→4   | 0.10      | 73.5%     | 34/50    | 39/50     |
+| 27    | 5     | 0.11      | 80.8%     | 49/50    | 50/50     |
+| 29    | 6     | 0.15      | 90.1%     | 39/50    | 50/50     |
+| **32**| **6** | **0.18**  | **91.4%** | **50/50**| **50/50** |
+| 36    | 7     | 0.18      | 90.9%     | 46/50    | 50/50     |
+| 38    | 8     | 1.02      | 14.7%     | 49/50    | 50/50     |
 
-### Sawtooth Content Weight
+### What Worked
 
-The adaptive content weight was the key innovation of run2. In stage 1:
+- **Sawtooth content weight** — adaptive cw that ramps when val improvement stalls, resets on stage advance. Drove val exact from 80.8%→91.4% without manual intervention.
+- **Curriculum learning** — 4x faster to 50/50 AR than run 1. Staged difficulty (answer→tool→mixed→augmented→corrupted) is dramatically more efficient than monolithic training.
+- **Bracket swap corruption** — added mid-run when real reject analysis showed `}`↔`]` swaps are the #1 real LLM failure pattern. AR exact jumped 39→48 in one epoch after adding it.
+- **Compact JSON augmentation** — compacting pretty-printed JSON to single-line format, introduced at stage 7. Model absorbed it within 3 epochs.
 
-1. **Epochs 1-3**: cw=1.0, model learns structural XML transformation (val drops 375→6.4)
-2. **Epochs 4-9**: val flattens, sawtooth ramps cw from 1.0→4.5 over 5 epochs
-3. **Epoch 10**: content accuracy breakthrough — val crashes from 5.5→2.2 in one epoch
-4. **Epochs 11+**: AR eval activates, model converges to 82% AR exact at cw=4.5
+### What Didn't Work
 
-On stage advance (e.g., stage 1→2), content weight resets to 1.0 and the cycle repeats. The model re-learns structure for the new data type, then the sawtooth ramps content pressure as the structure plateaus.
+- **Stage 8 (long samples only)** — training exclusively on samples >4000 chars at LR 1.25e-5 produced no convergence. Losses stayed at 0.8-1.5 across two full epochs. The 384d/d_state=16 Mamba architecture hits a representational capacity ceiling at ~1000 tokens.
+- **Real reject inference** — 0/20 exact match on actual broken LLM output across all checkpoints. The model handles synthetic corruption well but fails on real patterns: multi-bracket runs (`]}}}`), escaped `\n` in strings, ambiguous nesting boundaries.
+- **Late compact introduction** — compact JSON wasn't added until stage 7 (epoch 33). The model spent 32 epochs on pretty-printed only, then had to learn a new format. Should be present from stage 1.
 
-### Stage Transitions
+### Lessons Learned (new in run 2)
 
-- **Stage 1→2** (epoch 21): Answer-only mastered at 82% AR exact. Sawtooth cw reached 7.1.
-- **Stage 2→3** (epoch 23): Tool structures learned in 2 epochs. 100% XML validity.
-- **Stage 3→4** (epoch 25): Full mix + augmentation. Val exact jumped 6%→79% in one epoch. 90% AR exact, 100% XML.
-
-### Comparison with Run 1
-
-Run 2 reached stage 4 in 20k steps vs run 1's ~25k steps for equivalent capability, on harder real-world data. The sawtooth content weight eliminated the need for manual intervention — run 1 required manual content_weight tuning, while run 2's weight adapted automatically to the learning dynamics.
+- **best_ar_exact must be persisted in checkpoints** — a stop/resume cycle reset the tracker, causing best.pt to be overwritten with a worse model.
+- **Val set must not change with max-stage** — regenerating the val set with new stage params breaks metric comparability across the run.
+- **LR warm restart on stage advance** — the plateau scheduler halved LR 4 times by stage 8, leaving it at 1.25e-5 which was too low to learn new patterns. Implemented LR restart to half-base on advance.
+- **AR eval is noisy at later stages** — variable sample lengths cause AR exact to oscillate 32-50 between epochs. Val exact is more stable.
+- **Effective sequence length ceiling ~1000 tokens** — the model produces exact matches up to ~1000 tokens, whitespace-collapsed xml_ok up to ~1200, and fails/truncates beyond ~1500.
+- **`--no-session-persistence`** — Claude CLI generates ~3GB/hour of session logs without this flag. Essential for batch generation.
 
 ## Data Pipelines
 
@@ -152,32 +154,36 @@ Uses real LLM outputs (~100k haiku samples) as the data source. Each epoch sampl
 ```
 
 The `cmd/augment` tool handles sampling and augmentation:
-- Loads haiku JSONL from `data/haiku/`
-- Samples N% of corpus per epoch (disjoint train/val via seed offset)
+- Loads haiku JSONL from `data/haiku/` (corpus.jsonl or individual shards)
+- Length-stratified sampling: bins samples by character length, samples equally from each bin
 - For each sample, emits the natural pair + N augmented variants
 - Augmented variants replace string values with dictionary words or shuffled content
 - Configurable XML special character injection (`-special-prob`)
-- Configurable JSON corruption (`-corrupt-pct`)
+- Configurable JSON corruption (`-corrupt-pct`) with bracket swaps, drops, and multi-bracket runs
+- Configurable compact JSON output (`-compact-pct`) — single-line with escaped newlines
+- Minimum character length filter (`-min-chars`)
 
-**Haiku curriculum stages (6-stage, answer-first):**
+**Haiku curriculum stages (5-stage, run 3):**
 
-| Stage | Type | Aug Ratio | Special Prob | Corrupt % | Sample % |
-|-------|------|-----------|-------------|-----------|----------|
-| 1     | answer | 0 (natural only) | 0.0  | 0   | 50       |
-| 2     | tool   | 0 (natural only) | 0.0  | 0   | 50       |
-| 3     | all    | 1:5       | 0.15        | 0         | 5        |
-| 4     | all    | 1:10      | 0.30        | 0         | 5        |
-| 5     | all    | 1:10      | 0.40        | 10        | 5        |
-| 6     | all    | 1:10      | 0.40        | 20        | 5        |
+| Stage | Type | Aug Ratio | Special Prob | Corrupt % | Compact % | Sample % |
+|-------|------|-----------|-------------|-----------|-----------|----------|
+| 1     | answer | 0 (natural only) | 0.0  | 0   | 50 | 50       |
+| 2     | tool   | 0 (natural only) | 0.0  | 0   | 50 | 50       |
+| 3     | all    | 1:5       | 0.15        | 0         | 50 | 5        |
+| 4     | all    | 1:10      | 0.30        | 10        | 50 | 5        |
+| 5     | all    | 1:10      | 0.40        | 20        | 50 | 5        |
 
-Auto-advance when AR exact match >= 55% for 2 consecutive epochs.
+Auto-advance when AR exact match >= 55% for 2 consecutive epochs. LR resets to half-base on stage advance.
 
-**Key training innovations (run2):**
+**Key training innovations:**
 
-- **Sawtooth content weight** — content token loss weight starts at 1.0 (learn structure first) and ramps up adaptively when val improvement stalls. Resets to 1.0 on stage advance, creating a sawtooth pattern: each new stage re-learns structure at low weight, then gradually shifts focus to content accuracy. The ramp is computed every 2 epochs from the val loss improvement rate.
-- **Adaptive validation budget** — validation set generated once at max stage difficulty (55k samples), but early stages only validate on a small prefix (50-5000 batches). Full validation runs only at stages 5-6. This cuts epoch time from ~45 min to ~30 min in early stages.
-- **LR 2e-4 with 500-step warmup** — lower than run1's 3e-4 to avoid fp16 NaN at high gradient accumulation. 500 warmup steps (vs 2000) because epochs are larger.
-- **50% corpus sampling in stages 1-2** — larger epochs (~25k samples, ~776 steps) for more stable gradients. Stages 3+ use 5% with augmentation for variety.
+- **Sawtooth content weight** — content token loss weight starts at 1.0 (learn structure first) and ramps up adaptively when val improvement stalls. Resets to 1.0 on stage advance.
+- **Length-stratified sampling** — bins corpus by character length and samples equally from each bin, ensuring long samples (~10-26% of training) aren't drowned out by the short majority.
+- **Compact JSON from stage 1** — 50% of samples are single-line compact JSON throughout training. Real LLM output is compact; the model learns both formats from the start.
+- **Multi-bracket corruption** — generates `]}}}}` runs matching real LLM failure patterns, not just single bracket swaps.
+- **LR warm restart on stage advance** — resets learning rate to half-base and rebuilds the plateau scheduler, preventing accumulated LR decay from blocking learning on new data distributions.
+- **Adaptive validation budget** — early stages validate on a small prefix (50-5000 batches). Full validation runs only at stage 5.
+- **Variable schema** — some training samples omit `memory` field entirely, teaching the model to handle varied JSON schemas.
 
 ### Synthetic Pipeline (Run 1, legacy)
 
@@ -210,8 +216,8 @@ Training data follows a fixed agent response schema:
 
 - `thought` — the agent's reasoning (always present)
 - `answer` — text response, may contain markdown with fenced code blocks, tables, and lists (null when a tool is called)
-- `tool` — tool invocation with arguments; code execution tools (`execute_sql`, `execute_python`, `execute_javascript`, `execute_shell`, `execute_go`) embed realistic code snippets; utility tools (`search`, `read_file`, `write_file`, `http_request`) have simple arguments (null when an answer is given)
-- `memory` — contextual notes carried across interactions
+- `tool` — tool invocation with nested `tool_name` and `arguments`; arguments vary from single-field (`{"query": "..."}`) to multi-field with nested objects, arrays, and mixed types. Code execution tools embed realistic snippets. (null when an answer is given)
+- `memory` — contextual notes carried across interactions (optional — some samples omit this field entirely)
 
 ## XML Schema
 
@@ -251,7 +257,9 @@ Six element names. No attributes, no declarations, no namespaces.
 transmutation/
 ├── cmd/
 │   ├── augment/       # Haiku augmentation pipeline CLI
-│   ├── generate/      # Synthetic training data generator CLI (legacy)
+│   ├── enrich/        # Tool-call argument enrichment
+│   ├── generate/      # Synthetic training data generator + haiku wrapper
+│   ├── repair/        # Reject repair validation (dual-LLM agreement)
 │   ├── infer/         # Go ONNX inference CLI + Dockerfile
 │   └── collage/       # Visual sample collage generator
 ├── pkg/
@@ -272,9 +280,13 @@ transmutation/
 │   └── wheels/        # Pre-built mamba_ssm + causal_conv1d wheels
 ├── models/
 │   ├── run1/          # Archived run 1 (synthetic data, 53 epochs)
-│   └── run2/          # Current run (haiku data, 6-stage curriculum)
+│   ├── run2/          # Archived run 2 (haiku data, 8-stage, 39 epochs)
+│   └── run3/          # Current run
 ├── data/
-│   └── haiku/         # ~100k real LLM haiku outputs (JSONL)
+│   └── haiku/         # ~140k real LLM haiku outputs (corpus.jsonl)
+├── scripts/
+│   ├── gen_haiku.sh   # Generate haiku samples via Claude CLI
+│   └── repair_rejects.sh  # Repair broken samples via dual-LLM passes
 ├── go.mod
 └── go.sum
 ```
@@ -335,7 +347,7 @@ The corrupter applies a random subset of these to valid JSON:
 - **Preamble/postamble** — wrapping text ("Here is the JSON response:", etc.)
 - **Trailing commas** — after last elements
 - **Whitespace mangling** — inconsistent indentation
-- **Bracket issues** — mismatched or missing brackets
+- **Bracket issues** — single swaps (`}`↔`]`), drops, duplicates, and multi-bracket runs (`]}}}}`) matching real LLM failure patterns
 
 ## Embedded Languages
 

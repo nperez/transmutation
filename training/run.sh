@@ -186,6 +186,26 @@ case "${1:-help}" in
         fi
 
         mkdir -p "$PROJECT_DIR/$RUN_DIR"
+
+        # Train tokenizer if missing.
+        if [ ! -f "$PROJECT_DIR/$RUN_DIR/tokenizer.model" ]; then
+            echo "No tokenizer found — training one..."
+            build_generator
+            # Generate augmented corpus for tokenizer training.
+            mkdir -p "$PROJECT_DIR/data/train" "$PROJECT_DIR/data/val"
+            "$AUGMENT_BIN" -dir "$PROJECT_DIR/data/haiku" \
+                -sample-pct 30 -aug-ratio 5 -special-prob 0.30 -compact-pct 50 -seed 42 \
+                > "$PROJECT_DIR/data/train/haiku_augmented.jsonl"
+            "$AUGMENT_BIN" -dir "$PROJECT_DIR/data/haiku" \
+                -sample-pct 10 -aug-ratio 5 -special-prob 0.30 -compact-pct 50 -seed 42 -val \
+                > "$PROJECT_DIR/data/val/haiku_augmented.jsonl"
+            run_gpu training/tokenizer_train.py \
+                --data-dir data \
+                --output-dir "$RUN_DIR" \
+                --vocab-size 8000
+            echo "Tokenizer trained."
+        fi
+
         echo "Run: $RUN ($RUN_DIR)"
         CID=$(run_gpu_detached training/train.py \
             --data-dir data \
@@ -194,15 +214,15 @@ case "${1:-help}" in
             --augment-bin /app/augment \
             --batch-size 2 \
             --grad-accum 16 \
-            --max-src-len 1536 \
-            --max-tgt-len 2048 \
+            --max-src-len 1152 \
+            --max-tgt-len 1536 \
             --epochs 100 \
             --lr 2e-4 \
             --warmup-steps 500 \
             --save-every 5 \
             --fp16 \
             --stage 1 \
-            --max-stage 6 \
+            --max-stage 5 \
             --stage-advance-ar 0.55 \
             --stage-patience 2 \
             --content-weight 10.0 \
@@ -388,6 +408,33 @@ for e in entries[-5:]:
             -n "$N_SAMPLES" "$@"
         ;;
 
+    infer-rejects)
+        build_train
+        shift
+        N_SAMPLES="${1:-10}"
+        if [ -n "${1:-}" ]; then shift; fi
+
+        REJECTS_FILE="$PROJECT_DIR/data/haiku/rejects.jsonl"
+        if [ ! -f "$REJECTS_FILE" ]; then
+            echo "No rejects file at $REJECTS_FILE"
+            exit 1
+        fi
+
+        RESUME_CKPT=$(find_resume_flag | sed 's/--resume //')
+        CHECKPOINT="${RESUME_CKPT:-$RUN_DIR/best.pt}"
+
+        # Wrap raw reject lines as JSONL {"input": LINE, "target": ""}.
+        TMPFILE="$PROJECT_DIR/tmp/infer_rejects_$$.jsonl"
+        trap "rm -f '$TMPFILE'" EXIT
+        awk '{gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); print "{\"input\": \"" $0 "\", \"target\": \"\"}"}' \
+            "$REJECTS_FILE" > "$TMPFILE"
+
+        TOTAL=$(wc -l < "$TMPFILE")
+        echo "CPU inference on rejects: $CHECKPOINT ($N_SAMPLES of $TOTAL rejects)..."
+        cat "$TMPFILE" | run_cpu_stdin training/infer_cpu.py "$CHECKPOINT" \
+            -n "$N_SAMPLES" "$@"
+        ;;
+
     go-infer)
         build_infer
         build_generator
@@ -436,8 +483,8 @@ for e in entries[-5:]:
             --output-dir "$RUN_DIR" \
             --batch-size 2 \
             --grad-accum 16 \
-            --max-src-len 1536 \
-            --max-tgt-len 2048 \
+            --max-src-len 1152 \
+            --max-tgt-len 1536 \
             --epochs 30 \
             --lr 2e-4 \
             --warmup-steps 2000 \
@@ -533,6 +580,40 @@ for e in entries[-5:]:
         echo "Set TRANSMUTATION_RUN=$NEXT or it will auto-detect as current run."
         ;;
 
+    haiku-collapse)
+        HAIKU_DIR="$PROJECT_DIR/data/haiku"
+        CORPUS="$HAIKU_DIR/corpus.jsonl"
+        echo "Collapsing shards into corpus.jsonl..."
+        cat "$HAIKU_DIR"/haiku_shard_*.jsonl > "$CORPUS"
+        LINES=$(wc -l < "$CORPUS")
+        echo "$LINES samples -> $CORPUS"
+        echo "Removing shards..."
+        find "$HAIKU_DIR" -name 'haiku_shard_*.jsonl' -delete
+        echo "Done."
+        ;;
+
+    enrich-tools)
+        go build -o "$PROJECT_DIR/tmp/enrich" "$PROJECT_DIR/cmd/enrich/"
+        shift
+        PCT="${1:-25}"
+        HAIKU_DIR="$PROJECT_DIR/data/haiku"
+        CORPUS="$HAIKU_DIR/corpus.jsonl"
+        if [ ! -f "$CORPUS" ]; then
+            echo "No corpus.jsonl found. Run './training/run.sh haiku-collapse' first."
+            exit 1
+        fi
+        echo "Enriching tool-call samples (${PCT}% of tools)..."
+        "$PROJECT_DIR/tmp/enrich" -pct "$PCT" -seed 42 < "$CORPUS" > "${CORPUS}.enriched" 2>&1
+        mv "${CORPUS}.enriched" "$CORPUS"
+        echo "Done."
+        ;;
+
+    repair-rejects)
+        go build -o "$PROJECT_DIR/tmp/repair" "$PROJECT_DIR/cmd/repair/"
+        shift
+        "$PROJECT_DIR/scripts/repair_rejects.sh" "$@"
+        ;;
+
     help|*)
         cat <<'USAGE'
 Usage: ./training/run.sh <command> [args...]
@@ -548,6 +629,7 @@ Training:
 Inference:
   infer [N] [stage] [--beam-width K] [--length-penalty A]
                         CPU inference on N samples (default 10, stage 3).
+  infer-rejects [N]    CPU inference on N rejected haiku samples (default 10).
   go-infer [N] [stage] [-beam-width K] [-length-penalty A]
                         Go ONNX inference on N samples (default 10, stage 3).
 
@@ -555,6 +637,9 @@ Data:
   haiku-gen [N]     Generate N samples via Claude Haiku (default 100).
   haiku-split       Split haiku corpus into train/val (90/10).
   haiku-clean       Remove haiku corpus (all splits).
+  haiku-collapse    Collapse haiku shards into single corpus.jsonl.
+  enrich-tools [pct] Enrich tool-call argument structures (default 25%).
+  repair-rejects    Repair rejected haiku samples via dual LLM passes.
   clean-generated   Remove train/val data (preserves haiku).
   clean-all         Remove all data (train, val, haiku).
 

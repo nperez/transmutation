@@ -157,7 +157,7 @@ def patch_mamba_for_cpu(model):
             module.forward = lambda x, m=module: mamba_forward_cpu(m, x)
 
 
-def greedy_decode(model, src_ids, sp, max_len=2048, device="cpu"):
+def greedy_decode(model, src_ids, sp, max_len=1536, device="cpu"):
     with torch.no_grad():
         src = torch.tensor([src_ids], dtype=torch.long, device=device)
         memory = model.encode(src)
@@ -226,7 +226,7 @@ def _decoder_step(model, x, layer_states, memory):
     return model.output_proj(x)[:, 0, :]  # (B, vocab)
 
 
-def beam_decode(model, src_ids, sp, max_len=2048, beam_width=3,
+def beam_decode(model, src_ids, sp, max_len=1536, beam_width=3,
                 length_penalty=0.6, device="cpu"):
     """Beam search decoding. Falls back to greedy when beam_width <= 1."""
     if beam_width <= 1:
@@ -323,7 +323,8 @@ def beam_decode(model, src_ids, sp, max_len=2048, beam_width=3,
 
 def load_model(checkpoint, device):
     sp = spm.SentencePieceProcessor()
-    sp.load("models/tokenizer.model")
+    tok_path = str(Path(checkpoint).parent / "tokenizer.model")
+    sp.load(tok_path)
 
     sys.path.insert(0, str(Path(__file__).parent))
     from model import TransmutationModel
@@ -359,7 +360,7 @@ def main():
     parser = argparse.ArgumentParser(description="CPU inference for transmutation model")
     parser.add_argument("checkpoint", nargs="?", default="models/epoch_1.pt")
     parser.add_argument("-n", type=int, default=10, help="number of samples")
-    parser.add_argument("--max-src-len", type=int, default=1536)
+    parser.add_argument("--max-src-len", type=int, default=1152)
     parser.add_argument("--beam-width", type=int, default=1,
                         help="beam width (1 = greedy)")
     parser.add_argument("--length-penalty", type=float, default=0.6,

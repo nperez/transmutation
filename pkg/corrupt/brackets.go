@@ -20,16 +20,26 @@ import (
 	"strings"
 )
 
-// MangleBrackets occasionally drops a closing bracket or brace.
-// This is applied with very low probability since it creates the most
-// severe corruption.
+// MangleBrackets corrupts closing brackets/braces to simulate real LLM failures.
+// Mutation types (weighted by probability):
+//   - 30% swap: } ↔ ] (most common real error)
+//   - 20% drop: remove a closing bracket (truncation)
+//   - 20% extra: duplicate a closing bracket
+//   - 30% run: produce a run of 2-5 mismatched closers at a nesting boundary
+//     (e.g. "]}}}" or "}}}}") — matches the most common real reject pattern
 func MangleBrackets(json string, rng *rand.Rand) string {
 	var b strings.Builder
-	b.Grow(len(json))
+	b.Grow(len(json) + 4)
 
 	inString := false
-	// Only drop one bracket per application to keep corruption recoverable.
-	dropped := false
+	mutated := false
+
+	// Decide mutation type.
+	roll := rng.Float64()
+	doSwap := roll < 0.3
+	doDrop := roll >= 0.3 && roll < 0.5
+	doExtra := roll >= 0.5 && roll < 0.7
+	doRun := roll >= 0.7
 
 	for i := 0; i < len(json); i++ {
 		ch := json[i]
@@ -38,21 +48,63 @@ func MangleBrackets(json string, rng *rand.Rand) string {
 			inString = !inString
 		}
 
-		// Only consider dropping closing brackets, never opening ones.
-		// This simulates LLMs that stop generating mid-structure or
-		// truncate output before the final bracket.
-		if !inString && !dropped && (ch == '}' || ch == ']') {
-			remaining := json[i+1:]
-			isFinal := !strings.Contains(remaining, "}") && !strings.Contains(remaining, "]")
-			if isFinal {
-				// Final bracket — drop with lower probability (simulates truncation).
-				if rng.Float64() < 0.2 {
-					dropped = true
+		if !inString && !mutated && (ch == '}' || ch == ']') {
+			if doSwap && rng.Float64() < 0.4 {
+				mutated = true
+				if ch == '}' {
+					b.WriteByte(']')
+				} else {
+					b.WriteByte('}')
+				}
+				continue
+			}
+			if doDrop && rng.Float64() < 0.3 {
+				mutated = true
+				continue
+			}
+			if doExtra && rng.Float64() < 0.3 {
+				mutated = true
+				b.WriteByte(ch)
+				b.WriteByte(ch)
+				continue
+			}
+			// Run: at a nesting boundary (consecutive closers), replace with
+			// a run of 2-5 mismatched brackets. Targets the end of nested
+			// tool arguments where real LLMs produce "]}}}}".
+			if doRun && rng.Float64() < 0.4 {
+				// Check if we're at a run of consecutive closers.
+				runEnd := i
+				for runEnd+1 < len(json) {
+					next := json[runEnd+1]
+					if next == '}' || next == ']' {
+						runEnd++
+					} else if next == '\n' || next == ' ' || next == '\t' || next == '\r' {
+						runEnd++
+					} else {
+						break
+					}
+				}
+				origLen := 0
+				for j := i; j <= runEnd; j++ {
+					if json[j] == '}' || json[j] == ']' {
+						origLen++
+					}
+				}
+				// Only mangle runs of 2+ closers (nesting boundaries).
+				if origLen >= 2 {
+					mutated = true
+					runLen := origLen + rng.IntN(3) // same length or up to 2 extra
+					for k := range runLen {
+						if rng.Float64() < 0.4 {
+							b.WriteByte(']')
+						} else {
+							b.WriteByte('}')
+						}
+						_ = k
+					}
+					i = runEnd // skip past original run
 					continue
 				}
-			} else if rng.Float64() < 0.3 {
-				dropped = true
-				continue
 			}
 		}
 

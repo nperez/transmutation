@@ -44,7 +44,7 @@ func LightConfig() Config {
 		WrapperProb:      0.3,
 		TrailingProb:     0.2,
 		WhitespaceProb:   0.2,
-		BracketProb:      0.0,
+		BracketProb:      0.10,
 	}
 }
 
@@ -58,7 +58,7 @@ func MediumConfig() Config {
 		WrapperProb:      0.5,
 		TrailingProb:     0.3,
 		WhitespaceProb:   0.4,
-		BracketProb:      0.05,
+		BracketProb:      0.15,
 	}
 }
 
@@ -72,7 +72,7 @@ func HeavyConfig() Config {
 		WrapperProb:      0.7,
 		TrailingProb:     0.5,
 		WhitespaceProb:   0.6,
-		BracketProb:      0.1,
+		BracketProb:      0.25,
 	}
 }
 
