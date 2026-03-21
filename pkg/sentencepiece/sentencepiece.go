@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,6 +32,8 @@ import (
 
 	"google.golang.org/protobuf/proto"
 )
+
+var wsRun = regexp.MustCompile(`\s+`)
 
 const separator = "▁" // U+2581, SentencePiece whitespace marker
 
@@ -49,6 +52,7 @@ type Processor struct {
 	padID         int
 	byteFallback  bool
 	addDummyPfx   bool
+	removeExtraWS bool
 	maxPieceLen   int
 }
 
@@ -87,6 +91,7 @@ func LoadFrom(r io.Reader) (*Processor, error) {
 	}
 	if ns := mp.GetNormalizerSpec(); ns != nil {
 		p.addDummyPfx = ns.GetAddDummyPrefix()
+		p.removeExtraWS = ns.GetRemoveExtraWhitespaces()
 	}
 
 	for i, piece := range p.pieces {
@@ -157,7 +162,13 @@ func (p *Processor) VocabSize() int { return len(p.pieces) }
 // Encode tokenizes text into a sequence of token IDs.
 // If addBOS/addEOS are true, the respective special tokens are prepended/appended.
 func (p *Processor) Encode(text string, addBOS, addEOS bool) []int {
-	// Normalize: replace spaces with separator.
+	// Normalize whitespace: convert \n, \t, \r etc to spaces (matches C++ NFKC).
+	text = wsRun.ReplaceAllString(text, " ")
+	if p.removeExtraWS {
+		text = strings.TrimSpace(text)
+	}
+
+	// Replace spaces with separator.
 	text = strings.ReplaceAll(text, " ", separator)
 
 	// Add dummy prefix if the model was trained with it.

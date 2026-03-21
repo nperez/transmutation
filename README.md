@@ -142,6 +142,66 @@ Run 2 used real haiku LLM outputs (~140k samples) with an 8-stage answer-first c
 - **Effective sequence length ceiling ~1000 tokens** — the model produces exact matches up to ~1000 tokens, whitespace-collapsed xml_ok up to ~1200, and fails/truncates beyond ~1500.
 - **`--no-session-persistence`** — Claude CLI generates ~3GB/hour of session logs without this flag. Essential for batch generation.
 
+## Run 3 Results
+
+Run 3 continued with the haiku-first pipeline, same 5-stage curriculum, same hardware. Key changes from run 2: reduced stages to 5 (dropped stages 6-8), stage advance threshold lowered to 55% AR, content weight sawtooth from 1.0 with adaptive ramp, professor forcing at 15% token noise.
+
+### Training Budget
+
+| Metric | Run 2 | Run 3 | Run 3 / Run 2 |
+|--------|-------|-------|---------------|
+| Optimizer steps | 50,795 | ~63,500 | 125% |
+| Epochs | 39 | 40 | ~same |
+| Best val exact | 91.4% | 60.5% | — (different val set) |
+| Best AR exact | 50/50 | 50/50 | same |
+| Real reject xml_ok | 4/20 (20%) | 5/20 (25%) | +5% |
+
+Note: val_exact is not comparable between runs due to a training restart that regenerated the val set mid-run.
+
+### Key Metrics
+
+| Epoch | Stage | Train Loss | Val Exact | AR Exact | AR XML OK |
+|-------|-------|-----------|-----------|----------|-----------|
+| 1     | 1     | 63.92     | 0.0%      | 0/50     | 0/50      |
+| 10    | 1     | 0.62      | 0.0%      | 0/50     | 0/50      |
+| 15    | 1     | 0.45      | 0.0%      | 0/50     | 0/50      |
+| 20    | 2     | 0.47      | —         | —        | —         |
+| 25    | 5     | 0.52      | —         | 48/50    | —         |
+| 30    | 5     | 0.52      | 57.2%     | 46/50    | 47/50     |
+| 33    | 5     | 0.51      | 58.4%     | **50/50**| 50/50     |
+| **36**| **5** | **0.48**  | **60.5%** | **50/50**| **50/50** |
+| 40    | 5     | 0.48      | 60.6%     | 45/50    | 49/50     |
+
+### What Worked
+
+- **Professor forcing noise bump** — increasing token noise from 0.15 to 0.25 at epoch 36 produced the best single-epoch improvement (val_exact 58.6%->60.5%, val_loss 0.508->0.483). The model was starved for self-correction practice.
+- **Go tokenizer whitespace fix** — the Go sentencepiece implementation wasn't normalizing `\n`/`\t` to spaces before tokenization, causing completely different token IDs from Python. Fixing this 2-line bug brought Go ONNX inference from 0/20 exact to matching Python exactly.
+- **Semantic XML comparison** — added a `SEMANTIC` tier to inference that parses both XML trees and compares canonically, catching cases where output is correct but has CDATA/whitespace differences.
+- **Stale checkpoint safety** — added a check that refuses to resume from an old checkpoint when newer ones exist, preventing Docker restart from overwriting progress (happened twice).
+
+### What Didn't Work
+
+- **Late PF noise bump** — bumping professor forcing noise on a converged model (epoch 36+) gave one good epoch then plateaued. PF noise needs to ramp during training, not be bolted on at the end.
+- **CW boost vs AR** — content weight ramping to 5.2+ improved val_exact but hurt AR exact (dropped from 50 to 42). High CW pushes teacher-forced accuracy at the expense of autoregressive coherence.
+- **Real reject inference** — 0/30 exact match on repaired reject samples regardless of input token limit (tested 400-1060). Root cause: 99.98% of training data has a `memory` field; rejects without memory cause the model to hallucinate a memory section and collapse.
+
+### Lessons Learned (new in run 3)
+
+- **Go sentencepiece must normalize whitespace** — the C++ sentencepiece library applies NFKC normalization (including `\n`->`space`) before tokenization. The Go implementation must do the same or tokenization diverges on any input with newlines.
+- **ONNX export numerical validation** — step-by-step comparison of PyTorch vs ONNX outputs caught that the export was correct; the real bug was in tokenization. Always validate the full pipeline end-to-end.
+- **Training data distribution gaps kill generalization** — the model's reject failures weren't about context length or model capacity, they were about never seeing inputs without a `memory` field. Added `--drop-memory-pct 20` to augment.
+- **Docker container restart hazard** — `docker run -d` bakes the command at creation time. If systemd restarts the container, it replays the original command (including the original `--resume` checkpoint). Added stale checkpoint detection to train.py.
+- **Professor forcing noise schedule** — static per-stage schedule is simpler and more predictable than dynamic ramping tied to val loss stalls.
+
+### ONNX Inference Performance
+
+| Model | Size | Tokens/sec (12 threads) |
+|-------|------|------------------------|
+| fp32  | 120 MB | ~54 tok/s |
+| int8  | 31 MB  | ~69 tok/s |
+
+Int8 quantization: 28% faster, 4x smaller, slight quality degradation (1 fewer exact match in 10 samples).
+
 ## Data Pipelines
 
 ### Haiku-First Pipeline (Run 2, current)
@@ -171,9 +231,19 @@ The `cmd/augment` tool handles sampling and augmentation:
 | 2     | tool   | 0 (natural only) | 0.0  | 0   | 50 | 50       |
 | 3     | all    | 1:5       | 0.15        | 0         | 50 | 5        |
 | 4     | all    | 1:10      | 0.30        | 10        | 50 | 5        |
-| 5     | all    | 1:10      | 0.40        | 20        | 50 | 5        |
+| 5     | all    | 1:10      | 0.35        | 15        | 50 | 5        |
 
 Auto-advance when AR exact match >= 55% for 2 consecutive epochs. LR resets to half-base on stage advance.
+
+**Professor forcing noise schedule** (static, per-stage):
+
+| Stage | PF Noise |
+|-------|----------|
+| 1     | 0.30     |
+| 2     | 0.30     |
+| 3     | 0.35     |
+| 4     | 0.40     |
+| 5     | 0.50     |
 
 **Key training innovations:**
 
@@ -183,7 +253,7 @@ Auto-advance when AR exact match >= 55% for 2 consecutive epochs. LR resets to h
 - **Multi-bracket corruption** — generates `]}}}}` runs matching real LLM failure patterns, not just single bracket swaps.
 - **LR warm restart on stage advance** — resets learning rate to half-base and rebuilds the plateau scheduler, preventing accumulated LR decay from blocking learning on new data distributions.
 - **Adaptive validation budget** — early stages validate on a small prefix (50-5000 batches). Full validation runs only at stage 5.
-- **Variable schema** — some training samples omit `memory` field entirely, teaching the model to handle varied JSON schemas.
+- **Variable schema** — 20% of augmented samples have their `memory` field dropped (`--drop-memory-pct 20`), teaching the model to handle varied JSON schemas. Without this, the model hallucinated a memory section on real inputs that lacked one.
 
 ### Synthetic Pipeline (Run 1, legacy)
 
@@ -281,7 +351,8 @@ transmutation/
 ├── models/
 │   ├── run1/          # Archived run 1 (synthetic data, 53 epochs)
 │   ├── run2/          # Archived run 2 (haiku data, 8-stage, 39 epochs)
-│   └── run3/          # Current run
+│   ├── run3/          # Archived run 3 (haiku data, 5-stage, 40 epochs)
+│   └── run4/          # Current run
 ├── data/
 │   └── haiku/         # ~140k real LLM haiku outputs (corpus.jsonl)
 ├── scripts/

@@ -60,6 +60,8 @@ func main() {
 	flag.Float64Var(&compactPct, "compact-pct", 0, "percentage of samples to compact input to single-line JSON (0-100)")
 	var minChars int
 	flag.IntVar(&minChars, "min-chars", 0, "minimum input character length (0 = no filter)")
+	var maxChars int
+	flag.IntVar(&maxChars, "max-chars", 4769, "maximum input character length (0 = no filter, default fits 1152 tokens)")
 	flag.StringVar(&sampleType, "type", "all", "sample type filter: answer, tool, or all")
 	flag.Parse()
 
@@ -68,17 +70,23 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error loading haiku: %v\n", err)
 		os.Exit(1)
 	}
-	if minChars > 0 {
+	orig := len(samples)
+	if minChars > 0 || maxChars > 0 {
 		filtered := samples[:0]
 		for _, s := range samples {
-			if len(s.Input) >= minChars {
-				filtered = append(filtered, s)
+			l := len(s.Input)
+			if minChars > 0 && l < minChars {
+				continue
 			}
+			if maxChars > 0 && l > maxChars {
+				continue
+			}
+			filtered = append(filtered, s)
 		}
-		fmt.Fprintf(os.Stderr, "Loaded %d haiku samples, %d passed min-chars=%d filter\n", len(samples), len(filtered), minChars)
+		fmt.Fprintf(os.Stderr, "Loaded %d haiku samples, %d passed char filters (min=%d max=%d)\n", orig, len(filtered), minChars, maxChars)
 		samples = filtered
 	} else {
-		fmt.Fprintf(os.Stderr, "Loaded %d haiku samples\n", len(samples))
+		fmt.Fprintf(os.Stderr, "Loaded %d haiku samples\n", orig)
 	}
 
 	// Deterministic shuffle of indices — same seed always gives same order.
@@ -327,9 +335,9 @@ func augmentString(s string, rng *rand.Rand) string {
 }
 
 // Length bins for stratified sampling (input character counts).
-// Tuned to the haiku corpus distribution where pretty-printed JSON
-// starts around 2000 chars. Bins cover short→long evenly.
-var lengthBins = []int{0, 2500, 3500, 4500, 6000, 8000, 11000, 16000}
+// Capped at 4769 chars (fits 1152 src tokens). No samples above this
+// enter training — they'd be truncated into broken XML targets.
+var lengthBins = []int{0, 1500, 2500, 3500, 4500}
 
 // stratifiedSample bins samples by input character length and samples equally
 // from each bin. Bins with fewer samples than their quota contribute all they

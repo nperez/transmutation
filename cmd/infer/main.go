@@ -56,6 +56,7 @@ func main() {
 		dConv         int
 		beamWidth     int
 		lengthPenalty float64
+		debugSteps    int
 	)
 	flag.StringVar(&encoderPath, "encoder", "models/onnx/encoder.onnx", "path to encoder ONNX")
 	flag.StringVar(&decoderPath, "decoder", "models/onnx/decoder.onnx", "path to decoder ONNX")
@@ -70,6 +71,7 @@ func main() {
 	flag.IntVar(&dConv, "d-conv", 4, "Mamba d_conv")
 	flag.IntVar(&beamWidth, "beam-width", 1, "beam width (1 = greedy)")
 	flag.Float64Var(&lengthPenalty, "length-penalty", 0.6, "length normalization exponent for beam search")
+	flag.IntVar(&debugSteps, "debug-steps", 0, "print per-step token IDs and logit stats for first N steps of sample 1")
 	flag.Parse()
 
 	// Initialize tokenizer.
@@ -139,6 +141,7 @@ func main() {
 
 	wsNorm := regexp.MustCompile(`\s+`)
 	exactCount := 0
+	semanticCount := 0
 	xmlOKCount := 0
 	total := 0
 
@@ -177,13 +180,18 @@ func main() {
 		}
 
 		// Decode (greedy or beam search).
+		debug := 0
+		if total == 1 && debugSteps > 0 {
+			debug = debugSteps
+		}
+
 		var predIDs []int64
 		if beamWidth > 1 {
 			predIDs, err = beamDecode(decSession, allK, allV, bosID, eosID,
 				maxTgtLen, nLayers, dInner, dState, dConv, beamWidth, lengthPenalty)
 		} else {
 			predIDs, err = greedyDecode(decSession, allK, allV, bosID, eosID,
-				maxTgtLen, nLayers, dInner, dState, dConv)
+				maxTgtLen, nLayers, dInner, dState, dConv, debug)
 		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "decoder error: %v\n", err)
@@ -204,9 +212,16 @@ func main() {
 		exact := normPred == normTgt
 
 		xmlOK := isValidXML(strings.TrimSpace(pred))
+		semantic := false
+		if !exact && xmlOK {
+			semantic = xmlSemanticallyEqual(strings.TrimSpace(pred), strings.TrimSpace(rec.Target))
+		}
 
 		if exact {
 			exactCount++
+		}
+		if semantic {
+			semanticCount++
 		}
 		if xmlOK {
 			xmlOKCount++
@@ -215,13 +230,15 @@ func main() {
 		tag := "FAIL"
 		if exact {
 			tag = "EXACT"
+		} else if semantic {
+			tag = "SEMANTIC"
 		} else if xmlOK {
 			tag = "XML_OK"
 		}
 
 		fmt.Printf("=== Sample %d [%s] %.2fs, %d tokens ===\n", total, tag, elapsed.Seconds(), len(predIDs))
 		fmt.Printf("INPUT:\n%s\n\n", rec.Input)
-		if exact {
+		if exact || semantic {
 			fmt.Printf("OUTPUT (matches target):\n%s\n\n", strings.TrimSpace(pred))
 		} else {
 			fmt.Printf("TARGET:\n%s\n\n", strings.TrimSpace(rec.Target))
@@ -233,7 +250,8 @@ func main() {
 		allV.Destroy()
 	}
 
-	fmt.Printf("===== %d samples: exact=%d xml_ok=%d =====\n", total, exactCount, xmlOKCount)
+	fmt.Printf("===== %d samples: exact=%d semantic=%d xml_ok=%d fail=%d =====\n",
+		total, exactCount, semanticCount, xmlOKCount-exactCount-semanticCount, total-xmlOKCount)
 }
 
 // runEncoder runs the encoder ONNX model and returns cached K/V tensors.
@@ -268,6 +286,7 @@ func greedyDecode(
 	allK, allV *ort.Tensor[float32],
 	bosID, eosID int64,
 	maxLen, nLayers, dInner, dState, dConv int,
+	debugSteps int,
 ) ([]int64, error) {
 	// Initialize Mamba state: all zeros.
 	hSize := nLayers * dInner * dState
@@ -323,6 +342,28 @@ func greedyDecode(
 		}
 		logitsData := logitsTensor.GetData()
 		nextID := argmax(logitsData)
+
+		// Save top-3 for debug before destroying tensor.
+		var debugTop3 []int
+		var debugLogitMax float32
+		step := len(tgtIDs)
+		if debugSteps > 0 && step < debugSteps {
+			debugTop3 = topKIndices(func() []float64 {
+				f := make([]float64, len(logitsData))
+				for i, v := range logitsData {
+					f[i] = float64(v)
+				}
+				return f
+			}(), 3)
+			for _, v := range logitsData {
+				if v > debugLogitMax {
+					debugLogitMax = v
+				}
+				if -v > debugLogitMax {
+					debugLogitMax = -v
+				}
+			}
+		}
 		logitsTensor.Destroy()
 
 		// Copy updated state back into reusable tensors.
@@ -339,6 +380,21 @@ func greedyDecode(
 		}
 		copy(convTensor.GetData(), convOutTensor.GetData())
 		convOutTensor.Destroy()
+
+		if debugSteps > 0 && step < debugSteps {
+			// Read h from the copied-into tensor (post-copy, pre-next-step).
+			hMax := float32(0)
+			for _, v := range hTensor.GetData() {
+				if v > hMax {
+					hMax = v
+				}
+				if -v > hMax {
+					hMax = -v
+				}
+			}
+			fmt.Fprintf(os.Stderr, "  GO step %3d: id=%5d  logit_max=%.4f  h_absmax=%.6f  top3=%v\n",
+				step, nextID, debugLogitMax, hMax, debugTop3)
+		}
 
 		if int64(nextID) == eosID {
 			break
@@ -597,6 +653,58 @@ func isValidXML(s string) bool {
 		_, err := d.Token()
 		if err != nil {
 			return err.Error() == "EOF"
+		}
+	}
+}
+
+// xmlSemanticallyEqual parses both XML strings, flattens each into a canonical
+// sequence of (element, text) tokens with normalized whitespace, and compares.
+// This treats CDATA vs plain text as equivalent and ignores insignificant whitespace.
+func xmlSemanticallyEqual(a, b string) bool {
+	af := flattenXML(a)
+	bf := flattenXML(b)
+	if af == nil || bf == nil {
+		return false
+	}
+	if len(af) != len(bf) {
+		return false
+	}
+	for i := range af {
+		if af[i] != bf[i] {
+			return false
+		}
+	}
+	return true
+}
+
+type xmlToken struct {
+	kind string // "start", "end", "text"
+	val  string
+}
+
+var wsNormRe = regexp.MustCompile(`\s+`)
+
+func flattenXML(s string) []xmlToken {
+	d := xml.NewDecoder(strings.NewReader(s))
+	var tokens []xmlToken
+	for {
+		tok, err := d.Token()
+		if err != nil {
+			if err.Error() == "EOF" {
+				return tokens
+			}
+			return nil // parse error
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			tokens = append(tokens, xmlToken{"start", t.Name.Local})
+		case xml.EndElement:
+			tokens = append(tokens, xmlToken{"end", t.Name.Local})
+		case xml.CharData:
+			text := wsNormRe.ReplaceAllString(strings.TrimSpace(string(t)), " ")
+			if text != "" {
+				tokens = append(tokens, xmlToken{"text", text})
+			}
 		}
 	}
 }
