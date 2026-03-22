@@ -47,16 +47,21 @@ from model import build_model
 # Stage 2: Tool-only, natural — learn nested tool structures.
 # Stage 3: Full mix, 1:5 augmentation — generalize content, intro special chars.
 # Stage 4: Full mix, 1:10 augmentation + moderate special chars — CDATA practice.
-# Stage 5: Full mix, 1:10 aug + high special chars + light corruption.
-# Stage 6: Full mix, 1:10 aug + high special chars + heavier corruption.
+# Stage 5: Full mix, 1:10 aug + high special chars + light-moderate corruption.
 
 HAIKU_STAGES = {
-    1: {"type": "answer", "aug_ratio": 0,  "special_prob": 0.0,  "corrupt_pct": 0,  "compact_pct": 50, "sample_pct": 50},
-    2: {"type": "tool",   "aug_ratio": 0,  "special_prob": 0.0,  "corrupt_pct": 0,  "compact_pct": 50, "sample_pct": 50},
-    3: {"type": "all",    "aug_ratio": 5,  "special_prob": 0.15, "corrupt_pct": 0,  "compact_pct": 50, "sample_pct": 5},
-    4: {"type": "all",    "aug_ratio": 10, "special_prob": 0.30, "corrupt_pct": 10, "compact_pct": 50, "sample_pct": 5},
-    5: {"type": "all",    "aug_ratio": 10, "special_prob": 0.40, "corrupt_pct": 20, "compact_pct": 50, "sample_pct": 5},
+    # Stage 1: Learn the mapping. Full corpus, natural + compact, no augmentation.
+    1: {"type": "all", "aug_ratio": 0, "special_prob": 0.0,  "corrupt_pct": 0,  "compact_pct": 50, "sample_pct": 100, "dict_word_pct": 0, "drop_memory_pct": 50, "truncate_pct": 0},
+    # Stage 2: Generalize copying. Shuffle augmentation, light special chars, light corruption + truncation.
+    2: {"type": "all", "aug_ratio": 3, "special_prob": 0.15, "corrupt_pct": 5,  "compact_pct": 50, "sample_pct": 100, "dict_word_pct": 0, "drop_memory_pct": 50, "truncate_pct": 5},
+    # Stage 3: Harden. More special chars, moderate corruption + truncation.
+    3: {"type": "all", "aug_ratio": 3, "special_prob": 0.25, "corrupt_pct": 10, "compact_pct": 50, "sample_pct": 100, "dict_word_pct": 0, "drop_memory_pct": 50, "truncate_pct": 10},
+    # Stage 4: Full difficulty. High special chars, full corruption + truncation.
+    4: {"type": "all", "aug_ratio": 3, "special_prob": 0.35, "corrupt_pct": 15, "compact_pct": 50, "sample_pct": 100, "dict_word_pct": 0, "drop_memory_pct": 50, "truncate_pct": 20},
 }
+
+# Professor forcing noise schedule: ramps with stage to progressively harden AR decoding.
+PF_NOISE_SCHEDULE = {1: 0.15, 2: 0.25, 3: 0.40, 4: 0.55}
 
 
 def compute_cw_boost(prev_val, curr_val, rate_threshold=0.10, max_boost=1.0):
@@ -73,10 +78,10 @@ def compute_cw_boost(prev_val, curr_val, rate_threshold=0.10, max_boost=1.0):
 # Validation budget by training stage — small early (fast epochs), full later (precise eval).
 # Full val set is generated once at max stage; this caps how many batches we actually run.
 # None = use full val set.
-VAL_MAX_BATCHES = {1: 50, 2: 500, 3: 5000, 4: 5000, 5: None}
+VAL_MAX_BATCHES = {1: 50, 2: 500, 3: 5000, 4: None}
 
 
-def generate_haiku_data(augment_bin, data_dir, split, stage, seed):
+def generate_haiku_data(augment_bin, data_dir, split, stage, seed, dict_word_pct_override=None):
     """Call the Go augment binary to produce training or validation data.
 
     The augment binary reads haiku JSONL from data_dir/haiku, samples a
@@ -95,6 +100,9 @@ def generate_haiku_data(augment_bin, data_dir, split, stage, seed):
         "-special-prob", str(params["special_prob"]),
         "-corrupt-pct", str(params["corrupt_pct"]),
         "-compact-pct", str(params.get("compact_pct", 0)),
+        "-dict-word-pct", str(dict_word_pct_override if dict_word_pct_override is not None else params.get("dict_word_pct", 50)),
+        "-drop-memory-pct", str(params.get("drop_memory_pct", 20)),
+        "-truncate-pct", str(params.get("truncate_pct", 0)),
         "-min-chars", str(params.get("min_chars", 0)),
         "-type", str(params.get("type", "all")),
         "-seed", str(seed),
@@ -146,6 +154,8 @@ def train(args):
         n_encoder_layers=args.n_encoder_layers,
         n_decoder_layers=args.n_decoder_layers,
         d_state=args.d_state,
+        expand=2,
+        headdim=args.headdim,
         n_heads=args.n_heads,
         dropout=args.dropout,
         pad_id=pad_id,
@@ -178,10 +188,11 @@ def train(args):
 
     # Loss — optionally upweight content tokens (numbers, strings, code)
     # vs structural XML tokens (IDs 0-15: special + XML tags).
-    criterion = nn.CrossEntropyLoss(ignore_index=-100)
+    # Model returns log-probs (copy mechanism), so use NLLLoss.
+    criterion = nn.NLLLoss(ignore_index=-100)
     print(f"Content weight: adaptive sawtooth 1.0→{args.content_weight}x (resets on stage advance, structural tokens 0-{args.structural_max_id} at 1.0x)")
     if args.professor_forcing:
-        print(f"Professor forcing: ON (noise={args.token_noise}, using model predictions)")
+        print(f"Professor forcing: ON (schedule: {' → '.join(f's{s}={n:.3f}' for s, n in sorted(PF_NOISE_SCHEDULE.items()))})")
 
     # Mixed precision.
     scaler = GradScaler("cuda", enabled=args.fp16)
@@ -207,7 +218,17 @@ def train(args):
     if args.resume and os.path.exists(args.resume):
         print(f"Resuming from {args.resume}")
         ckpt = torch.load(args.resume, map_location=device, weights_only=True)
-        model.load_state_dict(ckpt["model_state_dict"])
+        missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        if missing:
+            if all("copy_gate" in k for k in missing):
+                # Old checkpoint without copy gate — initialize to near-zero copy.
+                nn.init.zeros_(model.copy_gate.weight)
+                nn.init.constant_(model.copy_gate.bias, -5.0)
+                print(f"  Initialized copy_gate from scratch (old checkpoint, p_copy≈0.007)")
+            else:
+                raise RuntimeError(f"Unexpected missing keys: {missing}")
+        if unexpected:
+            print(f"  Ignoring unexpected checkpoint keys: {unexpected}")
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         try:
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
@@ -245,6 +266,35 @@ def train(args):
             print(f"Resuming from epoch {start_epoch}, step {resume_epoch_step}, global_step={global_step}, best_val_loss={best_val_loss:.4f}, lr={resumed_lr}→{args.override_lr} (override), stage={current_stage}")
         else:
             print(f"Resuming from epoch {start_epoch}, step {resume_epoch_step}, global_step={global_step}, best_val_loss={best_val_loss:.4f}, lr={resumed_lr}, stage={current_stage}")
+
+    # Safety: refuse to train if checkpoint state is inconsistent.
+    existing = [f for f in os.listdir(args.output_dir)
+                if f.endswith(".pt") and f != "tokenizer.model"]
+    if existing:
+        if start_epoch == 1 and not args.resume:
+            # Case 1: no --resume but checkpoints exist (fresh start would overwrite).
+            print("ERROR: found existing checkpoints but no --resume flag:")
+            for f in sorted(existing):
+                print(f"  {f}")
+            print("Pass --resume <checkpoint> to continue, or move/delete old checkpoints.")
+            raise SystemExit(1)
+        if args.resume:
+            # Case 2: --resume points to a stale checkpoint when newer ones exist.
+            # Find the newest checkpoint by modification time.
+            newest = max(
+                (os.path.join(args.output_dir, f) for f in existing),
+                key=os.path.getmtime,
+            )
+            resume_mtime = os.path.getmtime(args.resume)
+            newest_mtime = os.path.getmtime(newest)
+            if newest_mtime > resume_mtime + 60:  # 60s tolerance
+                newest_name = os.path.basename(newest)
+                resume_name = os.path.basename(args.resume)
+                print(f"ERROR: --resume {resume_name} is stale — newer checkpoint exists:")
+                print(f"  {resume_name}: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(resume_mtime))}")
+                print(f"  {newest_name}: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(newest_mtime))}")
+                print(f"Use --resume {os.path.join(args.output_dir, newest_name)} instead.")
+                raise SystemExit(1)
 
     # Signal handling: preserve state on any interruption.
     # SIGUSR1 = save checkpoint, keep training
@@ -288,7 +338,7 @@ def train(args):
 
     # Generate held-out validation data ONCE at max stage with a fixed seed.
     VAL_SEED = 7777777
-    generate_haiku_data(args.augment_bin, args.data_dir, "val", args.max_stage, VAL_SEED)
+    generate_haiku_data(args.augment_bin, args.data_dir, "val", args.max_stage, VAL_SEED, args.dict_word_pct)
     print(f"Fixed validation set (stage {args.max_stage}, seed {VAL_SEED}), reused every epoch")
     print(f"Training stage: {current_stage} (auto-advance at AR>{args.stage_advance_ar:.0%} for {args.stage_patience} epochs, max={args.max_stage})")
 
@@ -315,7 +365,7 @@ def train(args):
                     epoch_seed = resume_epoch_seed
                 start_index = resume_epoch_step
                 print(f"Resuming epoch {epoch} from batch {start_index} (seed={epoch_seed})")
-            generate_haiku_data(args.augment_bin, args.data_dir, "train", current_stage, epoch_seed)
+            generate_haiku_data(args.augment_bin, args.data_dir, "train", current_stage, epoch_seed, args.dict_word_pct)
 
             train_loader, epoch_seed = create_dataloader(
                 data_dir=train_data_dir, shuffle=True,
@@ -337,7 +387,8 @@ def train(args):
                 tgt_labels = batch["tgt_labels"].to(device)
                 src_mask = batch["src_key_padding_mask"].to(device)
 
-                if args.token_noise > 0:
+                effective_noise = PF_NOISE_SCHEDULE.get(current_stage, args.token_noise)
+                if effective_noise > 0:
                     if args.professor_forcing:
                         # Extra forward pass (no grad) to get model's own predictions.
                         with torch.no_grad():
@@ -350,12 +401,12 @@ def train(args):
                                 [tgt_in[:, :1], pred_ids[:, :-1]], dim=1,
                             )
                         tgt_in = corrupt_content_tokens(
-                            tgt_in, args.token_noise, args.structural_max_id,
+                            tgt_in, effective_noise, args.structural_max_id,
                             vocab_size, pad_id, replacement_ids=replacement_ids,
                         )
                     else:
                         tgt_in = corrupt_content_tokens(
-                            tgt_in, args.token_noise, args.structural_max_id, vocab_size, pad_id,
+                            tgt_in, effective_noise, args.structural_max_id, vocab_size, pad_id,
                         )
 
                 with autocast("cuda", enabled=args.fp16):
@@ -452,14 +503,18 @@ def train(args):
         # Autoregressive eval on fresh augmented haiku samples.
         # Skip when val_exact is 0% — model can't possibly produce correct AR output.
         if val_exact > 0:
-            ar_exact, ar_xml_ok, ar_total = autoregressive_eval(
-                model, sp, n_samples=args.ar_eval_samples,
-                augment_bin=args.augment_bin, data_dir=args.data_dir,
-                max_src_len=args.max_src_len, max_tgt_len=args.max_tgt_len,
-                output_dir=args.output_dir, epoch=epoch, stage=current_stage,
-            )
+            try:
+                ar_exact, ar_xml_ok, ar_total, ar_cer, ar_wer = autoregressive_eval(
+                    model, sp, n_samples=args.ar_eval_samples,
+                    augment_bin=args.augment_bin, data_dir=args.data_dir,
+                    max_src_len=args.max_src_len, max_tgt_len=args.max_tgt_len,
+                    output_dir=args.output_dir, epoch=epoch, stage=current_stage,
+                )
+            except NotImplementedError as e:
+                ar_exact, ar_xml_ok, ar_total, ar_cer, ar_wer = 0, 0, args.ar_eval_samples, 1.0, 1.0
+                print(f"AR eval skipped: {e}", flush=True)
         else:
-            ar_exact, ar_xml_ok, ar_total = 0, 0, args.ar_eval_samples
+            ar_exact, ar_xml_ok, ar_total, ar_cer, ar_wer = 0, 0, args.ar_eval_samples, 1.0, 1.0
             print("Skipping AR eval (val_exact=0%)", flush=True)
 
         # Step the plateau scheduler based on AR error rate, not val loss.
@@ -499,7 +554,9 @@ def train(args):
                     optimizer, mode='min', factor=0.5,
                     patience=args.lr_patience, min_lr=1e-6,
                 )
-                best_val_loss = float("inf")  # reset plateau tracker
+                # Reset plateau tracker for scheduler (so it doesn't see the new
+                # stage's higher loss as regression), but DON'T reset best_val_loss
+                # for checkpoint saving — that tracks the actual best across all stages.
                 print(f"      type={new_params.get('type', 'all')} aug={new_params['aug_ratio']} sp={new_params['special_prob']} cor={new_params['corrupt_pct']}% cw_boost reset→0 lr restart→{restart_lr:.1e}")
 
         # Sawtooth content weight: ramp when val improvement stalls.
@@ -525,13 +582,15 @@ def train(args):
             "ar_exact": ar_exact,
             "ar_xml_ok": ar_xml_ok,
             "ar_total": ar_total,
+            "ar_cer": round(ar_cer, 6),
+            "ar_wer": round(ar_wer, 6),
             "lr": new_lr,
             "content_weight": min(args.content_weight, 1.0 + cw_boost),
             "global_step": global_step,
         }
         log_entries.append(log_entry)
 
-        print(f"Epoch {epoch}: stage={current_stage} train_loss={avg_train_loss:.4f} val_loss={avg_val_loss:.4f} val_exact={val_exact:.2%} ar={ar_exact}/{ar_total}exact {ar_xml_ok}/{ar_total}xml lr={new_lr:.2e} cw={min(args.content_weight, 1.0 + cw_boost):.1f}")
+        print(f"Epoch {epoch}: stage={current_stage} train_loss={avg_train_loss:.4f} val_loss={avg_val_loss:.4f} val_exact={val_exact:.2%} ar={ar_exact}/{ar_total}exact {ar_xml_ok}/{ar_total}xml CER={ar_cer:.2%} WER={ar_wer:.2%} lr={new_lr:.2e} cw={min(args.content_weight, 1.0 + cw_boost):.1f} pf={PF_NOISE_SCHEDULE.get(current_stage, args.token_noise):.3f}")
 
         # Save best (by AR exact match, the only reliable metric).
         if ar_exact > best_ar_exact or (ar_exact == best_ar_exact and avg_val_loss < best_val_loss):
@@ -652,16 +711,64 @@ def corrupt_content_tokens(tgt_in, noise_prob, structural_max_id, vocab_size, pa
     return torch.where(replace_mask, replacement_ids, tgt_in)
 
 
-def weighted_content_loss(logits, tgt_labels, vocab_size, content_weight, structural_max_id):
-    """Cross-entropy loss with higher weight on content tokens.
+def levenshtein(a, b):
+    """Compute Levenshtein edit distance between two sequences."""
+    if len(a) < len(b):
+        return levenshtein(b, a)
+    if len(b) == 0:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a):
+        curr = [i + 1]
+        for j, cb in enumerate(b):
+            curr.append(min(
+                prev[j + 1] + 1,      # deletion
+                curr[j] + 1,           # insertion
+                prev[j] + (ca != cb),  # substitution
+            ))
+        prev = curr
+    return prev[-1]
 
+
+def char_weighted_wer(pred_words, ref_words):
+    """Word-level Levenshtein where each edit is weighted by character length.
+
+    A substitution costs max(len(ref_word), len(pred_word)) chars.
+    A deletion costs len(ref_word) chars. An insertion costs len(pred_word) chars.
+    """
+    n, m = len(ref_words), len(pred_words)
+    if n == 0:
+        return sum(len(w) for w in pred_words)
+    if m == 0:
+        return sum(len(w) for w in ref_words)
+    prev = [0] * (m + 1)
+    for j in range(1, m + 1):
+        prev[j] = prev[j - 1] + len(pred_words[j - 1])
+    for i in range(1, n + 1):
+        curr = [prev[0] + len(ref_words[i - 1])]
+        for j in range(1, m + 1):
+            if ref_words[i - 1] == pred_words[j - 1]:
+                curr.append(prev[j - 1])
+            else:
+                sub = prev[j - 1] + max(len(ref_words[i - 1]), len(pred_words[j - 1]))
+                delete = prev[j] + len(ref_words[i - 1])
+                insert = curr[j - 1] + len(pred_words[j - 1])
+                curr.append(min(sub, delete, insert))
+        prev = curr
+    return prev[m]
+
+
+def weighted_content_loss(log_probs, tgt_labels, vocab_size, content_weight, structural_max_id):
+    """NLL loss with higher weight on content tokens.
+
+    Input is log-probs from the copy mechanism (not raw logits).
     Structural tokens (IDs 0..structural_max_id) get weight 1.0.
     All other tokens (actual content being copied) get content_weight.
     Padding positions (label == -100) contribute 0.
     """
-    flat_logits = logits.reshape(-1, vocab_size)
+    flat_log_probs = log_probs.reshape(-1, vocab_size)
     flat_labels = tgt_labels.reshape(-1)
-    per_token = F.cross_entropy(flat_logits, flat_labels, reduction="none", ignore_index=-100)
+    per_token = F.nll_loss(flat_log_probs, flat_labels, reduction="none", ignore_index=-100)
 
     valid = flat_labels != -100
     structural = (flat_labels >= 0) & (flat_labels <= structural_max_id)
@@ -722,6 +829,10 @@ def autoregressive_eval(model, sp, n_samples=10,
     exact_count = 0
     xml_ok_count = 0
     total = 0
+    total_cer_chars = 0
+    total_cer_edits = 0
+    total_wer_words = 0
+    total_wer_edits = 0
     inferences = []
 
     samples = records[:n_samples]
@@ -745,6 +856,22 @@ def autoregressive_eval(model, sp, n_samples=10,
         except ET.ParseError:
             xml_ok = False
 
+        # CER: character-level edit distance on whitespace-normalized text.
+        char_edits = 0 if exact else levenshtein(norm_pred, norm_tgt)
+        char_ref_len = len(norm_tgt)
+        sample_cer = char_edits / max(char_ref_len, 1)
+        total_cer_edits += char_edits
+        total_cer_chars += char_ref_len
+
+        # WER: character-weighted word error rate. Levenshtein on words,
+        # but each edit weighted by the character length of the affected word.
+        pred_words = norm_pred.split()
+        tgt_words = norm_tgt.split()
+        wer_chars = 0 if exact else char_weighted_wer(pred_words, tgt_words)
+        sample_wer = wer_chars / max(char_ref_len, 1)
+        total_wer_edits += wer_chars
+        total_wer_words += char_ref_len
+
         if exact:
             exact_count += 1
         if xml_ok:
@@ -757,12 +884,19 @@ def autoregressive_eval(model, sp, n_samples=10,
             "predicted": pred,
             "exact": exact,
             "xml_ok": xml_ok,
+            "cer": round(sample_cer, 6),
+            "wer": round(sample_wer, 6),
+            "char_edits": char_edits,
+            "wer_chars": wer_chars,
         })
 
         status = "exact" if exact else ("xml_ok" if xml_ok else "FAIL")
-        print(f"  AR eval {i+1}/{len(samples)}: {len(src_ids)}→{len(pred_ids)} tokens [{status}]", flush=True)
+        detail = "" if exact else f" cer={sample_cer:.1%} wer={sample_wer:.1%}"
+        print(f"  AR eval {i+1}/{len(samples)}: {len(src_ids)}→{len(pred_ids)} tokens [{status}]{detail}", flush=True)
 
-    print(f"AR eval done: {exact_count}/{total} exact, {xml_ok_count}/{total} xml_ok", flush=True)
+    overall_cer = total_cer_edits / max(total_cer_chars, 1)
+    overall_wer = total_wer_edits / max(total_wer_words, 1)
+    print(f"AR eval done: {exact_count}/{total} exact, {xml_ok_count}/{total} xml_ok, CER={overall_cer:.2%}, WER={overall_wer:.2%}", flush=True)
 
     # Write inference log.
     if output_dir:
@@ -774,7 +908,7 @@ def autoregressive_eval(model, sp, n_samples=10,
                 f.write(json.dumps(inf) + "\n")
 
     del cpu_model
-    return exact_count, xml_ok_count, total
+    return exact_count, xml_ok_count, total, overall_cer, overall_wer
 
 
 def interrupt_filename():
@@ -818,7 +952,8 @@ def main():
     parser.add_argument("--d-model", type=int, default=384)
     parser.add_argument("--n-encoder-layers", type=int, default=6)
     parser.add_argument("--n-decoder-layers", type=int, default=6)
-    parser.add_argument("--d-state", type=int, default=16)
+    parser.add_argument("--d-state", type=int, default=64)
+    parser.add_argument("--headdim", type=int, default=64)
     parser.add_argument("--n-heads", type=int, default=6)
     parser.add_argument("--dropout", type=float, default=0.1)
 
@@ -846,18 +981,20 @@ def main():
     parser.add_argument("--structural-max-id", type=int, default=15,
                         help="Token IDs 0..N are considered structural (XML tags, special tokens)")
     parser.add_argument("--token-noise", type=float, default=0.15,
-                        help="Probability of replacing a content token in decoder input with a random content token (0=off)")
+                        help="Fallback probability of replacing a content token (used if stage not in PF_NOISE_SCHEDULE)")
     parser.add_argument("--professor-forcing", action="store_true", default=True,
                         help="Use model predictions instead of random tokens for noise (requires --token-noise > 0)")
 
     # Haiku augmentation pipeline.
     parser.add_argument("--augment-bin", type=str, default="/app/augment",
                         help="Path to Go augment binary")
+    parser.add_argument("--dict-word-pct", type=float, default=None,
+                        help="Override dict-word-pct for all stages (0=shuffle only, 50=default, 100=all dict words)")
     parser.add_argument("--stage", type=int, default=1,
                         help="Starting curriculum stage (1-5)")
-    parser.add_argument("--max-stage", type=int, default=5,
+    parser.add_argument("--max-stage", type=int, default=4,
                         help="Maximum curriculum stage (auto-advance stops here)")
-    parser.add_argument("--stage-advance-ar", type=float, default=0.7,
+    parser.add_argument("--stage-advance-ar", type=float, default=0.55,
                         help="AR exact rate threshold to advance stage (0-1)")
     parser.add_argument("--stage-patience", type=int, default=2,
                         help="Consecutive epochs above threshold before advancing")

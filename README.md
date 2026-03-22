@@ -202,6 +202,71 @@ Note: val_exact is not comparable between runs due to a training restart that re
 
 Int8 quantization: 28% faster, 4x smaller, slight quality degradation (1 fewer exact match in 10 samples).
 
+## Run 4 Results
+
+Run 4 added a pointer-generator copy mechanism to the decoder, allowing the model to explicitly copy content tokens from the input instead of regenerating them through the output vocabulary. Same hardware (RTX 2060 6GB), same 5-stage curriculum, same haiku corpus.
+
+### Architecture Changes
+
+- **Copy gate**: `Linear(d_model, 1)` with sigmoid, 385 new parameters. Blends generate distribution with copy distribution from cross-attention weights: `blended = (1-p_copy) * gen_probs + p_copy * copy_probs`
+- **NLLLoss**: switched from CrossEntropyLoss since output is now log-probabilities
+- **Float32 copy blending**: entire copy block wrapped in `torch.autocast("cuda", enabled=False)` to prevent fp16 NaN
+
+### Training Budget
+
+| Metric | Run 3 | Run 4 | Run 4 / Run 3 |
+|--------|-------|-------|---------------|
+| Optimizer steps | ~63,500 | ~63,800 | ~same |
+| Epochs | 40 | 43 | +7% |
+| Best val exact | 60.5% | 80.2% | +33% |
+| Best AR exact | 50/50 | 47/50 | -6% (harder val set) |
+| Best AR CER | — | 0.02% | new metric |
+| Real reject xml_ok | 5/20 (25%) | 17/30 (57%) | +128% |
+| Real reject CER | — | 6.1% | new metric |
+
+### Key Metrics
+
+| Epoch | Stage | Train Loss | Val Exact | AR Exact | AR XML OK | CER | WER |
+|-------|-------|-----------|-----------|----------|-----------|-----|-----|
+| 20    | 1     | —         | —         | 0/50     | 0/50      | —   | —   |
+| 30    | 3     | —         | —         | —        | —         | —   | —   |
+| 34    | 4     | 0.53      | 95.0%     | 33/50    | 50/50     | —   | —   |
+| 35    | 5     | 0.63      | 58.7%     | 46/50    | 50/50     | —   | —   |
+| 38    | 5     | 0.62      | 60.5%     | 40/50    | 49/50     | —   | —   |
+| **39**| **5** | **0.24**  | **78.2%** | **46/50**| **50/50** | —   | —   |
+| **40**| **5** | **0.21**  | **80.2%** | **47/50**| **50/50** | 0.07%| 0.15%|
+| 41    | 5     | 0.31      | 73.3%     | 46/50    | 50/50     | 0.02%| 0.13%|
+| 42    | 5     | 0.31      | 73.6%     | 45/50    | 50/50     | 0.28%| 0.38%|
+
+Epoch 39 breakthrough: switching from random dictionary word augmentation to shuffle-only (`dict_word_pct=0`) broke through the 60.5% plateau by 17.7 points in a single epoch.
+
+Epochs 41-42 introduced truncation augmentation and higher drop-memory rate, which made the training harder (val_exact dropped) but dramatically improved real reject performance.
+
+### What Worked
+
+- **Copy mechanism** — pointer-generator copy gate lets the model explicitly copy content tokens from source. Content fidelity improved dramatically, especially on code blocks and markdown.
+- **Shuffle-only augmentation** (`dict_word_pct=0`) — random dictionary words were training the copy mechanism on easy targets. Shuffling real content words preserves code syntax, markdown, and punctuation complexity. Single biggest improvement: 60.5% → 78.2% val_exact.
+- **Truncation augmentation** — `corrupt.DropKeys()` + `corrupt.TruncateJSON()` teaches the model to handle truncated inputs without hallucinating missing fields. Reject xml_ok went from 4/30 to 16/30 in one epoch.
+- **Drop memory 50%** — increasing from 20% to 50% reduced memory hallucination on inputs without a memory key.
+- **CER/WER metrics** — character error rate and character-weighted word error rate provide continuous quality measurement beyond binary exact/fail. Levenshtein-based, computed per-sample and aggregated.
+- **Professor forcing at 0.50-0.65** — higher PF rates in stage 5 close the train/eval gap by training on the model's own predictions.
+
+### What Didn't Work
+
+- **CW boost with copy mechanism** — content weight ramping fought the copy gate. The model reduced loss by increasing p_copy instead of learning structure. Disabled entirely (`content_weight=1.0`).
+- **NaN from fp16 copy blending** — `log(blended + 1e-10)` underflows in fp16 (1e-10 below fp16 minimum). Required wrapping entire copy block in float32 with autocast disabled.
+- **best_val_loss reset on stage advance** — resetting to infinity caused best.pt to be overwritten with worse models on resume. Removed the reset.
+
+### Remaining Failure Modes
+
+- **Field skipping on long inputs** — model drops entire XML entries (answer, memory) on 1000+ token inputs despite all fields being present in input. Likely an encoder state decay issue (real-valued SSM states lose early-field information).
+- **CDATA lookahead** — model must decide `<![CDATA[` before seeing content tokens. If it emits bare `<value>` and content has `<` or `&`, XML is broken. Fix implemented (always-CDATA) but not yet trained.
+- **Copy mechanism variable confusion** — copy gate attends to wrong source position, substituting nearby variable names (`state`→`time`, `high_efficiency`→`]_efficiency`).
+
+### Conclusions
+
+The copy mechanism and shuffle-only augmentation were transformative for content fidelity. However, the model hits a ceiling on long inputs where the Mamba 1 real-valued SSM states cannot maintain field-level state tracking. The dominant remaining failures are structural (field skipping, CDATA decisions) rather than content-level — exactly the class of problems that Mamba 3's complex-valued states are designed to address.
+
 ## Data Pipelines
 
 ### Haiku-First Pipeline (Run 2, current)

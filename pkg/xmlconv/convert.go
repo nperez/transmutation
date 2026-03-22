@@ -53,7 +53,7 @@ func writeValue(b *strings.Builder, v any, indent int) {
 	case string:
 		b.WriteString(prefix)
 		b.WriteString("<value>")
-		writeTextContent(b, val)
+		writeValueContent(b, val)
 		b.WriteString("</value>\n")
 	case float64:
 		b.WriteString(prefix)
@@ -150,13 +150,23 @@ func writeArray(b *strings.Builder, arr []any, indent int) {
 	b.WriteString("</array>\n")
 }
 
-// writeTextContent writes a string value, using CDATA if it contains special characters.
+// writeTextContent writes a string, using CDATA only when it contains special characters.
+// Used for keys (which are safe JSON field names).
 func writeTextContent(b *strings.Builder, s string) {
 	if needsCDATA(s) {
 		writeCDATA(b, s)
 	} else {
 		b.WriteString(s)
 	}
+}
+
+// writeValueContent writes a string value, always wrapped in CDATA.
+// Always using CDATA eliminates a lookahead problem in autoregressive decoding:
+// the model must decide CDATA before seeing content tokens, and can't go back
+// to add it if special characters appear later. Unconditional CDATA makes the
+// decision trivial — always emit <![CDATA[ after <value>.
+func writeValueContent(b *strings.Builder, s string) {
+	writeCDATA(b, s)
 }
 
 // needsCDATA returns true if the string contains characters that need escaping in XML.

@@ -100,11 +100,13 @@ build_infer() {
 # Run a GPU container in the foreground (blocking).
 run_gpu() {
     docker run --rm --gpus all \
+        --name "$CONTAINER_NAME" \
         -v "$PROJECT_DIR/data:/app/data" \
         -v "$PROJECT_DIR/models:/app/models" \
         -v "$SCRIPT_DIR:/app/training:ro" \
         -v "$PROJECT_DIR/tmp/generate:/app/generate:ro" \
         -v "$PROJECT_DIR/tmp/augment:/app/augment:ro" \
+        -v "$PROJECT_DIR/tmp/triton_cache:/home/trainer/.triton" \
         "$TRAIN_IMAGE" \
         "$@"
 }
@@ -118,6 +120,7 @@ run_gpu_detached() {
         -v "$SCRIPT_DIR:/app/training:ro" \
         -v "$PROJECT_DIR/tmp/generate:/app/generate:ro" \
         -v "$PROJECT_DIR/tmp/augment:/app/augment:ro" \
+        -v "$PROJECT_DIR/tmp/triton_cache:/home/trainer/.triton" \
         "$TRAIN_IMAGE" \
         "$@"
 }
@@ -212,20 +215,22 @@ case "${1:-help}" in
             --tokenizer "$RUN_DIR/tokenizer.model" \
             --output-dir "$RUN_DIR" \
             --augment-bin /app/augment \
-            --batch-size 2 \
-            --grad-accum 16 \
+            --batch-size 4 \
+            --grad-accum 8 \
+            --d-state 64 \
+            --headdim 64 \
             --max-src-len 1152 \
             --max-tgt-len 1536 \
             --epochs 100 \
             --lr 2e-4 \
             --warmup-steps 500 \
-            --save-every 5 \
+            --save-every 2 \
             --fp16 \
             --stage 1 \
-            --max-stage 5 \
+            --max-stage 4 \
             --stage-advance-ar 0.55 \
             --stage-patience 2 \
-            --content-weight 10.0 \
+            --content-weight 1.0 \
             --token-noise 0.15 \
             --professor-forcing \
             --ar-eval-samples 50 \
@@ -320,7 +325,8 @@ import json, sys
 entries = json.load(open('$PROJECT_DIR/$RUN_DIR/training_log.json'))
 for e in entries[-5:]:
     ar = f\"ar={e.get('ar_exact','?')}/{e.get('ar_total','?')}exact {e.get('ar_xml_ok','?')}/{e.get('ar_total','?')}xml\" if 'ar_total' in e else ''
-    print(f\"  epoch={e['epoch']} train={e['train_loss']:.4f} val={e['val_loss']:.4f} exact={e.get('val_exact_match',0):.1%} {ar} lr={e['lr']:.2e}\")
+    er = f\" CER={e['ar_cer']:.2%} WER={e['ar_wer']:.2%}\" if 'ar_cer' in e else ''
+    print(f\"  epoch={e['epoch']} train={e['train_loss']:.4f} val={e['val_loss']:.4f} exact={e.get('val_exact_match',0):.1%} {ar}{er} lr={e['lr']:.2e}\")
 " 2>/dev/null || echo "  (empty or parse error)"
         else
             echo "  (no training_log.json yet)"
@@ -414,24 +420,18 @@ for e in entries[-5:]:
         N_SAMPLES="${1:-10}"
         if [ -n "${1:-}" ]; then shift; fi
 
-        REJECTS_FILE="$PROJECT_DIR/data/haiku/rejects.jsonl"
-        if [ ! -f "$REJECTS_FILE" ]; then
-            echo "No rejects file at $REJECTS_FILE"
+        PAIRS_FILE="$PROJECT_DIR/data/rejects/repaired_pairs.jsonl"
+        if [ ! -f "$PAIRS_FILE" ]; then
+            echo "No repaired pairs file at $PAIRS_FILE"
             exit 1
         fi
 
         RESUME_CKPT=$(find_resume_flag | sed 's/--resume //')
         CHECKPOINT="${RESUME_CKPT:-$RUN_DIR/best.pt}"
 
-        # Wrap raw reject lines as JSONL {"input": LINE, "target": ""}.
-        TMPFILE="$PROJECT_DIR/tmp/infer_rejects_$$.jsonl"
-        trap "rm -f '$TMPFILE'" EXIT
-        awk '{gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); print "{\"input\": \"" $0 "\", \"target\": \"\"}"}' \
-            "$REJECTS_FILE" > "$TMPFILE"
-
-        TOTAL=$(wc -l < "$TMPFILE")
-        echo "CPU inference on rejects: $CHECKPOINT ($N_SAMPLES of $TOTAL rejects)..."
-        cat "$TMPFILE" | run_cpu_stdin training/infer_cpu.py "$CHECKPOINT" \
+        TOTAL=$(wc -l < "$PAIRS_FILE")
+        echo "CPU inference on repaired rejects: $CHECKPOINT ($N_SAMPLES of $TOTAL pairs)..."
+        cat "$PAIRS_FILE" | run_cpu_stdin training/infer_cpu.py "$CHECKPOINT" \
             -n "$N_SAMPLES" "$@"
         ;;
 
@@ -456,6 +456,34 @@ for e in entries[-5:]:
         docker run --rm \
             -v "$PROJECT_DIR/models:/app/models:ro" \
             -v "$TMPFILE:/app/input.jsonl:ro" \
+            --entrypoint sh \
+            "$INFER_IMAGE" \
+            -c "cat /app/input.jsonl | infer \
+                -encoder $RUN_DIR/onnx/encoder_int8.onnx \
+                -decoder $RUN_DIR/onnx/decoder_int8.onnx \
+                -tokenizer $RUN_DIR/tokenizer.model \
+                -ort-lib /usr/local/lib/libonnxruntime.so \
+                -n $N_SAMPLES \
+                $*"
+        ;;
+
+    go-infer-rejects)
+        build_infer
+        shift
+        N_SAMPLES="${1:-10}"
+        if [ -n "${1:-}" ]; then shift; fi
+
+        PAIRS_FILE="$PROJECT_DIR/data/rejects/repaired_pairs.jsonl"
+        if [ ! -f "$PAIRS_FILE" ]; then
+            echo "No repaired pairs file at $PAIRS_FILE"
+            exit 1
+        fi
+
+        TOTAL=$(wc -l < "$PAIRS_FILE")
+        echo "Go ONNX inference on repaired rejects ($N_SAMPLES of $TOTAL pairs)..."
+        docker run --rm \
+            -v "$PROJECT_DIR/models:/app/models:ro" \
+            -v "$PAIRS_FILE:/app/input.jsonl:ro" \
             --entrypoint sh \
             "$INFER_IMAGE" \
             -c "cat /app/input.jsonl | infer \
@@ -632,6 +660,7 @@ Inference:
   infer-rejects [N]    CPU inference on N rejected haiku samples (default 10).
   go-infer [N] [stage] [-beam-width K] [-length-penalty A]
                         Go ONNX inference on N samples (default 10, stage 3).
+  go-infer-rejects [N]  Go ONNX inference on N rejected haiku samples (default 10).
 
 Data:
   haiku-gen [N]     Generate N samples via Claude Haiku (default 100).

@@ -33,7 +33,7 @@ func TestConvertSimpleObject(t *testing.T) {
 	assertContains(t, result, "<entry>")
 	assertContains(t, result, "<key>age</key>")
 	assertContains(t, result, "<key>name</key>")
-	assertContains(t, result, "<value>alice</value>")
+	assertContains(t, result, "<value><![CDATA[alice]]></value>")
 	assertContains(t, result, "<value>30</value>")
 }
 
@@ -47,7 +47,7 @@ func TestConvertSimpleArray(t *testing.T) {
 	assertContains(t, result, "<array>")
 	assertContains(t, result, "</array>")
 	assertContains(t, result, "<value>1</value>")
-	assertContains(t, result, "<value>two</value>")
+	assertContains(t, result, "<value><![CDATA[two]]></value>")
 	assertContains(t, result, "<value>true</value>")
 	assertContains(t, result, "<value>null</value>")
 }
@@ -147,7 +147,7 @@ func TestConvertDeeplyNested(t *testing.T) {
 	if strings.Count(result, "<object>") != 4 {
 		t.Errorf("expected 4 <object> tags, got %d", strings.Count(result, "<object>"))
 	}
-	assertContains(t, result, "<value>deep</value>")
+	assertContains(t, result, "<value><![CDATA[deep]]></value>")
 }
 
 func TestConvertMixedTypes(t *testing.T) {
@@ -157,7 +157,7 @@ func TestConvertMixedTypes(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	assertValidXML(t, result)
-	assertContains(t, result, "<value>hello</value>")
+	assertContains(t, result, "<value><![CDATA[hello]]></value>")
 	assertContains(t, result, "<value>42</value>")
 	assertContains(t, result, "<value>3.14</value>")
 	assertContains(t, result, "<value>true</value>")

@@ -75,15 +75,14 @@ func MangleBrackets(json string, rng *rand.Rand) string {
 				// Check if we're at a run of consecutive closers.
 				runEnd := i
 				for runEnd+1 < len(json) {
-					next := json[runEnd+1]
-					if next == '}' || next == ']' {
+					switch json[runEnd+1] {
+					case '}', ']', '\n', ' ', '\t', '\r':
 						runEnd++
-					} else if next == '\n' || next == ' ' || next == '\t' || next == '\r' {
-						runEnd++
-					} else {
-						break
+					default:
+						goto endRun
 					}
 				}
+			endRun:
 				origLen := 0
 				for j := i; j <= runEnd; j++ {
 					if json[j] == '}' || json[j] == ']' {

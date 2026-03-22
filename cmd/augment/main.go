@@ -24,7 +24,9 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 
 	"nickandperla.net/transmutation/pkg/corrupt"
 	"nickandperla.net/transmutation/pkg/randtext"
@@ -39,6 +41,8 @@ type TrainingPair struct {
 var specialProb float64
 var corruptPct float64
 var compactPct float64
+var dictWordPct float64
+var truncatePct float64
 
 func main() {
 	var (
@@ -58,6 +62,10 @@ func main() {
 	flag.Float64Var(&specialProb, "special-prob", 0.15, "probability of XML special char injection per word boundary (0-1)")
 	flag.Float64Var(&corruptPct, "corrupt-pct", 0, "percentage of samples to corrupt input JSON (0-100)")
 	flag.Float64Var(&compactPct, "compact-pct", 0, "percentage of samples to compact input to single-line JSON (0-100)")
+	flag.Float64Var(&dictWordPct, "dict-word-pct", 50, "percentage of augmented strings to replace with dictionary words vs shuffle (0=shuffle only, 100=all dict words)")
+	flag.Float64Var(&truncatePct, "truncate-pct", 0, "percentage of samples to truncate (drop keys + cut string) (0-100)")
+	var dropMemoryPct float64
+	flag.Float64Var(&dropMemoryPct, "drop-memory-pct", 20, "percentage of augmented samples to drop the memory key (0-100)")
 	var minChars int
 	flag.IntVar(&minChars, "min-chars", 0, "minimum input character length (0 = no filter)")
 	var maxChars int
@@ -108,6 +116,91 @@ func main() {
 
 	selected := stratifiedSample(samples, keep, rng)
 
+	// Process samples in parallel, write results in order.
+	type result struct {
+		pairs     []TrainingPair
+		natural   int
+		augmented int
+		augFailed int
+		corrupted int
+		compacted int
+		truncated int
+	}
+
+	nWorkers := runtime.NumCPU()
+	results := make([]result, len(selected))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, nWorkers)
+
+	for si, idx := range selected {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(si, idx int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			sample := samples[idx]
+			var r result
+
+			// Natural sample, optionally truncated/compacted/corrupted.
+			out := sample
+			cSeed := seed + uint64(idx)*uint64(augRatio+1) + 999999
+			cRng := rand.New(rand.NewPCG(cSeed, cSeed^0xf00d))
+			if truncatePct > 0 && cRng.Float64()*100 < truncatePct {
+				if t, err := truncateSample(out, cRng); err == nil {
+					out = t
+					r.truncated++
+				}
+			}
+			if compactPct > 0 && cRng.Float64()*100 < compactPct {
+				out.Input = compactJSON(out.Input)
+				r.compacted++
+			}
+			if corruptPct > 0 && cRng.Float64()*100 < corruptPct {
+				out.Input = corrupt.Apply(out.Input, corruptionConfig(cRng), cRng)
+				r.corrupted++
+			}
+			r.pairs = append(r.pairs, out)
+			r.natural++
+
+			// Augmented variants.
+			for v := range augRatio {
+				augSeed := seed + uint64(idx)*uint64(augRatio+1) + uint64(v) + 1
+				augRng := rand.New(rand.NewPCG(augSeed, augSeed^0xcafebabe))
+
+				aug, err := augmentSample(sample, augRng, dropMemoryPct)
+				if err != nil {
+					r.augFailed++
+					continue
+				}
+				if truncatePct > 0 && augRng.Float64()*100 < truncatePct {
+					if t, err := truncateSample(aug, augRng); err == nil {
+						aug = t
+						r.truncated++
+					}
+				}
+				if compactPct > 0 && augRng.Float64()*100 < compactPct {
+					aug.Input = compactJSON(aug.Input)
+					r.compacted++
+				}
+				if corruptPct > 0 {
+					cSeed := augSeed ^ 0xf00d
+					cRng := rand.New(rand.NewPCG(cSeed, cSeed^0xbeef))
+					if cRng.Float64()*100 < corruptPct {
+						aug.Input = corrupt.Apply(aug.Input, corruptionConfig(cRng), cRng)
+						r.corrupted++
+					}
+				}
+				r.pairs = append(r.pairs, aug)
+				r.augmented++
+			}
+
+			results[si] = r
+		}(si, idx)
+	}
+	wg.Wait()
+
+	// Write results in order and aggregate counts.
 	bw := bufio.NewWriterSize(os.Stdout, 256*1024)
 	defer bw.Flush()
 	enc := json.NewEncoder(bw)
@@ -117,51 +210,18 @@ func main() {
 	augFailed := 0
 	corrupted := 0
 	compacted := 0
+	truncated := 0
 
-	for _, idx := range selected {
-		sample := samples[idx]
-
-		// Emit the natural (unmodified) sample, optionally compacted/corrupted.
-		out := sample
-		cSeed := seed + uint64(idx)*uint64(augRatio+1) + 999999
-		cRng := rand.New(rand.NewPCG(cSeed, cSeed^0xf00d))
-		if compactPct > 0 && cRng.Float64()*100 < compactPct {
-			out.Input = compactJSON(out.Input)
-			compacted++
+	for _, r := range results {
+		for _, p := range r.pairs {
+			enc.Encode(p)
 		}
-		if corruptPct > 0 && cRng.Float64()*100 < corruptPct {
-			out.Input = corrupt.Apply(out.Input, corruptionConfig(cRng), cRng)
-			corrupted++
-		}
-		enc.Encode(out)
-		natural++
-
-		// Emit augRatio augmented variants, optionally compacted/corrupted.
-		for v := range augRatio {
-			augSeed := seed + uint64(idx)*uint64(augRatio+1) + uint64(v) + 1
-			augRng := rand.New(rand.NewPCG(augSeed, augSeed^0xcafebabe))
-
-			aug, err := augmentSample(sample, augRng)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "  augment fail: %v\n", err)
-				augFailed++
-				continue
-			}
-			if compactPct > 0 && augRng.Float64()*100 < compactPct {
-				aug.Input = compactJSON(aug.Input)
-				compacted++
-			}
-			if corruptPct > 0 {
-				cSeed := augSeed ^ 0xf00d
-				cRng := rand.New(rand.NewPCG(cSeed, cSeed^0xbeef))
-				if cRng.Float64()*100 < corruptPct {
-					aug.Input = corrupt.Apply(aug.Input, corruptionConfig(cRng), cRng)
-					corrupted++
-				}
-			}
-			enc.Encode(aug)
-			augmented++
-		}
+		natural += r.natural
+		augmented += r.augmented
+		augFailed += r.augFailed
+		corrupted += r.corrupted
+		compacted += r.compacted
+		truncated += r.truncated
 	}
 
 	bw.Flush()
@@ -172,6 +232,9 @@ func main() {
 	}
 	fmt.Fprintf(os.Stderr, "Haiku augment (%s): %d natural + %d augmented = %d total (sampled %d = %.1f%% of %d",
 		split, natural, augmented, natural+augmented, keep, samplePct, len(samples))
+	if truncated > 0 {
+		fmt.Fprintf(os.Stderr, ", %d truncated", truncated)
+	}
 	if compacted > 0 {
 		fmt.Fprintf(os.Stderr, ", %d compacted", compacted)
 	}
@@ -252,10 +315,17 @@ func loadHaiku(dir string, sampleType string) ([]TrainingPair, error) {
 // augmentSample takes a natural haiku sample, replaces all string values
 // with augmented content (dict words or shuffled + special char injection),
 // then regenerates XML from the modified JSON.
-func augmentSample(sample TrainingPair, rng *rand.Rand) (TrainingPair, error) {
+func augmentSample(sample TrainingPair, rng *rand.Rand, dropMemoryPct float64) (TrainingPair, error) {
 	var obj any
 	if err := json.Unmarshal([]byte(sample.Input), &obj); err != nil {
 		return TrainingPair{}, fmt.Errorf("parse input: %w", err)
+	}
+
+	// Randomly drop the memory key to teach the model it's optional.
+	if m, ok := obj.(map[string]any); ok && dropMemoryPct > 0 {
+		if _, has := m["memory"]; has && rng.Float64()*100 < dropMemoryPct {
+			delete(m, "memory")
+		}
 	}
 
 	augmentValues(obj, rng)
@@ -308,30 +378,39 @@ func augmentValues(v any, rng *rand.Rand) {
 	}
 }
 
-// augmentString replaces a string value with either dictionary words or
-// shuffled words from the original, both with XML special char injection
-// at the configured specialProb rate.
-func augmentString(s string, rng *rand.Rand) string {
-	words := strings.Fields(s)
-	n := len(words)
+// augmentStringDictWords replaces a string value with random dictionary words
+// and injects XML special characters.
+func augmentStringDictWords(s string, rng *rand.Rand) string {
+	n := len(strings.Fields(s))
 	if n == 0 {
 		n = 1 + rng.IntN(3)
 	}
-
-	if rng.Float64() < 0.5 {
-		// Dictionary words.
-		newWords := make([]string, n)
-		for i := range newWords {
-			newWords[i] = randtext.DictWord(rng)
-		}
-		return randtext.InjectSpecialChars(rng, strings.Join(newWords, " "), specialProb)
+	newWords := make([]string, n)
+	for i := range newWords {
+		newWords[i] = randtext.DictWord(rng)
 	}
+	return randtext.InjectSpecialChars(rng, strings.Join(newWords, " "), specialProb)
+}
 
-	// Shuffle original words + inject special chars.
+// augmentStringShuffle shuffles the original words in place, preserving
+// the real token complexity (code syntax, markdown, punctuation).
+func augmentStringShuffle(s string, rng *rand.Rand) string {
+	words := strings.Fields(s)
+	if len(words) == 0 {
+		return s
+	}
 	rng.Shuffle(len(words), func(i, j int) {
 		words[i], words[j] = words[j], words[i]
 	})
 	return randtext.InjectSpecialChars(rng, strings.Join(words, " "), specialProb)
+}
+
+// augmentString dispatches to dict words or shuffle based on dictWordPct.
+func augmentString(s string, rng *rand.Rand) string {
+	if rng.Float64()*100 < dictWordPct {
+		return augmentStringDictWords(s, rng)
+	}
+	return augmentStringShuffle(s, rng)
 }
 
 // Length bins for stratified sampling (input character counts).
@@ -403,6 +482,42 @@ func stratifiedSample(samples []TrainingPair, total int, rng *rand.Rand) []int {
 	}
 
 	return selected
+}
+
+// truncateSample simulates LLM output truncation by dropping 1-2 random keys
+// from the JSON input and regenerating the target XML to match. Optionally
+// also truncates the JSON string mid-stream (50% chance) to simulate hard cutoff.
+func truncateSample(sample TrainingPair, rng *rand.Rand) (TrainingPair, error) {
+	// Drop keys from the input JSON.
+	reduced, err := corrupt.DropKeys(sample.Input, rng)
+	if err != nil {
+		return TrainingPair{}, fmt.Errorf("drop keys: %w", err)
+	}
+
+	// Regenerate target XML from the reduced JSON.
+	xmlOut, err := xmlconv.Convert([]byte(reduced))
+	if err != nil {
+		return TrainingPair{}, fmt.Errorf("xmlconv: %w", err)
+	}
+
+	// Verify the XML is parseable.
+	dec := xml.NewDecoder(strings.NewReader("<root>" + xmlOut + "</root>"))
+	for {
+		_, err := dec.Token()
+		if err != nil {
+			if err.Error() == "EOF" {
+				break
+			}
+			return TrainingPair{}, fmt.Errorf("invalid xml: %w", err)
+		}
+	}
+
+	// 50% chance: also truncate the JSON string mid-stream (hard cutoff).
+	if rng.Float64() < 0.5 {
+		reduced = corrupt.TruncateJSON(reduced, rng)
+	}
+
+	return TrainingPair{Input: reduced, Target: xmlOut}, nil
 }
 
 // compactJSON re-marshals pretty-printed JSON into single-line compact form.

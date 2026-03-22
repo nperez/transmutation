@@ -20,6 +20,9 @@
 # If both fixes agree (low edit distance) and the result parses, generates
 # a training pair: broken JSON → correct XML.
 #
+# Incrementally updates the rejects file — successfully repaired items are
+# removed after each batch, so the process is resumable.
+#
 # Usage: ./scripts/repair_rejects.sh [rejects_file] [output_file]
 
 set -euo pipefail
@@ -28,11 +31,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 REPAIR_BIN="$PROJECT_DIR/tmp/repair"
 
-REJECTS="${1:-$PROJECT_DIR/data/haiku/rejects.jsonl}"
-OUTPUT="${2:-$PROJECT_DIR/data/haiku/repaired_pairs.jsonl}"
-FIXED_DIR="$PROJECT_DIR/data/haiku/fixed_json"
+REJECTS="${1:-$PROJECT_DIR/data/rejects/rejects.jsonl}"
+OUTPUT="${2:-$PROJECT_DIR/data/rejects/repaired_pairs.jsonl}"
 PARALLEL=8
-BATCH_SIZE=10
 
 if [ ! -f "$REPAIR_BIN" ]; then
     echo "Repair binary not found. Run: go build -o tmp/repair ./cmd/repair/"
@@ -44,12 +45,21 @@ if [ ! -f "$REJECTS" ]; then
     exit 1
 fi
 
-mkdir -p "$FIXED_DIR"
+mkdir -p "$(dirname "$OUTPUT")"
 
-TOTAL=$(wc -l < "$REJECTS")
+# Snapshot the rejects file so line numbers stay stable across rewrites.
+SNAPSHOT="$PROJECT_DIR/tmp/repair_snapshot_$$.jsonl"
+cp "$REJECTS" "$SNAPSHOT"
+TOTAL=$(wc -l < "$SNAPSHOT")
+
+if [ "$TOTAL" -eq 0 ]; then
+    echo "No rejects to repair."
+    rm -f "$SNAPSHOT"
+    exit 0
+fi
+
 echo "Repairing $TOTAL rejected samples from $REJECTS"
 echo "  Output: $OUTPUT"
-echo "  Fixed JSON: $FIXED_DIR/"
 echo "  Parallel: $PARALLEL"
 
 REPAIR_SYSTEM='You are a JSON repair tool. You will receive broken JSON. Fix it so it parses correctly.
@@ -101,12 +111,54 @@ repair_one() {
     echo "{\"original\": $orig_escaped, \"fix_a\": $fix_a_escaped, \"fix_b\": $fix_b_escaped}" > "$out_dir/record_${line_num}.jsonl"
 }
 
-# Process rejects in batches with parallelism.
+# Validate a batch of repair records, append accepted pairs to output,
+# and update the rejects file to remove successfully repaired items.
+process_batch() {
+    local batch_records
+    batch_records=$(ls "$RECORDS_DIR"/record_*.jsonl 2>/dev/null || true)
+    if [ -z "$batch_records" ]; then
+        return
+    fi
+
+    local batch_accepted=0
+    local batch_failed=0
+
+    for record_file in $batch_records; do
+        local lnum
+        lnum=$(basename "$record_file" | grep -oP '\d+')
+        local result
+        result=$("$REPAIR_BIN" -max-dist 50 -max-change-pct 10 < "$record_file" 2>/dev/null || true)
+        if [ -n "$result" ]; then
+            echo "$result" >> "$OUTPUT"
+            echo "$lnum" >> "$ACCEPTED_FILE"
+            batch_accepted=$((batch_accepted + 1))
+            TOTAL_ACCEPTED=$((TOTAL_ACCEPTED + 1))
+        else
+            batch_failed=$((batch_failed + 1))
+            TOTAL_FAILED=$((TOTAL_FAILED + 1))
+        fi
+        rm -f "$record_file"
+    done
+
+    # Rewrite rejects file: snapshot minus all accepted lines so far.
+    awk 'NR==FNR{skip[$1]; next} !(FNR in skip)' "$ACCEPTED_FILE" "$SNAPSHOT" > "$REJECTS.tmp"
+    mv "$REJECTS.tmp" "$REJECTS"
+
+    local remaining
+    remaining=$(wc -l < "$REJECTS")
+    echo "  batch: +$batch_accepted repaired, $batch_failed failed | totals: $TOTAL_ACCEPTED repaired, $remaining remaining"
+}
+
 RECORDS_DIR="$PROJECT_DIR/tmp/repair_records_$$"
 mkdir -p "$RECORDS_DIR"
 
+ACCEPTED_FILE="$PROJECT_DIR/tmp/repair_accepted_$$"
+touch "$ACCEPTED_FILE"
+
 PROCESSED=0
 LINE_NUM=0
+TOTAL_ACCEPTED=0
+TOTAL_FAILED=0
 
 while IFS= read -r line; do
     LINE_NUM=$((LINE_NUM + 1))
@@ -119,29 +171,26 @@ while IFS= read -r line; do
     repair_one "$LINE_NUM" "$line" "$RECORDS_DIR" &
     PROCESSED=$((PROCESSED + 1))
 
-    # Throttle parallelism.
+    # Throttle parallelism — validate and update after each batch.
     if [ $((PROCESSED % PARALLEL)) -eq 0 ]; then
         wait
-        DONE=$(ls "$RECORDS_DIR"/record_*.jsonl 2>/dev/null | wc -l)
-        echo "  processed $PROCESSED/$TOTAL ($DONE repair records)..."
+        process_batch
+        echo "  processed $PROCESSED/$TOTAL..."
     fi
-done < "$REJECTS"
+done < "$SNAPSHOT"
 
-# Wait for remaining jobs.
+# Wait for remaining jobs and process final batch.
 wait
-DONE=$(ls "$RECORDS_DIR"/record_*.jsonl 2>/dev/null | wc -l)
-echo "  processed $PROCESSED/$TOTAL ($DONE repair records)"
+process_batch
 
-# Merge per-job records into one file.
-REPAIR_RECORDS="$PROJECT_DIR/tmp/repair_records.jsonl"
-cat "$RECORDS_DIR"/record_*.jsonl > "$REPAIR_RECORDS" 2>/dev/null || true
-rm -rf "$RECORDS_DIR"
+# Cleanup temp files.
+rm -f "$SNAPSHOT" "$ACCEPTED_FILE"
+rmdir "$RECORDS_DIR" 2>/dev/null || true
 
-# Run validation and XML generation.
+PAIRS=0
+if [ -f "$OUTPUT" ]; then
+    PAIRS=$(wc -l < "$OUTPUT")
+fi
+REMAINING=$(wc -l < "$REJECTS")
 echo ""
-echo "Validating repairs and generating training pairs..."
-"$REPAIR_BIN" -max-dist 50 -max-change-pct 10 < "$REPAIR_RECORDS" > "$OUTPUT"
-
-PAIRS=$(wc -l < "$OUTPUT")
-echo ""
-echo "Done. $PAIRS training pairs written to $OUTPUT"
+echo "Done. $TOTAL_ACCEPTED repaired this run ($PAIRS total pairs in $OUTPUT), $REMAINING remaining rejects"
