@@ -215,25 +215,31 @@ case "${1:-help}" in
             --tokenizer "$RUN_DIR/tokenizer.model" \
             --output-dir "$RUN_DIR" \
             --augment-bin /app/augment \
-            --batch-size 4 \
-            --grad-accum 8 \
+            --batch-size 3 \
+            --grad-accum 11 \
             --d-state 64 \
             --headdim 64 \
+            --structural-weight 1.0 \
             --max-src-len 1152 \
             --max-tgt-len 1536 \
             --epochs 100 \
             --lr 2e-4 \
             --warmup-steps 500 \
-            --save-every 2 \
+            --save-every 1 \
             --fp16 \
             --stage 1 \
-            --max-stage 4 \
-            --stage-advance-ar 0.55 \
-            --stage-patience 2 \
+            --max-stage 6 \
+            --stage-patience 1 \
             --content-weight 1.0 \
+            --mrt-weight 10 \
+            --mrt-threshold 0.90 \
+            --cdata-weight 0 \
             --token-noise 0.15 \
             --professor-forcing \
-            --ar-eval-samples 50 \
+            --pf-iterations 1 \
+            --ar-train-frac 1.0 \
+            --ar-eval-samples 250 \
+            --max-epoch-samples 33000 \
             $RESUME_FLAG \
             "$@")
 
@@ -282,7 +288,11 @@ case "${1:-help}" in
             echo "No training container found."
             exit 1
         fi
-        docker logs -f "$CID" 2>&1 | tr '\r' '\n'
+        if [ -n "${2:-}" ]; then
+            docker logs --tail "$2" "$CID" 2>&1 | tr '\r' '\n'
+        else
+            docker logs -f "$CID" 2>&1 | tr '\r' '\n'
+        fi
         ;;
 
     status)
@@ -290,27 +300,11 @@ case "${1:-help}" in
         echo
         echo "=== Checkpoints ==="
         if ls "$PROJECT_DIR/$RUN_DIR"/*.pt 1>/dev/null 2>&1; then
-            docker run --rm \
-                -v "$PROJECT_DIR/models:/app/models:ro" \
-                "$TRAIN_IMAGE" -c "
-import torch, os
-run_dir = '$RUN_DIR'
-for f in sorted(os.listdir(run_dir)):
-    if not f.endswith('.pt'): continue
-    path = os.path.join(run_dir, f)
-    sz_mb = os.path.getsize(path) / 1024 / 1024
-    c = torch.load(path, map_location='cpu', weights_only=True)
-    ep = c.get('epoch', '?')
-    gs = c.get('global_step', '?')
-    vl = c.get('best_val_loss', None)
-    ec = c.get('epoch_complete', False)
-    es = c.get('epoch_step', 0)
-    stg = c.get('stage', '?')
-    parts = [f'epoch={ep}', f'step={gs}', f'stage={stg}']
-    if vl is not None: parts.append(f'best_val={vl:.4f}')
-    if not ec and es: parts.append(f'batch={es}')
-    print(f'  {f:<40s} {sz_mb:.0f}MB  {\" \".join(parts)}')
-"
+            ls -1 "$PROJECT_DIR/$RUN_DIR"/*.pt | while read f; do
+                name=$(basename "$f")
+                sz=$(du -h "$f" | cut -f1)
+                echo "  $name  $sz"
+            done
         else
             echo "  (none)"
         fi
@@ -323,10 +317,12 @@ for f in sorted(os.listdir(run_dir)):
             python3 -c "
 import json, sys
 entries = json.load(open('$PROJECT_DIR/$RUN_DIR/training_log.json'))
-for e in entries[-5:]:
+for e in entries[-10:]:
+    vc = f\" vCER={e['val_cer']:.2%} vWER={e['val_wer']:.2%}\" if 'val_cer' in e else ''
     ar = f\"ar={e.get('ar_exact','?')}/{e.get('ar_total','?')}exact {e.get('ar_xml_ok','?')}/{e.get('ar_total','?')}xml\" if 'ar_total' in e else ''
     er = f\" CER={e['ar_cer']:.2%} WER={e['ar_wer']:.2%}\" if 'ar_cer' in e else ''
-    print(f\"  epoch={e['epoch']} train={e['train_loss']:.4f} val={e['val_loss']:.4f} exact={e.get('val_exact_match',0):.1%} {ar}{er} lr={e['lr']:.2e}\")
+    stg = f\"s{e['stage']}\" if 'stage' in e else ''
+    print(f\"  epoch={e['epoch']} {stg} train={e['train_loss']:.4f} val={e['val_loss']:.4f} exact={e.get('val_exact_match',0):.1%}{vc} {ar}{er} lr={e['lr']:.2e}\")
 " 2>/dev/null || echo "  (empty or parse error)"
         else
             echo "  (no training_log.json yet)"
@@ -410,7 +406,7 @@ for e in entries[-5:]:
         "$GENERATE_BIN" -stage "$STAGE" -stdout -train "$GEN_COUNT" -val 0 -seed "$$" > "$TMPFILE"
 
         echo "CPU inference: $CHECKPOINT ($N_SAMPLES samples, stage $STAGE)..."
-        cat "$TMPFILE" | run_cpu_stdin training/infer_cpu.py "$CHECKPOINT" \
+        shuf -n "$N_SAMPLES" "$TMPFILE" | run_cpu_stdin training/infer.py "$CHECKPOINT" \
             -n "$N_SAMPLES" "$@"
         ;;
 
@@ -431,7 +427,7 @@ for e in entries[-5:]:
 
         TOTAL=$(wc -l < "$PAIRS_FILE")
         echo "CPU inference on repaired rejects: $CHECKPOINT ($N_SAMPLES of $TOTAL pairs)..."
-        cat "$PAIRS_FILE" | run_cpu_stdin training/infer_cpu.py "$CHECKPOINT" \
+        shuf -n "$N_SAMPLES" "$PAIRS_FILE" | run_cpu_stdin training/infer.py "$CHECKPOINT" \
             -n "$N_SAMPLES" "$@"
         ;;
 
@@ -642,6 +638,185 @@ for e in entries[-5:]:
         "$PROJECT_DIR/scripts/repair_rejects.sh" "$@"
         ;;
 
+    eval)
+        build_train
+        build_generator
+        shift
+        N_SAMPLES="${1:-500}"
+        if [ -n "${1:-}" ]; then shift; fi
+
+        HOLDOUT_DIR="$PROJECT_DIR/data/holdout"
+        EVAL_LOG="$PROJECT_DIR/tmp/eval.log"
+        EVAL_PID="$PROJECT_DIR/tmp/eval.pid"
+        mkdir -p "$PROJECT_DIR/tmp"
+
+        # Reject if already running.
+        if [ -f "$EVAL_PID" ] && kill -0 "$(cat "$EVAL_PID")" 2>/dev/null; then
+            echo "Eval already running (PID $(cat "$EVAL_PID")). Use 'eval-logs' to monitor."
+            exit 1
+        fi
+
+        # Accept explicit checkpoint: ./training/run.sh eval 250 --ckpt models/run5/epoch_74.pt
+        RESUME_CKPT=$(find_resume_flag | sed 's/--resume //')
+        CHECKPOINT="${RESUME_CKPT:-$RUN_DIR/best_ar.pt}"
+        _prev=""
+        _remaining=()
+        for _arg in "$@"; do
+            if [ "$_prev" = "--ckpt" ]; then CHECKPOINT="$_arg"; _prev=""; continue; fi
+            if [ "$_arg" = "--ckpt" ]; then _prev="$_arg"; continue; fi
+            _remaining+=("$_arg")
+        done
+        set -- "${_remaining[@]+"${_remaining[@]}"}"
+        EVAL_OUT="$PROJECT_DIR/tmp/eval_results.jsonl"
+
+        # Run the full pipeline in a background subshell, logging to file.
+        (
+            exec > "$EVAL_LOG" 2>&1
+            set -e
+            trap 'echo "EVAL FAILED at line $LINENO (exit $?)"' ERR
+
+            # Step 1: Generate fresh holdout data if not present.
+            HOLDOUT_HAS=$(find "$HOLDOUT_DIR" -name '*.jsonl' 2>/dev/null | head -1 || true)
+            if [ -z "$HOLDOUT_HAS" ]; then
+                echo "No holdout data found. Generating $N_SAMPLES fresh samples via Haiku..."
+                mkdir -p "$HOLDOUT_DIR"
+                "$PROJECT_DIR/scripts/gen_haiku.sh" "$N_SAMPLES" "$HOLDOUT_DIR"
+                echo "Holdout generation complete."
+            else
+                EXISTING=$(cat "$HOLDOUT_DIR"/*.jsonl 2>/dev/null | wc -l)
+                echo "Using existing holdout set: $EXISTING samples in $HOLDOUT_DIR"
+            fi
+
+            # Step 2: Augment holdout into clean input/target pairs (no corruption).
+            echo "Augmenting holdout to input/target pairs..."
+            TMPFILE=$(mktemp)
+            trap 'rm -f "$TMPFILE"' EXIT
+            "$PROJECT_DIR/tmp/augment" \
+                -dir "$HOLDOUT_DIR" \
+                -sample-pct 100 \
+                -aug-ratio 0 \
+                -special-prob 0 \
+                -corrupt-pct 0 \
+                -compact-pct 50 \
+                -type all \
+                -seed 77777 > "$TMPFILE" 2>/dev/null
+
+            TOTAL=$(wc -l < "$TMPFILE")
+            echo "Augmented $TOTAL holdout pairs."
+
+            # Step 3: Run inference with --json output (GPU if available).
+            echo "Running inference: $CHECKPOINT ($N_SAMPLES of $TOTAL samples, --json)..."
+            EVAL_INPUT="$PROJECT_DIR/data/eval_input.jsonl"
+            EVAL_RAW="$PROJECT_DIR/data/eval_raw.jsonl"
+            shuf -n "$N_SAMPLES" "$TMPFILE" > "$EVAL_INPUT"
+            docker run --rm --gpus all \
+                --name "${CONTAINER_NAME}-eval" \
+                -v "$PROJECT_DIR/data:/app/data" \
+                -v "$PROJECT_DIR/models:/app/models" \
+                -v "$SCRIPT_DIR:/app/training:ro" \
+                -v "$PROJECT_DIR/tmp/triton_cache:/home/trainer/.triton" \
+                "$TRAIN_IMAGE" \
+                training/infer.py "$CHECKPOINT" \
+                -n "$N_SAMPLES" --json --gpu --input data/eval_input.jsonl "$@" > "$EVAL_RAW" 2>&1
+            grep '^{' "$EVAL_RAW" > "$EVAL_OUT" || true
+            rm -f "$EVAL_INPUT" "$EVAL_RAW"
+
+            # Step 4: Display results bucketed by source token length.
+            echo ""
+            echo "=== Eval Summary ==="
+            TOTAL_EVAL=$(wc -l < "$EVAL_OUT")
+            EXACT=$(grep -c '"exact": true' "$EVAL_OUT" || true)
+            SEMANTIC=$(grep -c '"semantic": true' "$EVAL_OUT" || true)
+            XML_OK=$(grep -c '"xml_ok": true' "$EVAL_OUT" || true)
+            FAIL=$((TOTAL_EVAL - XML_OK))
+            echo "Total: $TOTAL_EVAL | Exact: $EXACT | Semantic: $SEMANTIC | XML_OK: $((XML_OK - EXACT - SEMANTIC)) | Fail: $FAIL"
+            echo ""
+
+            echo "=== By Source Token Length ==="
+            printf "%-16s %6s %6s %6s %6s %6s\n" "Bucket" "Total" "Exact" "Sem" "XmlOk" "Fail"
+            for BUCKET in "0-250" "251-500" "501-750" "751-1000" "1001+"; do
+                case "$BUCKET" in
+                    0-250)    FILTER='select(.src_tokens <= 250)' ;;
+                    251-500)  FILTER='select(.src_tokens > 250 and .src_tokens <= 500)' ;;
+                    501-750)  FILTER='select(.src_tokens > 500 and .src_tokens <= 750)' ;;
+                    751-1000) FILTER='select(.src_tokens > 750 and .src_tokens <= 1000)' ;;
+                    1001+)    FILTER='select(.src_tokens > 1000)' ;;
+                esac
+                STATS=$(jq -s -r "[.[] | $FILTER] | {t: length, e: [.[] | select(.exact)] | length, s: [.[] | select(.semantic)] | length, x: [.[] | select(.xml_ok)] | length} | \"\(.t) \(.e) \(.s) \(.x)\"" "$EVAL_OUT")
+                BT=$(echo "$STATS" | awk '{print $1}')
+                BE=$(echo "$STATS" | awk '{print $2}')
+                BS=$(echo "$STATS" | awk '{print $3}')
+                BX=$(echo "$STATS" | awk '{print $4}')
+                BF=$((BT - BX))
+                BXO=$((BX - BE - BS))
+                if [ "$BT" -gt 0 ]; then
+                    PCT=$(awk "BEGIN {printf \"%.1f\", ($BE/$BT)*100}")
+                    printf "%-16s %6d %6d %6d %6d %6d  (%s%% exact)\n" "$BUCKET" "$BT" "$BE" "$BS" "$BXO" "$BF" "$PCT"
+                fi
+            done
+
+            echo ""
+            echo "=== Eval complete ==="
+            rm -f "$EVAL_PID"
+        ) &
+        BGPID=$!
+        echo "$BGPID" > "$EVAL_PID"
+        echo "Eval started (PID $BGPID). Monitor with: ./training/run.sh eval-logs"
+        ;;
+
+    eval-logs)
+        EVAL_LOG="$PROJECT_DIR/tmp/eval.log"
+        EVAL_PID="$PROJECT_DIR/tmp/eval.pid"
+        EVAL_CONTAINER="${CONTAINER_NAME}-eval"
+        if [ ! -f "$EVAL_LOG" ]; then
+            echo "No eval log found. Run 'eval' first."
+            exit 1
+        fi
+        if [ -n "${2:-}" ]; then
+            # Show eval log, plus live container logs if inference is running.
+            tail -n "$2" "$EVAL_LOG"
+            if docker ps -q -f "name=$EVAL_CONTAINER" 2>/dev/null | grep -q .; then
+                echo "--- inference (live) ---"
+                docker logs --tail "$2" "$EVAL_CONTAINER" 2>&1
+            fi
+        else
+            if [ -f "$EVAL_PID" ] && kill -0 "$(cat "$EVAL_PID")" 2>/dev/null; then
+                tail -f "$EVAL_LOG"
+            else
+                cat "$EVAL_LOG"
+            fi
+        fi
+        ;;
+
+    eval-kill)
+        EVAL_PID="$PROJECT_DIR/tmp/eval.pid"
+        EVAL_CONTAINER="${CONTAINER_NAME}-eval"
+        # Stop the docker container first (the actual work).
+        if docker ps -q -f "name=$EVAL_CONTAINER" 2>/dev/null | grep -q .; then
+            echo "Stopping eval container..."
+            docker stop -t 5 "$EVAL_CONTAINER" >/dev/null 2>&1 || true
+            docker rm -f "$EVAL_CONTAINER" >/dev/null 2>&1 || true
+        fi
+        # Then kill the background subshell.
+        if [ -f "$EVAL_PID" ] && kill -0 "$(cat "$EVAL_PID")" 2>/dev/null; then
+            kill -- -"$(cat "$EVAL_PID")" 2>/dev/null || kill "$(cat "$EVAL_PID")" 2>/dev/null || true
+        fi
+        rm -f "$EVAL_PID"
+        echo "Eval killed."
+        ;;
+
+    eval-regen)
+        build_generator
+        shift
+        N_SAMPLES="${1:-500}"
+        HOLDOUT_DIR="$PROJECT_DIR/data/holdout"
+        echo "Regenerating holdout set: $N_SAMPLES fresh samples..."
+        rm -rf "$HOLDOUT_DIR"
+        mkdir -p "$HOLDOUT_DIR"
+        "$PROJECT_DIR/scripts/gen_haiku.sh" "$N_SAMPLES" "$HOLDOUT_DIR"
+        echo "Done. Run './training/run.sh eval' to evaluate."
+        ;;
+
     help|*)
         cat <<'USAGE'
 Usage: ./training/run.sh <command> [args...]
@@ -651,13 +826,17 @@ Training:
   stop              Graceful stop (checkpoints, then exits).
   kill              Force kill (no checkpoint).
   checkpoint        Save a checkpoint without stopping.
-  logs              Follow training output.
+  logs [N]          Follow training output, or show last N lines.
   status            Show checkpoints, metrics, container state.
 
 Inference:
   infer [N] [stage] [--beam-width K] [--length-penalty A]
                         CPU inference on N samples (default 10, stage 3).
   infer-rejects [N]    CPU inference on N rejected haiku samples (default 10).
+  eval [N]             Holdout eval (background): generate unseen data, infer, bucket by token length.
+  eval-logs [N]        Follow eval log, or show last N lines.
+  eval-kill            Kill running eval.
+  eval-regen [N]       Regenerate holdout set (N samples, default 500).
   go-infer [N] [stage] [-beam-width K] [-length-penalty A]
                         Go ONNX inference on N samples (default 10, stage 3).
   go-infer-rejects [N]  Go ONNX inference on N rejected haiku samples (default 10).

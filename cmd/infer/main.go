@@ -67,8 +67,14 @@ func main() {
 	flag.IntVar(&maxTgtLen, "max-tgt-len", 2048, "max target generation length")
 	flag.IntVar(&nLayers, "n-layers", 6, "number of decoder layers")
 	flag.IntVar(&dInner, "d-inner", 768, "Mamba d_inner (d_model * expand)")
-	flag.IntVar(&dState, "d-state", 16, "Mamba d_state")
-	flag.IntVar(&dConv, "d-conv", 4, "Mamba d_conv")
+	flag.IntVar(&dState, "d-state", 64, "Mamba d_state")
+	flag.IntVar(&dConv, "d-conv", 4, "Mamba1 d_conv (ignored for Mamba3)")
+	var nHeadsSSM int
+	var headDimSSM int
+	var numRopeAngles int
+	flag.IntVar(&nHeadsSSM, "n-heads-ssm", 12, "Mamba3 nheads (d_inner/headdim)")
+	flag.IntVar(&headDimSSM, "headdim-ssm", 64, "Mamba3 headdim")
+	flag.IntVar(&numRopeAngles, "num-rope-angles", 16, "Mamba3 num_rope_angles")
 	flag.IntVar(&beamWidth, "beam-width", 1, "beam width (1 = greedy)")
 	flag.Float64Var(&lengthPenalty, "length-penalty", 0.6, "length normalization exponent for beam search")
 	flag.IntVar(&debugSteps, "debug-steps", 0, "print per-step token IDs and logit stats for first N steps of sample 1")
@@ -117,23 +123,46 @@ func main() {
 	}
 	defer encSession.Destroy()
 
-	// Create decoder session (single-step with KV cache).
+	// Create decoder session — auto-detect Mamba3 vs Mamba1 from ONNX input names.
+	// Mamba3: 8 inputs (tgt_token, all_k, all_v, all_angle, all_ssm, all_k_state, all_v_state, src_ids)
+	// Mamba1: 6 inputs (tgt_token, all_k, all_v, all_h, all_conv, src_ids)
+	isMamba3 := false
+	decInputs := []string{"tgt_token", "all_k", "all_v", "all_h", "all_conv", "src_ids"}
+	decOutputs := []string{"log_probs", "all_h_out", "all_conv_out"}
+
+	// Try Mamba3 first, fall back to Mamba1.
 	decSession, err := ort.NewDynamicAdvancedSession(
 		decoderPath,
-		[]string{"tgt_token", "all_k", "all_v", "all_h", "all_conv"},
-		[]string{"logits", "all_h_out", "all_conv_out"},
+		[]string{"tgt_token", "all_k", "all_v", "all_angle", "all_ssm", "all_k_state", "all_v_state", "src_ids"},
+		[]string{"log_probs", "all_angle_out", "all_ssm_out", "all_k_state_out", "all_v_state_out"},
 		sessionOpts,
 	)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to create decoder session: %v\n", err)
-		os.Exit(1)
+	if err == nil {
+		isMamba3 = true
+		decInputs = []string{"tgt_token", "all_k", "all_v", "all_angle", "all_ssm", "all_k_state", "all_v_state", "src_ids"}
+		decOutputs = []string{"log_probs", "all_angle_out", "all_ssm_out", "all_k_state_out", "all_v_state_out"}
+	} else {
+		// Fall back to Mamba1.
+		decSession, err = ort.NewDynamicAdvancedSession(
+			decoderPath, decInputs, decOutputs, sessionOpts,
+		)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to create decoder session: %v\n", err)
+			os.Exit(1)
+		}
 	}
 	defer decSession.Destroy()
 
-	fmt.Println("ONNX sessions loaded")
+	if isMamba3 {
+		fmt.Println("ONNX sessions loaded (Mamba3)")
+	} else {
+		fmt.Println("ONNX sessions loaded (Mamba1)")
+	}
 	if beamWidth > 1 {
 		fmt.Printf("Beam search: width=%d, length_penalty=%.2f\n", beamWidth, lengthPenalty)
 	}
+	_ = decInputs
+	_ = decOutputs
 
 	// Read and process samples from stdin.
 	scanner := bufio.NewScanner(os.Stdin)
@@ -144,6 +173,10 @@ func main() {
 	semanticCount := 0
 	xmlOKCount := 0
 	total := 0
+	totalCEREdits := 0
+	totalCERChars := 0
+	totalWEREdits := 0
+	totalWERWords := 0
 
 	for scanner.Scan() {
 		if total >= nSamples {
@@ -186,11 +219,14 @@ func main() {
 		}
 
 		var predIDs []int64
-		if beamWidth > 1 {
-			predIDs, err = beamDecode(decSession, allK, allV, bosID, eosID,
+		if isMamba3 {
+			predIDs, err = greedyDecodeMamba3(decSession, allK, allV, srcIDs, bosID, eosID,
+				maxTgtLen, nLayers, nHeadsSSM, headDimSSM, dState, numRopeAngles, debug)
+		} else if beamWidth > 1 {
+			predIDs, err = beamDecode(decSession, allK, allV, srcIDs, bosID, eosID,
 				maxTgtLen, nLayers, dInner, dState, dConv, beamWidth, lengthPenalty)
 		} else {
-			predIDs, err = greedyDecode(decSession, allK, allV, bosID, eosID,
+			predIDs, err = greedyDecode(decSession, allK, allV, srcIDs, bosID, eosID,
 				maxTgtLen, nLayers, dInner, dState, dConv, debug)
 		}
 		if err != nil {
@@ -227,6 +263,20 @@ func main() {
 			xmlOKCount++
 		}
 
+		// CER on whitespace-normalized text (character-level Levenshtein).
+		// WER: character-weighted word error rate — Levenshtein on words,
+		// but each edit weighted by the character length of the affected word.
+		charEdits := 0
+		werChars := 0
+		if !exact {
+			charEdits = levenshtein(toChars(normPred), toChars(normTgt))
+			werChars = charWeightedWER(strings.Fields(normPred), strings.Fields(normTgt))
+		}
+		totalCEREdits += charEdits
+		totalCERChars += len([]rune(normTgt))
+		totalWEREdits += werChars
+		totalWERWords += len([]rune(normTgt))
+
 		tag := "FAIL"
 		if exact {
 			tag = "EXACT"
@@ -236,7 +286,15 @@ func main() {
 			tag = "XML_OK"
 		}
 
-		fmt.Printf("=== Sample %d [%s] %.2fs, %d tokens ===\n", total, tag, elapsed.Seconds(), len(predIDs))
+		cerDetail := ""
+		if !exact && len(normTgt) > 0 {
+			refChars := float64(len([]rune(normTgt)))
+			sampleCER := float64(charEdits) / refChars * 100
+			sampleWER := float64(werChars) / refChars * 100
+			cerDetail = fmt.Sprintf(" cer=%.1f%% wer=%.1f%%", sampleCER, sampleWER)
+		}
+
+		fmt.Printf("=== Sample %d [%s] %.2fs, %d tokens%s ===\n", total, tag, elapsed.Seconds(), len(predIDs), cerDetail)
 		fmt.Printf("INPUT:\n%s\n\n", rec.Input)
 		if exact || semantic {
 			fmt.Printf("OUTPUT (matches target):\n%s\n\n", strings.TrimSpace(pred))
@@ -250,8 +308,17 @@ func main() {
 		allV.Destroy()
 	}
 
-	fmt.Printf("===== %d samples: exact=%d semantic=%d xml_ok=%d fail=%d =====\n",
-		total, exactCount, semanticCount, xmlOKCount-exactCount-semanticCount, total-xmlOKCount)
+	overallCER := float64(0)
+	if totalCERChars > 0 {
+		overallCER = float64(totalCEREdits) / float64(totalCERChars) * 100
+	}
+	overallWER := float64(0)
+	if totalWERWords > 0 {
+		// WER denominator is total ref chars (same as CER) since edits are char-weighted.
+		overallWER = float64(totalWEREdits) / float64(totalWERWords) * 100
+	}
+	fmt.Printf("===== %d samples: exact=%d semantic=%d xml_ok=%d fail=%d CER=%.2f%% WER=%.2f%% =====\n",
+		total, exactCount, semanticCount, xmlOKCount-exactCount-semanticCount, total-xmlOKCount, overallCER, overallWER)
 }
 
 // runEncoder runs the encoder ONNX model and returns cached K/V tensors.
@@ -284,6 +351,7 @@ func runEncoder(session *ort.DynamicAdvancedSession, srcIDs []int64) (*ort.Tenso
 func greedyDecode(
 	session *ort.DynamicAdvancedSession,
 	allK, allV *ort.Tensor[float32],
+	srcIDs []int64,
 	bosID, eosID int64,
 	maxLen, nLayers, dInner, dState, dConv int,
 	debugSteps int,
@@ -321,14 +389,21 @@ func greedyDecode(
 	}
 	defer convTensor.Destroy()
 
+	// Source IDs tensor for copy mechanism (constant per sample).
+	srcIDsTensor, err := ort.NewTensor(ort.NewShape(1, int64(len(srcIDs))), srcIDs)
+	if err != nil {
+		return nil, fmt.Errorf("create src_ids tensor: %w", err)
+	}
+	defer srcIDsTensor.Destroy()
+
 	for range maxLen {
 		// Update token in-place.
 		tokenTensor.GetData()[0] = currentToken
 
-		// Run decoder step. K/V are read-only from encoder.
+		// Run decoder step. K/V and src_ids are read-only from encoder.
 		outputs := []ort.Value{nil, nil, nil}
 		err = session.Run(
-			[]ort.Value{tokenTensor, allK, allV, hTensor, convTensor},
+			[]ort.Value{tokenTensor, allK, allV, hTensor, convTensor, srcIDsTensor},
 			outputs,
 		)
 		if err != nil {
@@ -406,6 +481,127 @@ func greedyDecode(
 	return tgtIDs, nil
 }
 
+func greedyDecodeMamba3(
+	session *ort.DynamicAdvancedSession,
+	allK, allV *ort.Tensor[float32],
+	srcIDs []int64,
+	bosID, eosID int64,
+	maxLen, nLayers, nHeads, headDim, dState, numRopeAngles int,
+	debugSteps int,
+) ([]int64, error) {
+	// Initialize Mamba3 state: 4 tensors, all zeros.
+	angleData := make([]float32, nLayers*nHeads*numRopeAngles)
+	ssmData := make([]float32, nLayers*nHeads*headDim*dState)
+	ksData := make([]float32, nLayers*nHeads*dState)
+	vsData := make([]float32, nLayers*nHeads*headDim)
+
+	tgtIDs := []int64{}
+	currentToken := bosID
+
+	tokenData := []int64{bosID}
+	tokenTensor, err := ort.NewTensor(ort.NewShape(1, 1), tokenData)
+	if err != nil {
+		return nil, fmt.Errorf("create token tensor: %w", err)
+	}
+	defer tokenTensor.Destroy()
+
+	angleTensor, err := ort.NewTensor(
+		ort.NewShape(int64(nLayers), int64(nHeads), int64(numRopeAngles)), angleData)
+	if err != nil {
+		return nil, fmt.Errorf("create angle tensor: %w", err)
+	}
+	defer angleTensor.Destroy()
+
+	ssmTensor, err := ort.NewTensor(
+		ort.NewShape(int64(nLayers), int64(nHeads), int64(headDim), int64(dState)), ssmData)
+	if err != nil {
+		return nil, fmt.Errorf("create ssm tensor: %w", err)
+	}
+	defer ssmTensor.Destroy()
+
+	ksTensor, err := ort.NewTensor(
+		ort.NewShape(int64(nLayers), int64(nHeads), int64(dState)), ksData)
+	if err != nil {
+		return nil, fmt.Errorf("create k_state tensor: %w", err)
+	}
+	defer ksTensor.Destroy()
+
+	vsTensor, err := ort.NewTensor(
+		ort.NewShape(int64(nLayers), int64(nHeads), int64(headDim)), vsData)
+	if err != nil {
+		return nil, fmt.Errorf("create v_state tensor: %w", err)
+	}
+	defer vsTensor.Destroy()
+
+	srcIDsTensor, err := ort.NewTensor(ort.NewShape(1, int64(len(srcIDs))), srcIDs)
+	if err != nil {
+		return nil, fmt.Errorf("create src_ids tensor: %w", err)
+	}
+	defer srcIDsTensor.Destroy()
+
+	for range maxLen {
+		tokenTensor.GetData()[0] = currentToken
+
+		outputs := []ort.Value{nil, nil, nil, nil, nil}
+		err = session.Run(
+			[]ort.Value{tokenTensor, allK, allV, angleTensor, ssmTensor, ksTensor, vsTensor, srcIDsTensor},
+			outputs,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("decoder run: %w", err)
+		}
+
+		logitsTensor, ok := outputs[0].(*ort.Tensor[float32])
+		if !ok {
+			return nil, fmt.Errorf("unexpected logits type")
+		}
+		logitsData := logitsTensor.GetData()
+		nextID := argmax(logitsData)
+		logitsTensor.Destroy()
+
+		// Copy updated states back into reusable tensors.
+		angleOut, ok := outputs[1].(*ort.Tensor[float32])
+		if !ok {
+			return nil, fmt.Errorf("unexpected angle_out type")
+		}
+		copy(angleTensor.GetData(), angleOut.GetData())
+		angleOut.Destroy()
+
+		ssmOut, ok := outputs[2].(*ort.Tensor[float32])
+		if !ok {
+			return nil, fmt.Errorf("unexpected ssm_out type")
+		}
+		copy(ssmTensor.GetData(), ssmOut.GetData())
+		ssmOut.Destroy()
+
+		ksOut, ok := outputs[3].(*ort.Tensor[float32])
+		if !ok {
+			return nil, fmt.Errorf("unexpected k_state_out type")
+		}
+		copy(ksTensor.GetData(), ksOut.GetData())
+		ksOut.Destroy()
+
+		vsOut, ok := outputs[4].(*ort.Tensor[float32])
+		if !ok {
+			return nil, fmt.Errorf("unexpected v_state_out type")
+		}
+		copy(vsTensor.GetData(), vsOut.GetData())
+		vsOut.Destroy()
+
+		if debugSteps > 0 && len(tgtIDs) < debugSteps {
+			fmt.Fprintf(os.Stderr, "  GO step %3d: id=%5d\n", len(tgtIDs), nextID)
+		}
+
+		if int64(nextID) == eosID {
+			break
+		}
+		tgtIDs = append(tgtIDs, int64(nextID))
+		currentToken = int64(nextID)
+	}
+
+	return tgtIDs, nil
+}
+
 func argmax(data []float32) int {
 	maxIdx := 0
 	maxVal := float32(math.Inf(-1))
@@ -418,25 +614,6 @@ func argmax(data []float32) int {
 	return maxIdx
 }
 
-func logSoftmax(logits []float32) []float64 {
-	max := float64(logits[0])
-	for _, v := range logits[1:] {
-		if float64(v) > max {
-			max = float64(v)
-		}
-	}
-	var sumExp float64
-	for _, v := range logits {
-		sumExp += math.Exp(float64(v) - max)
-	}
-	logSumExp := max + math.Log(sumExp)
-
-	out := make([]float64, len(logits))
-	for i, v := range logits {
-		out[i] = float64(v) - logSumExp
-	}
-	return out
-}
 
 // topKIndices returns the indices of the k largest values in data.
 func topKIndices(data []float64, k int) []int {
@@ -471,6 +648,7 @@ type beamState struct {
 func beamDecode(
 	session *ort.DynamicAdvancedSession,
 	allK, allV *ort.Tensor[float32],
+	srcIDs []int64,
 	bosID, eosID int64,
 	maxLen, nLayers, dInner, dState, dConv, beamWidth int,
 	lengthPenalty float64,
@@ -501,6 +679,12 @@ func beamDecode(
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create conv tensor: %w", err)
+	}
+	defer convTensor.Destroy()
+
+	srcIDsTensor, err := ort.NewTensor(ort.NewShape(1, int64(len(srcIDs))), srcIDs)
+	if err != nil {
+		return nil, fmt.Errorf("create src_ids tensor: %w", err)
 	}
 	defer convTensor.Destroy()
 
@@ -537,19 +721,23 @@ func beamDecode(
 			// Run one decoder step.
 			outputs := []ort.Value{nil, nil, nil}
 			if err := session.Run(
-				[]ort.Value{tokenTensor, allK, allV, hTensor, convTensor},
+				[]ort.Value{tokenTensor, allK, allV, hTensor, convTensor, srcIDsTensor},
 				outputs,
 			); err != nil {
 				return nil, fmt.Errorf("decoder run (beam %d, step %d): %w", bi, step, err)
 			}
 
-			// Extract logits and compute log-softmax.
-			logitsTensor, ok := outputs[0].(*ort.Tensor[float32])
+			// Extract log-probs (already log-softmax from copy mechanism).
+			logProbsTensor, ok := outputs[0].(*ort.Tensor[float32])
 			if !ok {
-				return nil, fmt.Errorf("unexpected logits type")
+				return nil, fmt.Errorf("unexpected log_probs type")
 			}
-			logProbs := logSoftmax(logitsTensor.GetData())
-			logitsTensor.Destroy()
+			logProbsRaw := logProbsTensor.GetData()
+			logProbs := make([]float64, len(logProbsRaw))
+			for lpi, lpv := range logProbsRaw {
+				logProbs[lpi] = float64(lpv)
+			}
+			logProbsTensor.Destroy()
 
 			// Save updated state back to beam.
 			hOut, ok := outputs[1].(*ort.Tensor[float32])
@@ -645,6 +833,90 @@ func beamDecode(
 		}
 	}
 	return completed[bestIdx].ids, nil
+}
+
+// levenshtein computes the edit distance between two string slices.
+// Used for WER when called with words, CER when called with single-char strings.
+func levenshtein(a, b []string) int {
+	if len(a) < len(b) {
+		return levenshtein(b, a)
+	}
+	if len(b) == 0 {
+		return len(a)
+	}
+	prev := make([]int, len(b)+1)
+	for i := range prev {
+		prev[i] = i
+	}
+	for i, ca := range a {
+		curr := make([]int, len(b)+1)
+		curr[0] = i + 1
+		for j, cb := range b {
+			del := prev[j+1] + 1
+			ins := curr[j] + 1
+			sub := prev[j]
+			if ca != cb {
+				sub++
+			}
+			curr[j+1] = min(del, min(ins, sub))
+		}
+		prev = curr
+	}
+	return prev[len(b)]
+}
+
+// toChars splits a string into individual character strings for CER computation.
+func toChars(s string) []string {
+	runes := []rune(s)
+	out := make([]string, len(runes))
+	for i, r := range runes {
+		out[i] = string(r)
+	}
+	return out
+}
+
+// charWeightedWER computes word-level edit distance but returns the total
+// character count of the affected words rather than the word count.
+// This prevents a single large block deletion from counting as "1 word edit."
+func charWeightedWER(pred, ref []string) int {
+	if len(ref) < len(pred) {
+		// Ensure ref is the longer side for consistent weighting.
+		pred, ref = ref, pred
+	}
+	if len(ref) == 0 {
+		total := 0
+		for _, w := range pred {
+			total += len([]rune(w))
+		}
+		return total
+	}
+
+	// Standard Levenshtein DP, but track which words are edited.
+	n, m := len(ref), len(pred)
+	// cost[j] = character-weighted edit cost to transform pred[:j] into ref[:i]
+	prev := make([]int, m+1)
+	for j := 1; j <= m; j++ {
+		prev[j] = prev[j-1] + len([]rune(pred[j-1]))
+	}
+	for i := 1; i <= n; i++ {
+		curr := make([]int, m+1)
+		curr[0] = prev[0] + len([]rune(ref[i-1]))
+		for j := 1; j <= m; j++ {
+			if ref[i-1] == pred[j-1] {
+				curr[j] = prev[j-1] // no edit
+			} else {
+				// Cost of substitution: chars in both words
+				subCost := prev[j-1] + max(len([]rune(ref[i-1])), len([]rune(pred[j-1])))
+				// Cost of deletion (skip ref word): chars in ref word
+				delCost := prev[j] + len([]rune(ref[i-1]))
+				// Cost of insertion (skip pred word): chars in pred word
+				insCost := curr[j-1] + len([]rune(pred[j-1]))
+				curr[j] = min(subCost, min(delCost, insCost))
+			}
+		}
+		prev = curr
+	}
+	return prev[m]
 }
 
 func isValidXML(s string) bool {

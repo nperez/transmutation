@@ -267,6 +267,111 @@ Epochs 41-42 introduced truncation augmentation and higher drop-memory rate, whi
 
 The copy mechanism and shuffle-only augmentation were transformative for content fidelity. However, the model hits a ceiling on long inputs where the Mamba 1 real-valued SSM states cannot maintain field-level state tracking. The dominant remaining failures are structural (field skipping, CDATA decisions) rather than content-level — exactly the class of problems that Mamba 3's complex-valued states are designed to address.
 
+## Run 5 Results
+
+Run 5 switched from Mamba 1 to Mamba 3 (complex-valued SSM with RoPE), removed the copy mechanism entirely, and introduced length-stratified token binning with balanced distribution. Same hardware (RTX 2060 6GB). Best model: epoch 69.
+
+### Architecture Changes
+
+- **Mamba 3 encoder-decoder** — complex-valued SSM states with rotary position embeddings, replacing Mamba 1's real-valued states. d_model=384, 6+6 layers, 12 heads, 64 headdim, 64 d_state, ~25M params
+- **Copy mechanism removed** — Mamba 3's RoPE provides positional alignment natively. The copy gate in run 4 caused generation head collapse (p_copy→1.0, structural tokens ignored). Removing it freed ~3GB VRAM
+- **NormedInProj** — RMSNorm on Mamba 3 in_proj outputs (x and z) required for fp16 stability. Without it, SSM scan overflows at epoch 6
+- **QKNormCrossAttention** — RMSNorm on Q and K in cross-attention required for fp16 stability. Without it, attention scores overflow at epoch 4
+- **8000 BPE vocab** — IDs 0-15 reserved for structural tokens (pad/BOS/EOS/UNK + XML tags)
+
+### Training Budget
+
+| Metric | Run 4 | Run 5 |
+|--------|-------|-------|
+| Epochs | 43 | 75 |
+| Best val exact | 80.2% | 92.2% |
+| Best AR exact | 47/50 | 162/250 (64.8%) |
+| Holdout exact | untested | 76/239 (31.8%) |
+| Holdout exact+semantic | untested | 109/239 (45.6%) |
+
+### Key Metrics
+
+| Epoch | Stage | Train Loss | Val Exact | AR Exact | AR XML OK | CER | WER | LR |
+|-------|-------|-----------|-----------|----------|-----------|-----|-----|----|
+| 5     | 1→2   | 0.138     | 25.3%     | —        | —         | —   | —   | 2e-4 |
+| 20    | 2     | 0.004     | 85.7%     | —        | —         | —   | —   | 2.5e-5 |
+| 29    | 2     | 0.002     | 88.2%     | —        | —         | 0.06% | 0.18% | 2.5e-5 |
+| 40    | 6     | —         | 88.9%     | 50/50    | 50/50     | —   | —   | — |
+| 53    | 4     | 0.055     | 90.4%     | 251/500  | 278/500   | 1.01% | 1.26% | 2.5e-5 |
+| **67**| **4** | **0.056** | **92.2%** | 132/250  | 146/250   | 0.87% | 1.00% | 6.25e-6 |
+| **69**| **4** | **0.059** | 92.0%     | **162/250** | **172/250** | **0.88%** | **1.10%** | 2.5e-5 |
+| 74    | 4     | 0.054     | 91.7%     | 120/250  | 134/250   | 1.03% | 1.12% | 2.5e-5 |
+
+### Curriculum
+
+| Stage | Description | Gate |
+|-------|-------------|------|
+| 1 | complexity<=5, fp16 warmup | val_loss < 2.0 |
+| 2 | full complexity, clean, CDATA (special_prob=0.10) | val_exact >= 90% |
+| 3 | light augmentation (aug=1, corrupt=2%) | val_exact >= 90% |
+| 4 | heavy augmentation (aug=2, corrupt=5%, compact=50%) | AR exact >= 90% |
+| 5 | heavier (aug=3, corrupt=10%) | AR exact >= 90% |
+| 6 | maximum (aug=3, corrupt=15%) | AR exact >= 90% |
+
+Phase transition 3x faster than previous runs due to balanced length distribution exercising the full RoPE position spectrum from epoch 1.
+
+### What Worked
+
+- **Copy mechanism removal** — eliminated generation head collapse. The model learned to generate both structural and content tokens through cross-attention alone.
+- **Token-length binning** — replaced char-based length bins with actual BPE token bins in the augment pipeline. Required rewriting Go sentencepiece Encode() from O(n^2) to O(n log n) with doubly-linked list + heap priority queue (37x faster). Unlocked 5+pp val_exact improvement.
+- **Balanced distribution** — shorten-pct=30 + compact-pct=50 flattened training length distribution across all token buckets. Previous runs had 74% long samples, 0% short.
+- **Online MRT** — 10x loss weighting on full samples with 90-99% token accuracy. Per-token focal loss was too dilute (0.2% of loss). Full-sample weighting worked.
+- **Fixed val seed** — VAL_SEED=7777777 eliminated 3-4pp epoch-to-epoch oscillation from random val sampling.
+- **Professor forcing schedule** — PF noise ramped from 0.05 (stage 1) to 1.00 (stage 4+). At PF 1.0 all content tokens replaced with model predictions, structural tokens (IDs 0-15) remain ground truth. AR exact improved from 46% to 65%.
+- **Triton validation kernel** — single kernel for exact match + ref_len + non-exact buffer across 135K val samples. ~50ms vs minutes of Python.
+- **Fanned-out parallel AR decode** — per-operation Triton kernels with grid=(batch, n_tiles) for full 30-SM utilization. 6x faster than the persistent single-SM-per-sample kernel. Fused norm+VMM, VMM+residual, quad-RMSNorm kernels.
+
+### What Didn't Work
+
+- **100% AR training at epoch 74** — positive feedback loop: bad AR decode → large gradients → worse model → worse AR decode. Destabilized within ~4000 batches. Loss spike frequency went 25% → 45% → 75%, with individual batch losses hitting 6.0+. Holdout eval on the interrupt checkpoint: 3.3% exact (destroyed). AR training cannot be bolted on to a model with 74 epochs of teacher-forced weight patterns.
+- **Zero-copy weight blob** — replacing param.data with fp16 views into a flat buffer breaks GradScaler (fp16 gradients). Training uses fp32 params with autocast for fp16 forward. The fp32→fp16 copy for the decode kernel is inherent to this split.
+
+### Holdout Eval (epoch 74, 239 unseen samples)
+
+| Bucket | Total | Exact | Sem | XmlOk | Fail | Exact% |
+|--------|-------|-------|-----|-------|------|--------|
+| 0-250 | 23 | 12 | 0 | 0 | 11 | 52.2% |
+| 251-500 | 109 | 20 | 24 | 6 | 59 | 18.3% |
+| 501-750 | 60 | 26 | 1 | 7 | 26 | 43.3% |
+| 751-1000 | 35 | 15 | 6 | 5 | 9 | 42.9% |
+| 1001+ | 12 | 3 | 2 | 4 | 3 | 25.0% |
+
+### Token Accuracy by Position (epoch 75 val)
+
+```
+0-99:    99.8%
+100-299: 99.4%
+300-499: 99.1%
+500-799: 98.5%
+800-1199: 96.3%
+1200+:   28.3%
+```
+
+### Infrastructure Built
+
+- Fanned-out parallel Triton decoder (ar_parallel.py) with per-operation kernel launches
+- Fused kernels: norm+VMM, VMM+residual, quad-RMSNorm
+- Persistent single-SM kernel (ar_kernel.py) for comparison/inference
+- Idempotent data generation with marker files and resume support
+- Token cache with padded 2D tensor format for fast loading
+- Val dataset caching across epochs
+- Signal propagation to child subprocesses
+- `--force-resume` for checkpoint rollback, `--ckpt` for eval checkpoint override
+
+### Lessons Learned (new in run 5)
+
+- **Binning is data engineering** — changing 5 numbers in a Go slice (length bins) unlocked 5+pp val_exact improvement
+- **Val seed matters** — random val sampling created 3-4pp oscillation that masked real improvement
+- **Focal-loss MRT too dilute** — 2x on ~5 wrong tokens out of 4500 is unmeasurable. Full-sample 10x weighting needed
+- **AR training must be integrated from the start** — the exposure bias gap (92% TF vs 65% AR) cannot be closed by bolting AR training onto a converged TF model. The weight manifold becomes too specialized for always-correct decoder input
+- **fp16 stability requires NormedInProj + QKNormCrossAttention** — non-negotiable for Mamba 3. Without both, NaN within 6 epochs
+- **Copy mechanism is harmful with RoPE** — Mamba 3 doesn't need it and the copy gate collapses training dynamics
+
 ## Data Pipelines
 
 ### Haiku-First Pipeline (Run 2, current)
@@ -417,7 +522,8 @@ transmutation/
 │   ├── run1/          # Archived run 1 (synthetic data, 53 epochs)
 │   ├── run2/          # Archived run 2 (haiku data, 8-stage, 39 epochs)
 │   ├── run3/          # Archived run 3 (haiku data, 5-stage, 40 epochs)
-│   └── run4/          # Current run
+│   ├── run4/          # Archived run 4 (copy mechanism, 43 epochs)
+│   └── run5/          # Current run (Mamba 3, no copy, 75 epochs)
 ├── data/
 │   └── haiku/         # ~140k real LLM haiku outputs (corpus.jsonl)
 ├── scripts/

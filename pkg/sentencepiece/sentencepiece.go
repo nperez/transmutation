@@ -21,6 +21,7 @@
 package sentencepiece
 
 import (
+	"container/heap"
 	"fmt"
 	"io"
 	"os"
@@ -32,6 +33,30 @@ import (
 
 	"google.golang.org/protobuf/proto"
 )
+
+// bpeNode is a doubly-linked list node for O(n log n) BPE merge.
+type bpeNode struct {
+	text    string
+	noMerge bool
+	prev    int // -1 = head
+	next    int // -1 = tail
+	dead    bool
+}
+
+// bpePair is a candidate merge in the priority queue.
+type bpePair struct {
+	left  int     // index of left node
+	score float32 // merge score (higher = merge first)
+	gen   int     // generation counter to detect stale entries
+}
+
+type bpeHeap []bpePair
+
+func (h bpeHeap) Len() int            { return len(h) }
+func (h bpeHeap) Less(i, j int) bool  { return h[i].score > h[j].score } // max-heap
+func (h bpeHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
+func (h *bpeHeap) Push(x any)         { *h = append(*h, x.(bpePair)) }
+func (h *bpeHeap) Pop() any           { old := *h; n := len(old); x := old[n-1]; *h = old[:n-1]; return x }
 
 var wsRun = regexp.MustCompile(`\s+`)
 
@@ -212,47 +237,74 @@ func (p *Processor) Encode(text string, addBOS, addEOS bool) []int {
 		return nil
 	}
 
-	// BPE merge loop: repeatedly find the highest-scoring adjacent pair and merge.
-	for {
-		bestScore := float32(-1e18)
-		bestIdx := -1
+	// BPE merge loop using doubly-linked list + priority queue: O(n log n).
+	nodes := make([]bpeNode, len(symbols))
+	gens := make([]int, len(symbols)) // generation counter per node
+	for i, s := range symbols {
+		nodes[i] = bpeNode{text: s.text, noMerge: s.noMerge, prev: i - 1, next: i + 1}
+	}
+	nodes[len(nodes)-1].next = -1
 
-		for i := 0; i < len(symbols)-1; i++ {
-			if symbols[i].noMerge || symbols[i+1].noMerge {
-				continue
-			}
-			merged := symbols[i].text + symbols[i+1].text
-			if id, ok := p.pieceToID[merged]; ok {
-				score := p.pieces[id].GetScore()
-				if score > bestScore {
-					bestScore = score
-					bestIdx = i
-				}
-			}
+	// Helper to try adding a merge candidate for (left, left.next).
+	var h bpeHeap
+	tryAdd := func(left int) {
+		if left < 0 || nodes[left].dead || nodes[left].noMerge {
+			return
 		}
-
-		if bestIdx < 0 {
-			break
+		right := nodes[left].next
+		if right < 0 || nodes[right].dead || nodes[right].noMerge {
+			return
 		}
-
-		// Merge symbols[bestIdx] and symbols[bestIdx+1].
-		symbols[bestIdx].text = symbols[bestIdx].text + symbols[bestIdx+1].text
-		symbols = append(symbols[:bestIdx+1], symbols[bestIdx+2:]...)
+		merged := nodes[left].text + nodes[right].text
+		if id, ok := p.pieceToID[merged]; ok {
+			heap.Push(&h, bpePair{left: left, score: p.pieces[id].GetScore(), gen: gens[left]})
+		}
 	}
 
-	// Convert symbols to IDs.
+	// Seed the heap with all initial adjacent pairs.
+	for i := 0; i < len(nodes)-1; i++ {
+		tryAdd(i)
+	}
+
+	for h.Len() > 0 {
+		best := heap.Pop(&h).(bpePair)
+		left := best.left
+		if nodes[left].dead || best.gen != gens[left] {
+			continue // stale entry
+		}
+		right := nodes[left].next
+		if right < 0 || nodes[right].dead {
+			continue
+		}
+		// Merge: left absorbs right.
+		nodes[left].text += nodes[right].text
+		nodes[right].dead = true
+		nodes[left].next = nodes[right].next
+		if nodes[right].next >= 0 {
+			nodes[nodes[right].next].prev = left
+		}
+		gens[left]++ // invalidate stale heap entries for this node
+		// Re-check new adjacent pairs.
+		tryAdd(nodes[left].prev)
+		tryAdd(left)
+	}
+
+	// Convert live nodes to IDs.
 	var ids []int
 	if addBOS && p.bosID >= 0 {
 		ids = append(ids, p.bosID)
 	}
 
-	for _, sym := range symbols {
-		if id, ok := p.pieceToID[sym.text]; ok {
+	for i := 0; i >= 0; i = nodes[i].next {
+		if nodes[i].dead {
+			continue
+		}
+		sym := nodes[i].text
+		if id, ok := p.pieceToID[sym]; ok {
 			ids = append(ids, id)
 		} else if p.byteFallback {
-			// Decompose unknown symbol into byte pieces.
-			for i := 0; i < len(sym.text); i++ {
-				ids = append(ids, p.bytePiece[sym.text[i]])
+			for j := 0; j < len(sym); j++ {
+				ids = append(ids, p.bytePiece[sym[j]])
 			}
 		} else {
 			ids = append(ids, p.unkID)

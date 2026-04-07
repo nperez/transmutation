@@ -109,8 +109,11 @@ Each line must be valid JSON. Output ONLY JSON lines, nothing else.
 Follow the field instructions EXACTLY — use the precise nesting shown.'
 
 THOUGHT_INSTRUCTION='- "thought": 3-12 sentences of detailed reasoning. Use varied vocabulary and sentence structures. Mix short punchy sentences with longer analytical ones. Include comparisons with < > symbols, threshold references, and technical detail.'
+THOUGHT_BRIEF_INSTRUCTION='- "thought": 1-2 sentences only. Brief, direct reasoning. Still use technical vocabulary and special characters like < > & naturally.'
+THOUGHT_MINIMAL_INSTRUCTION='- "thought": ONE sentence, under 40 words. Technical but terse. Example length: "The query targets records where latency > 500ms & error_rate < 0.1%% across the production cluster."'
 
 ANSWER_INSTRUCTION='- "answer": substantial response text, 5-20 sentences. MUST include a mix of: markdown headers, code blocks, bullet lists, tables, inline code, comparisons using < > operators, HTML/XML tag references, URLs with & parameters, and mathematical expressions. Use apostrophes, quotes, and special characters naturally.'
+ANSWER_BRIEF_INSTRUCTION='- "answer": 1-4 sentences. Short, direct answer. Still include at least one of: inline code, a comparison with < >, or a URL with & parameters.'
 ANSWER_NULL_INSTRUCTION='- "answer": MUST be null.'
 
 TOOL_INSTRUCTION='- "tool": MUST be a nested object: {"tool_name": "<name>", "arguments": {<args>}}. Pick a DIFFERENT tool_name for each sample from: %s. Vary the arguments structurally:
@@ -119,9 +122,12 @@ TOOL_INSTRUCTION='- "tool": MUST be a nested object: {"tool_name": "<name>", "ar
   * Some: nested objects (e.g. {"tool_name": "execute_python", "arguments": {"code": "...", "env": {"PATH": "/usr/bin"}}})
   * Some: arrays (e.g. {"tool_name": "search", "arguments": {"query": "...", "sources": ["web", "docs"]}})
   * Code args: include comments, string literals with special chars, varied complexity.'
+TOOL_BRIEF_INSTRUCTION='- "tool": MUST be a nested object: {"tool_name": "<name>", "arguments": {<args>}}. Pick from: %s. Keep arguments minimal — 1-2 args, short values. No long code blocks.'
+TOOL_MINIMAL_INSTRUCTION='- "tool": {"tool_name": "<name>", "arguments": {<1-2 short args>}}. Pick from: %s. Example: {"tool_name": "search", "arguments": {"query": "climate data"}}. Keep it this short.'
 TOOL_NULL_INSTRUCTION='- "tool": MUST be null.'
 
 MEMORY_INSTRUCTION='- "memory": 4-10 short context strings. Include threshold rules (e.g. "Alert if latency > 500ms && error_rate < 0.1%%"), tag references (e.g. "Uses <config> & <auth> modules"), user preferences with apostrophes, and version/path strings.'
+MEMORY_BRIEF_INSTRUCTION='- "memory": 1-3 very short context strings. One-liners only.'
 MEMORY_NULL_INSTRUCTION='- "memory": MUST be null.'
 MEMORY_OMIT_INSTRUCTION='- Do NOT include a "memory" field at all.'
 
@@ -132,26 +138,49 @@ SEED WORDS: %s
 
 DOMAIN WORDS: %s'
 
-# build_prompt count answer_mode tool_mode memory_mode seed_words domain_words
+# build_prompt count answer_mode tool_mode memory_mode seed_words domain_words [brief]
 #   answer_mode: "include" | "null"
 #   tool_mode:   "include" | "null"
 #   memory_mode: "include" | "null" | "omit"
+#   brief:       "brief" for short outputs, "" for normal
 build_prompt() {
     local count="$1" answer_mode="$2" tool_mode="$3" memory_mode="$4"
-    local seed_words="$5" domain_words="$6"
+    local seed_words="$5" domain_words="$6" brief="${7:-}"
 
     # Header
     local prompt
     prompt="${PROMPT_HEADER/\%d/$count}"
-    prompt="$prompt
+
+    # Thought
+    if [ "$brief" = "minimal" ]; then
+        prompt="$prompt
+
+Field instructions:
+$THOUGHT_MINIMAL_INSTRUCTION"
+    elif [ "$brief" = "brief" ]; then
+        prompt="$prompt
+
+Field instructions:
+$THOUGHT_BRIEF_INSTRUCTION"
+    else
+        prompt="$prompt
 
 Field instructions:
 $THOUGHT_INSTRUCTION"
+    fi
 
     # Answer
     if [ "$answer_mode" = "include" ]; then
-        prompt="$prompt
+        if [ "$brief" = "minimal" ]; then
+            prompt="$prompt
+$ANSWER_BRIEF_INSTRUCTION"
+        elif [ "$brief" = "brief" ]; then
+            prompt="$prompt
+$ANSWER_BRIEF_INSTRUCTION"
+        else
+            prompt="$prompt
 $ANSWER_INSTRUCTION"
+        fi
     else
         prompt="$prompt
 $ANSWER_NULL_INSTRUCTION"
@@ -161,8 +190,16 @@ $ANSWER_NULL_INSTRUCTION"
     if [ "$tool_mode" = "include" ]; then
         local tool_list
         tool_list=$(printf '%s\n' "${TOOL_NAMES[@]}" | shuf -n 5 | tr '\n' ', ' | sed 's/,$//')
-        prompt="$prompt
+        if [ "$brief" = "minimal" ]; then
+            prompt="$prompt
+${TOOL_MINIMAL_INSTRUCTION/\%s/$tool_list}"
+        elif [ "$brief" = "brief" ]; then
+            prompt="$prompt
+${TOOL_BRIEF_INSTRUCTION/\%s/$tool_list}"
+        else
+            prompt="$prompt
 ${TOOL_INSTRUCTION/\%s/$tool_list}"
+        fi
     else
         prompt="$prompt
 $TOOL_NULL_INSTRUCTION"
@@ -170,8 +207,13 @@ $TOOL_NULL_INSTRUCTION"
 
     # Memory
     if [ "$memory_mode" = "include" ]; then
-        prompt="$prompt
+        if [ "$brief" = "brief" ] || [ "$brief" = "minimal" ]; then
+            prompt="$prompt
+$MEMORY_BRIEF_INSTRUCTION"
+        else
+            prompt="$prompt
 $MEMORY_INSTRUCTION"
+        fi
     elif [ "$memory_mode" = "null" ]; then
         prompt="$prompt
 $MEMORY_NULL_INSTRUCTION"
@@ -203,9 +245,17 @@ generate_shard() {
     pool2="${DOMAIN_POOLS[$((RANDOM % ${#DOMAIN_POOLS[@]}))]}"
     domain_words=$(echo "$pool1 $pool2" | tr ' ' '\n' | shuf -n 20 | tr '\n' ' ')
 
-    # Parse mode: "answer", "tool", "answer_nomem", "tool_nomem"
-    local answer_mode="null" tool_mode="null" memory_mode="include"
-    case "$mode" in
+    # Parse mode: "answer", "tool", "answer_nomem", etc. Prefix "brief_" for short outputs.
+    local answer_mode="null" tool_mode="null" memory_mode="include" brief=""
+    local base_mode="$mode"
+    if [[ "$mode" == minimal_* ]]; then
+        brief="minimal"
+        base_mode="${mode#minimal_}"
+    elif [[ "$mode" == brief_* ]]; then
+        brief="brief"
+        base_mode="${mode#brief_}"
+    fi
+    case "$base_mode" in
         answer)         answer_mode="include"; tool_mode="null";    memory_mode="include" ;;
         tool)           answer_mode="null";    tool_mode="include"; memory_mode="include" ;;
         answer_nomem)   answer_mode="include"; tool_mode="null";    memory_mode="omit" ;;
@@ -215,7 +265,7 @@ generate_shard() {
     esac
 
     local filled_prompt
-    filled_prompt=$(build_prompt "$batch" "$answer_mode" "$tool_mode" "$memory_mode" "$seed_words" "$domain_words")
+    filled_prompt=$(build_prompt "$batch" "$answer_mode" "$tool_mode" "$memory_mode" "$seed_words" "$domain_words" "$brief")
 
     RAW=$(claude_cmd "$filled_prompt" 2>/dev/null || true)
 
@@ -281,7 +331,8 @@ while [ "$TOTAL_REQUESTED" -lt "$COUNT" ]; do
         fi
 
         # Cycle through mode variants for diversity.
-        MODES=(answer tool answer_nomem tool_nomem answer_nullmem tool_nullmem answer tool tool)
+        # brief_ = short outputs, minimal_ = very short (fills 0-500 token bucket).
+        MODES=(answer tool answer_nomem tool_nomem answer_nullmem tool_nullmem brief_answer brief_tool minimal_tool_nomem minimal_answer_nomem minimal_tool_nullmem minimal_answer_nullmem)
         MODE="${MODES[$((J % ${#MODES[@]}))]}"
 
         generate_shard "$SHARD" "$MODE" "$THIS_BATCH" &
