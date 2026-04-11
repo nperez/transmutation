@@ -27,6 +27,9 @@ var mdLangTags = []string{"python", "javascript", "sql", "go", "bash", "json", "
 
 func (g *Generator) simpleAnswer() string {
 	n := 10 + g.rng.IntN(16) // 10-25 sentences
+	if g.Short {
+		n = 1 + g.rng.IntN(3) // 1-3 sentences
+	}
 	parts := make([]string, n)
 	for i := range parts {
 		if g.augment {

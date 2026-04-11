@@ -420,17 +420,27 @@ def _layer_offsets(ot_cpu, li):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def ar_decode_parallel(model, src_ids, sp, max_len=1536, src_key_padding_mask=None):
-    """AR decode with fanned-out per-operation kernels."""
+def ar_decode_parallel(model, src_ids, sp, max_len=1536, src_key_padding_mask=None,
+                       initial_ar_state=None, memory=None, K_all=None, V_all=None):
+    """AR decode with fanned-out per-operation kernels.
+
+    For chunked training, pass initial_ar_state (from previous chunk's return),
+    and pre-computed memory/K_all/V_all (encoder output computed once).
+    Returns (result_ids, final_ar_state) when initial_ar_state is provided,
+    otherwise returns result_ids only (backward compat).
+    """
     device = src_ids.device
     batch = src_ids.shape[0]
     bos_id, eos_id, pad_id = sp.bos_id(), sp.eos_id(), sp.pad_id()
     n_layers = len(model.decoder_layers)
+    return_state = initial_ar_state is not None
 
-    # Encode + KV cache
-    with torch.amp.autocast('cuda', dtype=torch.float16):
-        memory = model.encode(src_ids)
-    K_all, V_all = precompute_kv_cache(model, memory, src_key_padding_mask)
+    # Encode + KV cache (skip if pre-computed)
+    if memory is None:
+        with torch.amp.autocast('cuda', dtype=torch.float16):
+            memory = model.encode(src_ids)
+    if K_all is None or V_all is None:
+        K_all, V_all = precompute_kv_cache(model, memory, src_key_padding_mask)
 
     if not hasattr(model, '_ar_weight_blob'):
         pack_weights(model)
@@ -458,11 +468,20 @@ def ar_decode_parallel(model, src_ids, sp, max_len=1536, src_key_padding_mask=No
     TMP384 = torch.zeros(batch, 384, dtype=torch.float16, device=device)
     out_ids = torch.full((batch, max_len), pad_id, dtype=torch.int32, device=device)
 
-    # SSM states
-    ssm = torch.zeros(batch, n_layers, 12, 64, 64, dtype=torch.float16, device=device)
-    kst = torch.zeros(batch, n_layers, 12, 64, dtype=torch.float16, device=device)
-    vst = torch.zeros(batch, n_layers, 12, 64, dtype=torch.float16, device=device)
-    ast = torch.zeros(batch, n_layers, 12, 16, dtype=torch.float16, device=device)
+    # SSM states — use initial_ar_state if provided
+    if initial_ar_state is not None:
+        ssm = initial_ar_state["ssm"].clone()
+        kst = initial_ar_state["kst"].clone()
+        vst = initial_ar_state["vst"].clone()
+        ast = initial_ar_state["ast"].clone()
+        cur_tok = initial_ar_state["cur_tok"].clone()
+    else:
+        ssm = torch.zeros(batch, n_layers, 12, 64, 64, dtype=torch.float16, device=device)
+        kst = torch.zeros(batch, n_layers, 12, 64, dtype=torch.float16, device=device)
+        vst = torch.zeros(batch, n_layers, 12, 64, dtype=torch.float16, device=device)
+        ast = torch.zeros(batch, n_layers, 12, 16, dtype=torch.float16, device=device)
+        cur_tok = torch.full((batch,), bos_id, dtype=torch.int32, device=device)
+
     # Per-head scratch for B/C rotary (12 heads × 128 = 64 B + 64 C)
     ssm_sc = torch.zeros(batch, 12 * 128, dtype=torch.float16, device=device)
 
@@ -476,7 +495,6 @@ def ar_decode_parallel(model, src_ids, sp, max_len=1536, src_key_padding_mask=No
     t_scores = torch.empty(batch, NVT, dtype=torch.float32, device=device)
     t_idxs = torch.empty(batch, NVT, dtype=torch.int32, device=device)
 
-    cur_tok = torch.full((batch,), bos_id, dtype=torch.int32, device=device)
     finished = torch.zeros(batch, dtype=torch.bool, device=device)
 
     # Grid sizes for fanned-out VMMs
@@ -489,7 +507,7 @@ def ar_decode_parallel(model, src_ids, sp, max_len=1536, src_key_padding_mask=No
     G_OA = (batch, NVT)
 
     for step in range(max_len):
-        if step % 32 == 0 and step > 0 and finished.all():
+        if step % 8 == 0 and step > 0 and finished.all():
             break
 
         # Embed
@@ -553,4 +571,11 @@ def ar_decode_parallel(model, src_ids, sp, max_len=1536, src_key_padding_mask=No
             while ids and ids[-1] == pad_id:
                 ids.pop()
         result.append(ids)
+
+    if return_state:
+        final_ar_state = {
+            "ssm": ssm, "kst": kst, "vst": vst, "ast": ast,
+            "cur_tok": cur_tok,
+        }
+        return result, final_ar_state
     return result

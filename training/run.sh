@@ -162,6 +162,67 @@ case "${1:-help}" in
         build_train
         ;;
 
+    prepare-data)
+        build_train
+        build_generator
+        build_augment
+
+        mkdir -p "$PROJECT_DIR/data/run6/train" "$PROJECT_DIR/data/run6/val"
+
+        # Step 1: Short synthetic samples (idempotent — skip if shards exist).
+        if ls "$PROJECT_DIR/data/run6/train"/shard_*.jsonl 1>/dev/null 2>&1; then
+            echo "Short synthetic samples already exist, skipping."
+        else
+            echo "Generating short synthetic samples..."
+            "$GENERATE_BIN" -stage 1 -short -train 50000 -val 5000 \
+                -seed 42 -out "$PROJECT_DIR/data/run6"
+        fi
+
+        # Step 2: Haiku augmentation (idempotent — skip if haiku_all.jsonl exists and is non-empty).
+        if [ -s "$PROJECT_DIR/data/run6/train/haiku_all.jsonl" ]; then
+            echo "Haiku train augmentation already exists, skipping."
+        else
+            echo "Augmenting haiku corpus (train)..."
+            "$AUGMENT_BIN" -dir "$PROJECT_DIR/data/haiku" \
+                -sample-pct 100 -aug-ratio 5 \
+                -special-prob 0.25 -corrupt-pct 15 \
+                -compact-pct 50 -truncate-pct 10 \
+                -shorten-pct 30 -drop-memory-pct 30 \
+                -tokenizer "$PROJECT_DIR/$RUN_DIR/tokenizer.model" \
+                -seed 42 \
+                > "$PROJECT_DIR/data/run6/train/haiku_all.jsonl"
+        fi
+
+        if [ -s "$PROJECT_DIR/data/run6/val/haiku_all.jsonl" ]; then
+            echo "Haiku val augmentation already exists, skipping."
+        else
+            echo "Augmenting haiku corpus (val)..."
+            "$AUGMENT_BIN" -dir "$PROJECT_DIR/data/haiku" \
+                -sample-pct 100 -aug-ratio 5 \
+                -special-prob 0.25 -corrupt-pct 15 \
+                -compact-pct 50 -truncate-pct 10 \
+                -shorten-pct 30 -drop-memory-pct 30 \
+                -tokenizer "$PROJECT_DIR/$RUN_DIR/tokenizer.model" \
+                -seed 42 -val \
+                > "$PROJECT_DIR/data/run6/val/haiku_all.jsonl"
+        fi
+
+        # Step 3: Tokenize (idempotent — skip if dataset.pt exists and is newer than all JSONL).
+        if [ -f "$PROJECT_DIR/data/run6/train/dataset.pt" ] && \
+           [ -f "$PROJECT_DIR/data/run6/val/dataset.pt" ] && \
+           ! find "$PROJECT_DIR/data/run6" -name "*.jsonl" -newer "$PROJECT_DIR/data/run6/train/dataset.pt" 2>/dev/null | grep -q .; then
+            echo "dataset.pt already up to date, skipping tokenization."
+        else
+            echo "Tokenizing and preparing dataset..."
+            run_gpu training/prepare_data.py \
+                --tokenizer "$RUN_DIR/tokenizer.model" \
+                --data-dir data/run6 \
+                --max-src-len 1152 --max-tgt-len 1536
+        fi
+
+        echo "Data preparation complete."
+        ;;
+
     train)
         build_train
         shift
@@ -211,15 +272,13 @@ case "${1:-help}" in
 
         echo "Run: $RUN ($RUN_DIR)"
         CID=$(run_gpu_detached training/train.py \
-            --data-dir data \
+            --data-dir data/run6 \
             --tokenizer "$RUN_DIR/tokenizer.model" \
             --output-dir "$RUN_DIR" \
-            --augment-bin /app/augment \
             --batch-size 3 \
             --grad-accum 11 \
             --d-state 64 \
             --headdim 64 \
-            --structural-weight 1.0 \
             --max-src-len 1152 \
             --max-tgt-len 1536 \
             --epochs 100 \
@@ -228,16 +287,14 @@ case "${1:-help}" in
             --save-every 1 \
             --fp16 \
             --stage 1 \
-            --max-stage 6 \
-            --stage-patience 1 \
-            --content-weight 1.0 \
+            --max-stage 2 \
+            --stage-patience 2 \
             --mrt-weight 10 \
             --mrt-threshold 0.90 \
             --cdata-weight 0 \
-            --token-noise 0.15 \
-            --professor-forcing \
-            --pf-iterations 1 \
-            --ar-train-frac 1.0 \
+            --ar-train-frac 0.0 \
+            --override-ar-frac 1.0 \
+            --override-lr 2e-5 \
             --ar-eval-samples 250 \
             --max-epoch-samples 33000 \
             $RESUME_FLAG \
@@ -318,11 +375,13 @@ case "${1:-help}" in
 import json, sys
 entries = json.load(open('$PROJECT_DIR/$RUN_DIR/training_log.json'))
 for e in entries[-10:]:
-    vc = f\" vCER={e['val_cer']:.2%} vWER={e['val_wer']:.2%}\" if 'val_cer' in e else ''
     ar = f\"ar={e.get('ar_exact','?')}/{e.get('ar_total','?')}exact {e.get('ar_xml_ok','?')}/{e.get('ar_total','?')}xml\" if 'ar_total' in e else ''
     er = f\" CER={e['ar_cer']:.2%} WER={e['ar_wer']:.2%}\" if 'ar_cer' in e else ''
     stg = f\"s{e['stage']}\" if 'stage' in e else ''
-    print(f\"  epoch={e['epoch']} {stg} train={e['train_loss']:.4f} val={e['val_loss']:.4f} exact={e.get('val_exact_match',0):.1%}{vc} {ar}{er} lr={e['lr']:.2e}\")
+    wc = f\" {e['wallclock']/3600:.1f}h\" if 'wallclock' in e else ''
+    af = e.get('ar_train_frac')
+    mode = ' [AR]' if af is not None and af >= 1.0 else ' [TF]' if af is not None else ''
+    print(f\"  epoch={e['epoch']} {stg} train={e['train_loss']:.4f} {ar}{er} lr={e['lr']:.2e}{wc}{mode}\")
 " 2>/dev/null || echo "  (empty or parse error)"
         else
             echo "  (no training_log.json yet)"
@@ -408,6 +467,48 @@ for e in entries[-10:]:
         echo "CPU inference: $CHECKPOINT ($N_SAMPLES samples, stage $STAGE)..."
         shuf -n "$N_SAMPLES" "$TMPFILE" | run_cpu_stdin training/infer.py "$CHECKPOINT" \
             -n "$N_SAMPLES" "$@"
+        ;;
+
+    gpu-infer)
+        build_train
+        build_generator
+        shift
+        N_SAMPLES="${1:-10}"
+        if [ -n "${1:-}" ]; then shift; fi
+
+        STAGE="${1:-3}"
+        if [ -n "${1:-}" ]; then shift; fi
+
+        # Accept --ckpt override.
+        RESUME_CKPT=$(find_resume_flag | sed 's/--resume //')
+        CHECKPOINT="${RESUME_CKPT:-$RUN_DIR/best.pt}"
+        _prev=""
+        _remaining=()
+        for _arg in "$@"; do
+            if [ "$_prev" = "--ckpt" ]; then CHECKPOINT="$_arg"; _prev=""; continue; fi
+            if [ "$_arg" = "--ckpt" ]; then _prev="$_arg"; continue; fi
+            _remaining+=("$_arg")
+        done
+        set -- "${_remaining[@]+"${_remaining[@]}"}"
+
+        GEN_COUNT=$(( N_SAMPLES * 3 ))
+        TMPFILE="$PROJECT_DIR/tmp/infer_input_$$.jsonl"
+        trap "rm -f '$TMPFILE'" EXIT
+
+        echo "Generating $GEN_COUNT candidates (stage $STAGE)..."
+        "$GENERATE_BIN" -stage "$STAGE" -stdout -train "$GEN_COUNT" -val 0 -seed "$$" > "$TMPFILE"
+        shuf -n "$N_SAMPLES" "$TMPFILE" > "${TMPFILE}.shuf"
+        mv "${TMPFILE}.shuf" "$TMPFILE"
+
+        echo "GPU inference: $CHECKPOINT ($N_SAMPLES samples, stage $STAGE)..."
+        docker run --rm --gpus all \
+            -v "$PROJECT_DIR/data:/app/data" \
+            -v "$PROJECT_DIR/models:/app/models" \
+            -v "$SCRIPT_DIR:/app/training:ro" \
+            -v "$PROJECT_DIR/tmp:/app/tmp" \
+            "$TRAIN_IMAGE" \
+            training/infer.py "$CHECKPOINT" \
+            -n "$N_SAMPLES" --gpu --input "tmp/infer_input_$$.jsonl" "$@"
         ;;
 
     infer-rejects)
@@ -860,6 +961,7 @@ Runs:
   Override with TRANSMUTATION_RUN=runN.
 
 Other:
+  prepare-data      Pre-generate and tokenize run6 dataset.
   export [ckpt]     Export checkpoint to ONNX (default: best.pt).
   tokenizer         Train the tokenizer.
   build             Build the training Docker image.

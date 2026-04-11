@@ -41,64 +41,26 @@ from torch.amp import GradScaler, autocast
 # Module-level ref for signal handler to kill child subprocesses
 _active_child = None
 
-from dataset import create_dataloader
+from dataset import create_dataloader, PrebuiltDataset
 from infer import greedy_decode, batched_greedy_decode
 from model import build_model
 
 
-# ── Curriculum stages ────────────────────────────────────────────────────────
+# ── Run6: Minimal 2-stage curriculum ─────────────────────────────────────────
 #
-# Complexity-stratified curriculum: overfit on clean structure, then generalize.
-#
-# Phase A (stages 1-3): Overfit on clean JSON→XML. Advance on val_exact > 90%.
-#   - Complexity ramps from simple flat → full structural vocabulary
-#   - No corruption, no truncation. Compact OK (not structural complexity).
-#   - PF base is low (overfit mode), ramps on plateau via pf_boost.
-#
-# Phase B (stage 4): AR gate on clean data. Advance on AR exact > 90%.
-#   - Full complexity, clean. Model must GENERATE correct XML end-to-end.
-#   - PF boost kicks in hard here (teacher-forced mastery but AR gap).
-#
-# Phase C (stages 5-6): Generalize with augmentation. Advance on AR exact > 90%.
-#   - Progressive corruption, truncation, special chars.
-#   - PF driven by plateau detection.
+# Pre-generated dataset + full AR training. Logit soft cap prevents NaN.
+# All complexity levels and lengths from epoch 1.
+# Stage 1: clean samples only (learn faithful mapping).
+# Stage 2: + corrupted samples (learn robustness).
+# BucketedBatchSampler groups by source length for GPU efficiency.
 
-HAIKU_STAGES = {
-    # Stage 1: Clean, complexity<=5, fp16 warmup. Advance on val_loss < 2.0.
-    1: {"type": "all", "max_complexity": 5, "aug_ratio": 0, "special_prob": 0.0, "corrupt_pct": 0, "compact_pct": 50, "sample_pct": 50, "dict_word_pct": 0, "drop_memory_pct": 0, "truncate_pct": 0, "shorten_pct": 30},
-    # Stage 2: Clean + special chars (CDATA training), full complexity. Advance on val_exact >= 90%.
-    2: {"type": "all", "max_complexity": 10, "aug_ratio": 0, "special_prob": 0.10, "corrupt_pct": 0, "compact_pct": 50, "sample_pct": 50, "dict_word_pct": 0, "drop_memory_pct": 0, "truncate_pct": 0, "shorten_pct": 30},
-    # Stage 3: Light augmentation. Advance on val_exact >= 89%.
-    3: {"type": "all", "max_complexity": 10, "aug_ratio": 1, "special_prob": 0.05, "corrupt_pct": 2, "compact_pct": 50, "sample_pct": 50, "dict_word_pct": 0, "drop_memory_pct": 20, "truncate_pct": 2, "shorten_pct": 30},
-    # Stages 4-6: Heavy augmentation. AR eval active. Advance on ar_exact >= 89%.
-    4: {"type": "all", "max_complexity": 10, "aug_ratio": 2, "special_prob": 0.15, "corrupt_pct": 5, "compact_pct": 50, "sample_pct": 50, "dict_word_pct": 0, "drop_memory_pct": 30, "truncate_pct": 5, "shorten_pct": 30},
-    5: {"type": "all", "max_complexity": 10, "aug_ratio": 3, "special_prob": 0.25, "corrupt_pct": 10, "compact_pct": 50, "sample_pct": 50, "dict_word_pct": 0, "drop_memory_pct": 40, "truncate_pct": 10, "shorten_pct": 30},
-    6: {"type": "all", "max_complexity": 10, "aug_ratio": 3, "special_prob": 0.35, "corrupt_pct": 15, "compact_pct": 50, "sample_pct": 50, "dict_word_pct": 0, "drop_memory_pct": 50, "truncate_pct": 20, "shorten_pct": 30},
+STAGE_FILTERS = {
+    1: {"max_src_tokens": 1152, "max_complexity": 8, "allow_corrupt": False},
+    2: {"max_src_tokens": 1152, "max_complexity": 8, "allow_corrupt": True},
 }
 
-# Professor forcing base rate per stage. Low during overfit (1-3), moderate for AR (4-6).
-# pf_boost adds on top when the stage metric plateaus (sawtooth pattern, resets on advance).
-PF_NOISE_SCHEDULE = {1: 0.05, 2: 0.05, 3: 0.10, 4: 1.00, 5: 1.00, 6: 1.00}
+STAGE_ADVANCE_THRESHOLD = 0.90
 
-# Stage advance thresholds. Stages 1-3 use val_exact, stages 4-6 use AR exact.
-STAGE_ADVANCE_THRESHOLD = 0.90  # 90% mastery — stage 2 special chars ensure CDATA is well-exercised
-
-
-def compute_cw_boost(prev_val, curr_val, rate_threshold=0.10, max_boost=1.0):
-    """Compute content weight boost from val loss improvement rate.
-
-    Returns boost in [0, max_boost]. High improvement → 0 boost. Stalled → full boost.
-    Sawtooth pattern: accumulate boosts within a stage, reset on stage advance.
-    """
-    if prev_val <= 0:
-        return 0.0
-    improvement = (prev_val - curr_val) / prev_val
-    return max(0.0, min(max_boost, (1.0 - improvement / rate_threshold) * max_boost))
-
-# Validation budget by training stage — small early (fast epochs), full later (precise eval).
-# Full val set is generated once at max stage; this caps how many batches we actually run.
-# None = use full val set.
-VAL_MAX_BATCHES = {1: 50, 2: 1667, 3: 1667, 4: None, 5: None, 6: None}
 
 
 def generate_haiku_data(augment_bin, data_dir, split, stage, seed, dict_word_pct_override=None, tokenizer_path=None):
@@ -125,7 +87,7 @@ def generate_haiku_data(augment_bin, data_dir, split, stage, seed, dict_word_pct
         "-truncate-pct", str(params.get("truncate_pct", 0)),
         "-shorten-pct", str(params.get("shorten_pct", 0)),
         "-min-chars", str(params.get("min_chars", 0)),
-        "-max-complexity", str(params.get("max_complexity", 10)),
+        "-max-complexity", str(params.get("max_complexity", 8)),
         "-type", str(params.get("type", "all")),
         "-seed", str(seed),
     ]
@@ -220,9 +182,11 @@ def train(args):
         pad_id=pad_id,
     ).to(device)
 
-    # Data directories and dataloader args.
-    train_data_dir = os.path.join(args.data_dir, "train")
-    val_data_dir = os.path.join(args.data_dir, "val")
+    # Load pre-built datasets once — filtered per stage at runtime.
+    train_dataset = PrebuiltDataset(
+        os.path.join(args.data_dir, "train", "dataset.pt"), args.tokenizer)
+    val_dataset = PrebuiltDataset(
+        os.path.join(args.data_dir, "val", "dataset.pt"), args.tokenizer)
     dl_kwargs = dict(
         tokenizer_path=args.tokenizer,
         batch_size=args.batch_size,
@@ -249,16 +213,11 @@ def train(args):
     # vs structural XML tokens (IDs 0-15: special + XML tags).
     # Model returns raw logits (no copy mechanism), use CrossEntropyLoss.
     criterion = nn.CrossEntropyLoss(ignore_index=-100)
-    print(f"Content weight: adaptive sawtooth 1.0→{args.content_weight}x (resets on stage advance, structural tokens 0-{args.structural_max_id} at {args.structural_weight}x)")
-    if args.professor_forcing:
-        iter_str = f", {args.pf_iterations} iterations" if args.pf_iterations > 1 else ""
-        print(f"Professor forcing: ON (schedule: {' → '.join(f's{s}={n:.3f}' for s, n in sorted(PF_NOISE_SCHEDULE.items()))}{iter_str})")
     if args.mrt_weight > 0:
         cdata_str = f", CDATA weight={args.cdata_weight}x" if args.cdata_weight > 0 else ""
         print(f"Online MRT: weight={args.mrt_weight}x on near-miss samples, threshold={args.mrt_threshold:.0%}{cdata_str}")
-    if args.ar_train_frac > 0:
-        print(f"AR training: {args.ar_train_frac:.0%} of batches use full AR decode as input (stage 4+)")
-        model._ar_fixed_src_len = args.max_src_len  # fixed size for CUDA graph cache
+    print(f"AR training: {args.ar_train_frac:.0%} of batches use full AR decode as input (all stages)")
+    model._ar_fixed_src_len = args.max_src_len  # fixed size for CUDA graph cache
 
     # Mixed precision.
     scaler = GradScaler("cuda", enabled=args.fp16)
@@ -276,11 +235,9 @@ def train(args):
     resume_val_state = None
     resume_train_loss = 0.0
     current_stage = args.stage
-    stage_good_epochs = 0  # consecutive epochs above stage-advance threshold
-    cw_boost = 0.0  # accumulated content weight boost (sawtooth: resets on stage advance)
-    pf_boost = 0.0  # professor forcing boost (sawtooth: resets on stage advance)
-    sw_boost = 0.0  # structural weight boost (sawtooth: resets on stage advance)
-    prev_val_loss = None  # for computing improvement rate
+    stage_good_epochs = 0
+    wallclock = 0.0  # cumulative wall-clock seconds across all epochs/resumes
+    epoch_wall_start = None  # timestamp at epoch start or resume
 
     # Resume from checkpoint.
     if args.resume and os.path.exists(args.resume):
@@ -300,6 +257,8 @@ def train(args):
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         try:
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            if hasattr(scheduler, 'best') and scheduler.best == 0.0:
+                scheduler.best = float('inf')
         except (KeyError, ValueError):
             print("  Scheduler state incompatible (type changed?), starting fresh")
         if "scaler_state_dict" in ckpt:
@@ -309,29 +268,17 @@ def train(args):
         global_step = ckpt.get("global_step", 0)
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
         best_ar_exact = ckpt.get("best_ar_exact", 0)
-        current_stage = ckpt.get("stage", args.stage)
-        if args.force_stage and args.force_stage != current_stage:
-            print(f"  Force-advancing stage: {current_stage} → {args.force_stage}")
-            current_stage = args.force_stage
-            # Reset everything as if normal stage advance happened.
-            stage_good_epochs = 0
-            cw_boost = 0.0
-            pf_boost = 0.0
-            sw_boost = 0.0
-            prev_val_loss = None
-            restart_lr = args.lr / 2
-            for pg in optimizer.param_groups:
-                pg['lr'] = restart_lr
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer, mode='min', factor=0.5, patience=args.lr_patience,
-            )
-            print(f"  LR reset to {restart_lr:.1e}, scheduler reset, boosts zeroed")
-        else:
-            stage_good_epochs = ckpt.get("stage_good_epochs", 0)
-            cw_boost = ckpt.get("cw_boost", 0.0)
-            pf_boost = ckpt.get("pf_boost", 0.0)
-            sw_boost = ckpt.get("sw_boost", 0.0)
-            prev_val_loss = ckpt.get("prev_val_loss")
+        current_stage = ckpt.get("stage", 1)
+        stage_good_epochs = ckpt.get("stage_good_epochs", 0)
+        wallclock = ckpt.get("wallclock", 0.0)
+        saved_ar_frac = ckpt.get("ar_train_frac")
+        if args.override_ar_frac is not None:
+            args.ar_train_frac = args.override_ar_frac
+            print(f"  ar_train_frac: checkpoint={saved_ar_frac} → {args.ar_train_frac} (override)")
+        elif saved_ar_frac is not None:
+            if saved_ar_frac != args.ar_train_frac:
+                print(f"  ar_train_frac: cli={args.ar_train_frac} → checkpoint={saved_ar_frac} (checkpoint wins)")
+            args.ar_train_frac = saved_ar_frac
         if not completed_epoch:
             resume_epoch_seed = ckpt.get("epoch_seed")
             resume_epoch_step = ckpt.get("epoch_step", 0)
@@ -415,42 +362,41 @@ def train(args):
                             atexit_state["epoch"], global_step, best_val_loss,
                             args.output_dir, fname, epoch_complete=False,
                             epoch_step=actual_step, epoch_seed=atexit_state["epoch_seed"],
-                            stage=current_stage, stage_good_epochs=stage_good_epochs,
+                            stage=current_stage, stage_good_epochs=0,
                             training_done=atexit_state["training_done"],
                             val_state=atexit_state.get("val_state"),
                             train_loss=atexit_state.get("train_loss", 0.0),
-                            cw_boost=cw_boost, pf_boost=pf_boost, sw_boost=sw_boost, prev_val_loss=prev_val_loss,
-                            best_ar_exact=best_ar_exact)
+                            best_ar_exact=best_ar_exact, wallclock=current_wallclock(),
+                            ar_train_frac=args.ar_train_frac)
             print(f">>> atexit: saved at epoch {atexit_state['epoch']} batch {actual_step} (training_done={atexit_state['training_done']}) <<<")
         except Exception as e:
             print(f">>> atexit: FAILED to save checkpoint: {e} <<<")
     atexit.register(atexit_save)
 
-    # Generate validation data matching the current stage's complexity.
-    # Regenerated on stage advance so val_exact measures mastery of the current level.
     VAL_SEED = 7777777
-    last_val_stage = current_stage if args.resume else None  # on resume, val data matches current stage
-    prev_stage_metric = None  # for computing pf_boost improvement rate
 
-    def regenerate_val_if_needed():
-        nonlocal last_val_stage
-        if last_val_stage != current_stage:
-            generate_haiku_data(args.augment_bin, args.data_dir, "val", current_stage, VAL_SEED, args.dict_word_pct, args.tokenizer)
-            print(f"  Val set regenerated for stage {current_stage}")
-            last_val_stage = current_stage
+    def apply_stage_filters():
+        sf = STAGE_FILTERS[current_stage]
+        n_train = train_dataset.apply_stage_filter(**sf)
+        n_val = val_dataset.apply_stage_filter(**sf)
+        print(f"  Stage {current_stage}: corrupt={'yes' if sf['allow_corrupt'] else 'no'} → {n_train} train, {n_val} val")
 
-    regenerate_val_if_needed()
-    print(f"Training stage: {current_stage} (advance at {STAGE_ADVANCE_THRESHOLD:.0%} mastery, max={args.max_stage})")
-    print(f"  Stages 1-3: advance on val_exact, Stages 4+: advance on AR exact")
+    apply_stage_filters()
+    print(f"Training stage: {current_stage} (advance at {STAGE_ADVANCE_THRESHOLD:.0%} ar_exact, max={args.max_stage})")
 
     print(f"\nTraining for {args.epochs} epochs (ReduceLROnPlateau, patience={args.lr_patience})")
-    print(f"Grad accumulation: {args.grad_accum}, effective batch: {args.batch_size * args.grad_accum}")
+    print(f"Grad accumulation: {args.grad_accum}, base batch: {args.batch_size} (bucketed by length)")
     print()
 
-    _val_dataset = None  # cached val dataset — loaded once, reused across epochs
+    def current_wallclock():
+        if epoch_wall_start is None:
+            return wallclock
+        return wallclock + (time.time() - epoch_wall_start)
+
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_seed = epoch * 1000 + 42
         start_index = 0
+        epoch_wall_start = time.time()
 
         # If resuming an epoch where training already finished, skip to validation.
         if epoch == start_epoch and resume_training_done:
@@ -458,81 +404,24 @@ def train(args):
                 epoch_seed = resume_epoch_seed
             print(f"Resuming epoch {epoch} post-training (skipping to validation)")
             atexit_state.update(epoch=epoch, epoch_seed=epoch_seed, step=0, active=True, training_done=True)
-            avg_train_loss = resume_train_loss
+            avg_train_loss = resume_train_loss if resume_train_loss > 0 else 9.0  # log(8000) baseline
             # Jump straight to validation (below the training block).
         else:
-            # Generate fresh training data for this epoch (val is fixed).
             if epoch == start_epoch and resume_epoch_step > 0:
                 if resume_epoch_seed is not None:
                     epoch_seed = resume_epoch_seed
                 start_index = resume_epoch_step
                 print(f"Resuming epoch {epoch} from batch {start_index} (seed={epoch_seed})")
-            generate_haiku_data(args.augment_bin, args.data_dir, "train", current_stage, epoch_seed, args.dict_word_pct, args.tokenizer)
 
             train_loader, epoch_seed, _ = create_dataloader(
-                data_dir=train_data_dir, shuffle=True,
-                epoch_seed=epoch_seed, start_index=start_index * args.batch_size,
-                max_samples=args.max_epoch_samples, **dl_kwargs,
+                data_dir="unused", shuffle=True,
+                epoch_seed=epoch_seed, start_index=start_index,
+                max_samples=args.max_epoch_samples, dataset=train_dataset,
+                bucketed=True, **dl_kwargs,
             )
             n_dataset = len(train_loader.dataset)
-            n_sampled = len(train_loader) * args.batch_size
-            print(f"  Epoch {epoch}: {n_dataset} in dataset, {n_sampled} sampled (max_epoch={args.max_epoch_samples}), {len(train_loader)} batches", flush=True)
+            print(f"  Epoch {epoch}: {n_dataset} in dataset, {len(train_loader)} batches (bucketed)", flush=True)
             atexit_state.update(epoch=epoch, epoch_seed=epoch_seed, step=start_index, active=True, training_done=False)
-
-            # ── Pre-decode AR batches for the epoch (chunked, amortized) ──
-            ar_decoded_cache = {}
-            do_ar_training = (args.ar_train_frac > 0 and current_stage >= 4)
-            ar_inline = do_ar_training  # always inline — no pre-decode
-            if do_ar_training and not ar_inline:
-                from ar_kernel import ar_decode_fused
-                model.eval()
-                ar_rng = torch.Generator().manual_seed(epoch_seed + 999)
-                ar_step_indices = []
-                for s in range(start_index, len(train_loader)):
-                    if torch.rand(1, generator=ar_rng).item() < args.ar_train_frac:
-                        ar_step_indices.append(s)
-                if ar_step_indices:
-                    AR_BATCH = 30  # decode this many samples at once (10 training batches)
-                    ar_batches = {}
-                    for s, batch in enumerate(train_loader):
-                        if start_index + s in ar_step_indices:
-                            ar_batches[start_index + s] = (
-                                batch["src_ids"].to(device),
-                                batch["src_key_padding_mask"].to(device),
-                                batch["tgt_input"].shape[1],
-                            )
-                    keys = sorted(ar_batches.keys())
-                    batches_per_chunk = AR_BATCH // args.batch_size
-                    t0_ar = time.time()
-                    n_chunks = 0
-                    for chunk_start in range(0, len(keys), batches_per_chunk):
-                        chunk_keys = keys[chunk_start:chunk_start + batches_per_chunk]
-                        src_list = [ar_batches[k][0] for k in chunk_keys]
-                        mask_list = [ar_batches[k][1] for k in chunk_keys]
-                        max_src = max(s.shape[1] for s in src_list)
-                        max_tgt = max(ar_batches[k][2] for k in chunk_keys)
-                        cat_src = torch.full((len(chunk_keys) * args.batch_size, max_src),
-                                            sp.pad_id(), dtype=torch.long, device=device)
-                        cat_mask = torch.ones(cat_src.shape[0], max_src, dtype=torch.bool, device=device)
-                        for i, (s, m) in enumerate(zip(src_list, mask_list)):
-                            bs = s.shape[0]
-                            sl = s.shape[1]
-                            cat_src[i*bs:(i+1)*bs, :sl] = s
-                            cat_mask[i*bs:(i+1)*bs, :sl] = m
-                        with torch.no_grad():
-                            ar_ids = ar_decode_fused(
-                                model, cat_src, sp,
-                                max_len=max_tgt, src_key_padding_mask=cat_mask,
-                            )
-                        for i, k in enumerate(chunk_keys):
-                            bs = ar_batches[k][0].shape[0]
-                            ar_decoded_cache[k] = ar_ids[i*bs:(i+1)*bs]
-                        n_chunks += 1
-                    ar_elapsed = time.time() - t0_ar
-                    print(f"  AR pre-decode: {len(keys)} batches ({len(keys)*args.batch_size} samples) "
-                          f"in {ar_elapsed:.1f}s", flush=True)
-                    del ar_batches
-                model.train()
 
             # Train. Accumulators on GPU — zero sync in training loop.
             model.train()
@@ -551,8 +440,8 @@ def train(args):
                 tgt_labels = batch["tgt_labels"].to(device)
                 src_mask = batch["src_key_padding_mask"].to(device)
 
-                # AR training: fanned-out parallel decode — full GPU utilization.
-                if ar_inline and torch.rand(1).item() < args.ar_train_frac:
+                # AR training: fanned-out parallel decode.
+                if torch.rand(1).item() < args.ar_train_frac:
                     from ar_parallel import ar_decode_parallel
                     ar_ids = ar_decode_parallel(
                         model, src, sp,
@@ -566,39 +455,10 @@ def train(args):
                     _ar_did_decode = True
                 else:
                     _ar_did_decode = False
-                    effective_noise = min(PF_NOISE_SCHEDULE.get(current_stage, args.token_noise) + pf_boost, 1.0)
-                    if effective_noise > 0:
-                        if args.professor_forcing:
-                            # Iterative PF: N passes, each predicting from increasingly
-                            # corrupted context. Approximates AR error cascading.
-                            for _pf_iter in range(args.pf_iterations):
-                                with torch.no_grad():
-                                    with autocast("cuda", enabled=args.fp16):
-                                        pf_logits = model(src, tgt_in, src_mask)
-                                    pred_ids = pf_logits.argmax(dim=-1)
-                                    replacement_ids = torch.cat(
-                                        [tgt_in[:, :1], pred_ids[:, :-1]], dim=1,
-                                    )
-                                tgt_in = corrupt_content_tokens(
-                                    tgt_in, effective_noise, args.structural_max_id,
-                                    vocab_size, pad_id, replacement_ids=replacement_ids,
-                                )
-                        else:
-                            tgt_in = corrupt_content_tokens(
-                                tgt_in, effective_noise, args.structural_max_id, vocab_size, pad_id,
-                            )
 
                 with autocast("cuda", enabled=args.fp16):
                     logits = model(src, tgt_in, src_mask)
-                    cw = min(args.content_weight, 1.0 + cw_boost)
-                    sw = args.structural_weight + sw_boost
-                    if cw > 1.0 or sw > 1.0:
-                        loss = weighted_content_loss(
-                            logits, tgt_labels, vocab_size,
-                            cw, args.structural_max_id,
-                            structural_weight=sw,
-                        )
-                    elif args.mrt_weight > 0:
+                    if args.mrt_weight > 0:
                         loss = mrt_error_weighted_loss(
                             logits, tgt_labels, vocab_size,
                             args.mrt_weight, args.mrt_threshold,
@@ -607,6 +467,11 @@ def train(args):
                     else:
                         loss = criterion(logits.reshape(-1, vocab_size), tgt_labels.reshape(-1))
                     loss = loss / args.grad_accum
+
+                if not torch.isfinite(loss):
+                    optimizer.zero_grad()
+                    print(f"  Non-finite loss at step {step}, skipping", flush=True)
+                    continue
 
                 scaler.scale(loss).backward()
 
@@ -622,18 +487,14 @@ def train(args):
                     optimizer.zero_grad()
                     global_step += 1
 
-                    # Linear warmup: scale LR during initial steps.
                     if global_step <= warmup_steps:
                         warmup_lr = args.lr * global_step / warmup_steps
                         for pg in optimizer.param_groups:
                             pg["lr"] = warmup_lr
 
-                # Display + NaN check every grad_accum steps (one sync per optimizer step).
                 if (start_index + step + 1) % args.grad_accum == 0:
                     cur_lr = optimizer.param_groups[0]["lr"]
                     loss_val = loss.item() * args.grad_accum
-                    if loss_val != loss_val:  # NaN
-                        print(f"  NaN loss detected at step {step}, skipping", flush=True)
                     now = time.time()
                     if now - last_log_time >= 10:
                         pct = 100 * (step + 1) / n_batches
@@ -641,7 +502,9 @@ def train(args):
                         rate = (step + 1) / max(elapsed, 1)
                         eta_m = (n_batches - step - 1) / max(rate, 0.01) / 60
                         ar_tag = " [AR]" if _ar_did_decode else ""
-                        print(f"Epoch {epoch} train: {pct:5.1f}% | {step+1}/{n_batches} | loss={loss_val:.4f} | lr={cur_lr:.2e} | {rate:.1f} it/s | ETA {eta_m:.0f}m{ar_tag}", flush=True)
+                        bsz = src.shape[0]
+                        seq = max(src.shape[1], tgt_in.shape[1])
+                        print(f"Epoch {epoch} train: {pct:5.1f}% | {step+1}/{n_batches} | loss={loss_val:.4f} | lr={cur_lr:.2e} | {rate:.1f} it/s | ETA {eta_m:.0f}m | B={bsz} seq={seq}{ar_tag}", flush=True)
                         last_log_time = now
 
                 # Handle signal-triggered checkpoint.
@@ -652,9 +515,9 @@ def train(args):
                     save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss,
                                     args.output_dir, fname, epoch_complete=False,
                                     epoch_step=actual_step, epoch_seed=epoch_seed,
-                                    stage=current_stage, stage_good_epochs=stage_good_epochs,
-                                    cw_boost=cw_boost, prev_val_loss=prev_val_loss,
-                                    best_ar_exact=best_ar_exact)
+                                    stage=current_stage, stage_good_epochs=0,
+                                    best_ar_exact=best_ar_exact, wallclock=current_wallclock(),
+                                    ar_train_frac=args.ar_train_frac)
                     print(f"\n>>> Checkpoint saved ({fname}): epoch {epoch} batch {actual_step} stage={current_stage} <<<")
                     if sig_state["stop"]:
                         print("Exiting cleanly.")
@@ -666,125 +529,50 @@ def train(args):
             atexit_state["training_done"] = True
             atexit_state["train_loss"] = avg_train_loss
 
-        # Validate (fixed held-out val set, generated once before training).
+        # Validation = AR eval. Small count until first valid XML, then scale up.
         atexit_state["training_done"] = True
-        atexit_state["val_state"] = None
-        val_state_for_resume = None
-        if epoch == start_epoch and resume_val_state is not None:
-            val_state_for_resume = resume_val_state
-            resume_val_state = None  # only use once
-        val_start_index = val_state_for_resume["batch"] * args.batch_size if val_state_for_resume else 0
-        # Cache val dataset across epochs — reuse until stage changes
-        val_loader, _, _val_dataset = create_dataloader(
-            data_dir=val_data_dir, shuffle=True, start_index=val_start_index,
-            max_samples=args.max_epoch_samples, epoch_seed=VAL_SEED,
-            dataset=_val_dataset, **dl_kwargs,
-        )
-        val_max_batches = VAL_MAX_BATCHES.get(current_stage)
-        val_loss, val_tokens, val_exact, val_cer, total_wer_chars, wer_args = validate(
-            model, val_loader, criterion, vocab_size, device, args.fp16,
-            sp=sp, gpu_decoder=gpu_decoder, sig_state=sig_state,
-            atexit_state=atexit_state,
-            resume_val_state=val_state_for_resume,
-            max_batches=val_max_batches, output_dir=args.output_dir)
-        avg_val_loss = val_loss / max(val_tokens, 1)
-
-        # Launch WER in background thread (CPU) so AR eval can use GPU concurrently.
-        wer_result = [0]
-        def _compute_wer_bg():
-            if wer_args:
-                n_workers = min(os.cpu_count() or 4, len(wer_args))
-                with ProcessPoolExecutor(max_workers=n_workers) as pool:
-                    wer_result[0] = sum(pool.map(_wer_worker, wer_args, chunksize=64))
-                print(f"  WER done ({len(wer_args)} pairs, {os.cpu_count()} cores).", flush=True)
-        wer_thread = threading.Thread(target=_compute_wer_bg, daemon=True)
-        wer_thread.start()
-
-        # Check for stop signal after validation (may have aborted early).
-        if sig_state["stop"]:
-            wer_thread.join()
-            fname = interrupt_filename()
-            save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss,
-                            args.output_dir, fname, epoch_complete=False,
-                            stage=current_stage, stage_good_epochs=stage_good_epochs,
-                            training_done=True,
-                            val_state=atexit_state.get("val_state"),
-                            train_loss=avg_train_loss,
-                            cw_boost=cw_boost, pf_boost=pf_boost, sw_boost=sw_boost, prev_val_loss=prev_val_loss,
-                            best_ar_exact=best_ar_exact)
-            print(f"\n>>> Checkpoint saved ({fname}): epoch {epoch} (training_done, val_state saved) <<<")
-            print("Exiting cleanly.")
-            return model
-
-        atexit_state["val_state"] = None  # validation complete, clear partial state
-
-        # Autoregressive eval: always run. Stage gates 1-3 use val_exact, 4+ use ar_rate.
-        run_ar = True
-        if run_ar:
-            try:
-                ar_exact, ar_semantic, ar_xml_ok, ar_total, ar_cer, ar_wer, ar_buckets = autoregressive_eval(
-                    model, sp, n_samples=args.ar_eval_samples,
-                    augment_bin=args.augment_bin, data_dir=args.data_dir,
+        if best_ar_exact == 0:
+            ar_n = 50
+        else:
+            ar_scale = min(4.0, 2.0 / max(avg_train_loss, 0.1))
+            ar_n = max(50, int(args.ar_eval_samples * ar_scale))
+        try:
+            ar_exact, ar_semantic, ar_xml_ok, ar_total, ar_cer, ar_wer, ar_buckets = autoregressive_eval(
+                    model, sp, n_samples=ar_n,
+                    val_dataset=val_dataset,
                     max_src_len=args.max_src_len, max_tgt_len=args.max_tgt_len,
-                    output_dir=args.output_dir, epoch=epoch, stage=current_stage,
+                    output_dir=args.output_dir, epoch=epoch,
                     device=device, gpu_decoder=gpu_decoder,
+                    atexit_state=atexit_state, sig_state=sig_state,
                 )
-            except NotImplementedError as e:
-                ar_exact, ar_semantic, ar_xml_ok, ar_total, ar_cer, ar_wer, ar_buckets = 0, 0, 0, args.ar_eval_samples, 1.0, 1.0, {}
-                print(f"AR eval skipped: {e}", flush=True)
-        else:
-            ar_exact, ar_xml_ok, ar_total, ar_cer, ar_wer = 0, 0, args.ar_eval_samples, 1.0, 1.0
+        except NotImplementedError as e:
+            ar_exact, ar_semantic, ar_xml_ok, ar_total, ar_cer, ar_wer, ar_buckets = 0, 0, 0, ar_n, 1.0, 1.0, {}
+            print(f"AR eval skipped: {e}", flush=True)
 
-        # Join WER thread (was running on CPU in parallel with AR eval on GPU).
-        wer_thread.join()
-        val_wer = wer_result[0] / max(total_wer_chars, 1)
-
-        # Stage metrics.
         ar_rate = ar_exact / max(ar_total, 1)
-        # Stage 1: fp16 stability (val_loss gate).
-        # Stages 2-3: val_exact mastery (AR eval not active until stage 4).
-        # Stages 4+: AR exact robustness under augmentation.
-        if current_stage == 1:
-            # Stage 1→2: fp16 stability gate. Just need loss low enough.
-            stage_metric = 1.0 if avg_val_loss < 2.0 else 0.0
-            stage_metric_name = "val_loss<2.0"
-        elif current_stage <= 3:
-            # Stages 2-3: val_exact mastery gate. AR eval not yet active.
-            stage_metric = val_exact
-            stage_metric_name = "val_exact"
-        else:
-            # Stages 4+: AR robustness under augmentation.
-            stage_metric = ar_rate
-            stage_metric_name = "ar_exact"
 
-        # LR scheduler — always use val_loss (deterministic, smooth).
-        # AR rate is too noisy at 250 samples to drive LR — it triggers false plateaus.
+        # Phase transition: first valid XML → switch to full AR training.
+        if ar_xml_ok > 0 and args.ar_train_frac < 1.0:
+            args.ar_train_frac = 1.0
+            print(f"  >>> Phase transition: {ar_xml_ok}/{ar_total} valid XML — switching to full AR training")
+
+        # LR scheduler — driven by train loss (smooth, bounded by soft cap).
         cur_lr = optimizer.param_groups[0]["lr"]
-        scheduler.step(avg_val_loss)
+        scheduler.step(avg_train_loss)
         new_lr = optimizer.param_groups[0]["lr"]
         if new_lr < cur_lr:
             print(f"  LR reduced: {cur_lr:.2e} -> {new_lr:.2e}")
 
-        # Auto-advance curriculum stage on mastery.
+        # Stage advance: clean → clean+corrupt.
         if current_stage < args.max_stage:
-            if stage_metric >= STAGE_ADVANCE_THRESHOLD:
+            if ar_rate >= STAGE_ADVANCE_THRESHOLD:
                 stage_good_epochs += 1
             else:
                 stage_good_epochs = 0
             if stage_good_epochs >= args.stage_patience:
                 current_stage += 1
                 stage_good_epochs = 0
-                new_params = HAIKU_STAGES[current_stage]
-                print(f"  >>> Stage advanced to {current_stage} ({stage_metric_name}={stage_metric:.0%} for {args.stage_patience} epochs)")
-                cw_boost = 0.0  # sawtooth reset
-                pf_boost = 0.0  # sawtooth reset
-                sw_boost = 0.0  # sawtooth reset
-                prev_val_loss = None
-                prev_stage_metric = None
-                # Regenerate val set for new complexity level.
-                regenerate_val_if_needed()
-                _val_dataset = None  # invalidate cached val dataset
-                # LR warm restart.
+                apply_stage_filters()
                 restart_lr = args.lr / 2
                 for pg in optimizer.param_groups:
                     pg['lr'] = restart_lr
@@ -792,118 +580,48 @@ def train(args):
                     optimizer, mode='min', factor=0.5,
                     patience=args.lr_patience, min_lr=1e-6,
                 )
-                print(f"      complexity<={new_params.get('max_complexity', 10)} aug={new_params['aug_ratio']} cor={new_params['corrupt_pct']}% pf/cw reset lr→{restart_lr:.1e}")
-
-        # PF boost: ramp when stage metric isn't improving fast enough. Reset on advance.
-        # Checked every epoch. Threshold 10% — anything slower gets a boost.
-        effective_pf = min(PF_NOISE_SCHEDULE.get(current_stage, args.token_noise) + pf_boost, 1.0)
-        if prev_stage_metric is not None:
-            if prev_stage_metric > 0:
-                improvement = (stage_metric - prev_stage_metric) / max(prev_stage_metric, 0.01)
-            else:
-                improvement = stage_metric
-            boost = compute_cw_boost(1.0, 1.0 - improvement, rate_threshold=0.10, max_boost=0.10)
-            old_pf = effective_pf
-            pf_boost = min(pf_boost + boost, 0.50)
-            effective_pf = min(PF_NOISE_SCHEDULE.get(current_stage, args.token_noise) + pf_boost, 1.0)
-            if effective_pf > old_pf + 0.005:
-                print(f"  PF boost: {old_pf:.3f} -> {effective_pf:.3f} ({stage_metric_name} improvement {improvement:.1%})")
-        prev_stage_metric = stage_metric
-
-        # Structural weight boost: DISABLED. Re-enable by setting SW_CAP > 0.
-        # In run5 SW ramped 0→8 during stages 4-6 but unclear if it helped vs natural adaptation.
-        SW_CAP = 0.0
-        effective_sw = args.structural_weight + sw_boost
-        sw_at_cap = True  # disabled — always "at cap" so CW section is also skipped
-        if SW_CAP > 0 and not (effective_sw >= SW_CAP) and prev_stage_metric is not None:
-            if prev_stage_metric > 0:
-                sw_improvement = (stage_metric - prev_stage_metric) / max(prev_stage_metric, 0.01)
-            else:
-                sw_improvement = stage_metric
-            sw_inc = compute_cw_boost(1.0, 1.0 - sw_improvement, rate_threshold=0.05, max_boost=2.0)
-            old_sw = effective_sw
-            sw_boost = min(sw_boost + sw_inc, SW_CAP - args.structural_weight)
-            effective_sw = args.structural_weight + sw_boost
-            if effective_sw > old_sw + 0.1:
-                print(f"  SW boost: {old_sw:.1f} -> {effective_sw:.1f}")
-
-        # Content weight boost: DISABLED. Re-enable by setting SW_CAP > 0 (activates after SW caps).
-        # Was broken for most of run5 (content_weight=1.0 clamped boost to no-op).
-        cw_eval_interval = 2
-        if False and sw_at_cap and prev_stage_metric is not None and epoch % cw_eval_interval == 0:
-            # CW boost driven by AR metric plateau (same signal as PF/SW).
-            if prev_stage_metric > 0:
-                cw_improvement = (stage_metric - prev_stage_metric) / max(prev_stage_metric, 0.01)
-            else:
-                cw_improvement = stage_metric
-            boost = compute_cw_boost(1.0, 1.0 - cw_improvement, rate_threshold=0.05, max_boost=0.5)
-            old_cw = min(args.content_weight, 1.0 + cw_boost)
-            cw_boost += boost
-            new_cw = min(args.content_weight, 1.0 + cw_boost)
-            if new_cw > old_cw + 0.01:
-                print(f"  CW boost (AR plateau): {old_cw:.2f} -> {new_cw:.2f}")
-        elif prev_val_loss is not None and epoch % cw_eval_interval == 0:
-            # Fallback: CW driven by val_loss stall (pre-cap behavior).
-            boost = compute_cw_boost(prev_val_loss, avg_val_loss)
-            old_cw = min(args.content_weight, 1.0 + cw_boost)
-            cw_boost += boost
-            new_cw = min(args.content_weight, 1.0 + cw_boost)
-            if new_cw > old_cw + 0.01:
-                print(f"  Content weight: {old_cw:.2f} -> {new_cw:.2f} (boost +{boost:.2f}, improvement {(prev_val_loss - avg_val_loss) / prev_val_loss:.1%} over {cw_eval_interval} epochs)")
-            prev_val_loss = avg_val_loss
-        elif prev_val_loss is None:
-            prev_val_loss = avg_val_loss
+                print(f"  >>> Stage advanced to {current_stage} (ar_exact={ar_rate:.0%} for {args.stage_patience} epochs, lr→{restart_lr:.1e})")
 
         log_entry = {
             "epoch": epoch,
             "stage": current_stage,
             "train_loss": avg_train_loss,
-            "val_loss": avg_val_loss,
-            "val_exact_match": val_exact,
             "ar_exact": ar_exact,
             "ar_semantic": ar_semantic,
             "ar_xml_ok": ar_xml_ok,
             "ar_total": ar_total,
-            "val_cer": round(val_cer, 6),
-            "val_wer": round(val_wer, 6),
             "ar_cer": round(ar_cer, 6),
             "ar_wer": round(ar_wer, 6),
             "ar_buckets": ar_buckets,
             "lr": new_lr,
-            "content_weight": min(args.content_weight, 1.0 + cw_boost),
-            "pf_rate": round(effective_pf, 4),
             "global_step": global_step,
+            "wallclock": round(wallclock, 1),
+            "ar_train_frac": args.ar_train_frac,
         }
         log_entries.append(log_entry)
 
-        print(f"Epoch {epoch}: stage={current_stage} train={avg_train_loss:.4f} val={avg_val_loss:.4f} val_exact={val_exact:.2%} vCER={val_cer:.2%} vWER={val_wer:.2%} ar={ar_exact}/{ar_total}exact {ar_semantic}/{ar_total}sem {ar_xml_ok}/{ar_total}xml CER={ar_cer:.2%} WER={ar_wer:.2%} lr={new_lr:.2e} pf={effective_pf:.3f} sw={effective_sw:.1f}")
+        mode_tag = "AR" if args.ar_train_frac >= 1.0 else f"TF({1-args.ar_train_frac:.0%})"
+        print(f"Epoch {epoch}: train={avg_train_loss:.4f} ar={ar_exact}/{ar_total}exact {ar_semantic}/{ar_total}sem {ar_xml_ok}/{ar_total}xml CER={ar_cer:.2%} WER={ar_wer:.2%} lr={new_lr:.2e} [{mode_tag}]")
 
-        # Save best checkpoints — two tracks:
-        #   best.pt    — best val_loss (teacher-forced mastery, any stage)
-        #   best_ar.pt — best AR exact (generation quality, stages 4+ only)
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, args.output_dir, "best.pt",
-                            stage=current_stage, stage_good_epochs=stage_good_epochs,
-                            cw_boost=cw_boost, pf_boost=pf_boost, sw_boost=sw_boost, prev_val_loss=prev_val_loss,
-                            best_ar_exact=best_ar_exact)
-            print(f"  -> New best val (stage {current_stage}: val={avg_val_loss:.4f})")
-        if run_ar and (ar_exact > best_ar_exact or (ar_exact == best_ar_exact and avg_val_loss < best_val_loss)):
+        # Save best checkpoint — best AR exact.
+        if ar_exact > best_ar_exact or (ar_exact == best_ar_exact and ar_cer < best_val_loss):
             best_ar_exact = ar_exact
-            save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, args.output_dir, "best_ar.pt",
-                            stage=current_stage, stage_good_epochs=stage_good_epochs,
-                            cw_boost=cw_boost, pf_boost=pf_boost, sw_boost=sw_boost, prev_val_loss=prev_val_loss,
-                            best_ar_exact=best_ar_exact)
-            print(f"  -> New best AR (stage {current_stage}: ar={ar_exact}/{ar_total} val={avg_val_loss:.4f})")
+            best_val_loss = ar_cer  # repurpose for "best AR CER"
+            save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, args.output_dir, "best.pt",
+                            stage=current_stage, stage_good_epochs=0,
+                            best_ar_exact=best_ar_exact, wallclock=current_wallclock(),
+                            ar_train_frac=args.ar_train_frac)
+            print(f"  -> New best (ar={ar_exact}/{ar_total} CER={ar_cer:.2%})")
 
         # Save periodic checkpoint.
         if epoch % args.save_every == 0:
             save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, args.output_dir, f"epoch_{epoch}.pt",
-                            stage=current_stage, stage_good_epochs=stage_good_epochs,
-                            cw_boost=cw_boost, pf_boost=pf_boost, sw_boost=sw_boost, prev_val_loss=prev_val_loss,
-                            best_ar_exact=best_ar_exact)
+                            stage=current_stage, stage_good_epochs=0,
+                            best_ar_exact=best_ar_exact, wallclock=current_wallclock(),
+                            ar_train_frac=args.ar_train_frac)
 
-        # Epoch complete — atexit not needed until next epoch starts.
+        # Epoch complete — commit wallclock delta.
+        wallclock = current_wallclock()
         atexit_state["active"] = False
 
         # Clean up interrupt checkpoints after successful epoch completion.
@@ -914,6 +632,17 @@ def train(args):
         # Save training log.
         with open(os.path.join(args.output_dir, "training_log.json"), "w") as f:
             json.dump(log_entries, f, indent=2)
+
+        # Stop signal received during eval — exit now, don't start next epoch.
+        if sig_state["stop"]:
+            save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss,
+                            args.output_dir, interrupt_filename(), epoch_complete=True,
+                            stage=current_stage, stage_good_epochs=0,
+                            best_ar_exact=best_ar_exact, wallclock=current_wallclock(),
+                            ar_train_frac=args.ar_train_frac)
+            print(f"Exiting cleanly (signal caught during eval).")
+            atexit_state["active"] = False
+            return model
 
     print(f"\nTraining complete. Best val_loss: {best_val_loss:.4f}")
     atexit_state["active"] = False
@@ -932,7 +661,10 @@ def validate(model, loader, criterion, vocab_size, device, fp16,
     # ── Phase 1: Forward pass + fill GPU buffers. Zero sync in loop. ─────
     # Pre-allocate full pred/tgt buffers on GPU (int16, ~830MB for 135K×1536).
     # No gradients during validation so plenty of VRAM.
-    n_val = len(loader) * loader.batch_size  # respects sampler cap, not full dataset
+    if loader.batch_size is not None:
+        n_val = len(loader) * loader.batch_size
+    else:
+        n_val = sum(len(b) for b in loader.batch_sampler)
     max_seq = 1536  # matches max_tgt_len in run.sh — covers all padded batch lengths
     torch.cuda.empty_cache()  # free reserved-but-unallocated memory before big allocation
     all_preds = torch.zeros(n_val, max_seq, dtype=torch.int16, device=device)
@@ -1657,6 +1389,9 @@ def batched_triton_levenshtein(a_list, b_list, device):
         if na == 0 or nb == 0:
             results[idx] = max(na, nb)
             continue
+        if max(na, nb) > 8192:
+            results[idx] = max(na, nb)
+            continue
         block = _next_pow2(max(na, nb))
         groups.setdefault(block, []).append(idx)
 
@@ -1837,186 +1572,182 @@ def weighted_content_loss(log_probs, tgt_labels, vocab_size, content_weight, str
 
 @torch.no_grad()
 def autoregressive_eval(model, sp, n_samples=10,
-                        augment_bin="/app/augment", data_dir="data",
+                        val_dataset=None,
                         max_src_len=1152, max_tgt_len=1536,
-                        output_dir=None, epoch=0, stage=None,
-                        device="cuda", gpu_decoder=None):
-    """Run greedy autoregressive decoding on fresh augmented haiku samples.
+                        output_dir=None, epoch=0,
+                        device="cuda", gpu_decoder=None,
+                        atexit_state=None, sig_state=None):
+    """AR validation: decode from val dataset in chunks, resumable via atexit_state.
 
-    Uses the augment binary to generate fresh samples matching the current
-    stage's type and difficulty. Writes per-sample results to
-    output_dir/ar_inferences/epoch_N.jsonl for failure analysis.
+    Processes AR_CHUNK samples at a time. After each chunk, saves progress
+    to atexit_state so interrupted eval can resume.
     """
+    AR_CHUNK = 50
     model.eval()
-
-    # Generate fresh samples matching current stage difficulty.
-    seed = int(time.time()) % 2**32
-    if stage is None:
-        stage = max(HAIKU_STAGES.keys())
-    params = HAIKU_STAGES[stage]
-    # Generate enough samples to guarantee n_samples across all token-length bins.
-    # Over-request by 10x to give the stratifier enough samples per bin.
-    aug = max(params["aug_ratio"], 1)
-    needed_haiku = max(1, (n_samples * 10 // aug) + 5)
-    corpus_est = 50000 if params.get("type", "all") != "all" else 100000
-    sample_pct = max(0.01, needed_haiku / (corpus_est / 100))
-
-    # Find tokenizer path (same directory as augment_bin or from data_dir).
-    tok_path = os.path.join(output_dir, "tokenizer.model") if output_dir else None
-    cmd = [
-        augment_bin,
-        "-dir", os.path.join(data_dir, "haiku"),
-        "-sample-pct", f"{sample_pct:.4f}",
-        "-aug-ratio", str(params["aug_ratio"]),
-        "-special-prob", str(params["special_prob"]),
-        "-type", str(params.get("type", "all")),
-        "-shorten-pct", str(params.get("shorten_pct", 0)),
-        "-compact-pct", str(params.get("compact_pct", 50)),
-        "-seed", str(seed),
-    ]
-    if tok_path and os.path.exists(tok_path):
-        cmd.extend(["-tokenizer", tok_path])
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    records = []
-    for line in result.stdout.strip().split("\n"):
-        if line.strip():
-            records.append(json.loads(line))
-
-    # Batched greedy AR decode on GPU — all samples in parallel.
-    # Tokenize all records, filter by length, shuffle, then take n_samples.
-    # Shuffle ensures balanced length distribution from stratified augment output.
-    # Parallel tokenization — sp.encode is CPU-bound
-    from multiprocessing.pool import ThreadPool
-    def _tok(r):
-        r["_src_ids"] = sp.encode(r["input"])
-        return r
-    with ThreadPool(12) as pool:
-        records = list(pool.map(_tok, records))
-    eligible = [r for r in records if len(r["_src_ids"]) <= max_src_len]
-    random.shuffle(eligible)
-    samples = eligible[:n_samples]
-
-    if len(samples) < n_samples:
-        print(f"  AR eval: only {len(samples)}/{n_samples} samples fit context "
-              f"({len(records)} generated, {len(records) - len(samples)} skipped)", flush=True)
-    src_ids_list = [r["_src_ids"] for r in samples]
-    targets = [r["target"] for r in samples]
-
-    print(f"AR eval: fanned-out decode of {len(samples)} samples on {device}...", flush=True)
-    # Batch src_ids into a padded tensor for ar_decode_parallel
     from ar_parallel import ar_decode_parallel
-    _max_src = max(len(ids) for ids in src_ids_list)
-    _src_t = torch.zeros(len(src_ids_list), _max_src, dtype=torch.long, device=device)
-    _src_mask = torch.ones(len(src_ids_list), _max_src, dtype=torch.bool, device=device)
-    for i, ids in enumerate(src_ids_list):
-        _src_t[i, :len(ids)] = torch.tensor(ids, dtype=torch.long)
-        _src_mask[i, :len(ids)] = False
-    all_pred_ids = ar_decode_parallel(model, _src_t, sp, max_len=max_tgt_len,
-                                      src_key_padding_mask=_src_mask)
-    print(f"  Decode complete, scoring...", flush=True)
 
-    # Score each sample.
+    # Deterministic sample selection (epoch-based seed for reproducibility on resume).
+    n_avail = len(val_dataset)
+    n = min(n_samples, n_avail)
+    g = torch.Generator()
+    g.manual_seed(epoch * 7777 + 42)
+    indices = torch.randperm(n_avail, generator=g)[:n]
+
+    # Resume: skip already-evaluated samples.
+    start_idx = 0
+    resumed_results = None
+    if atexit_state and atexit_state.get("val_state"):
+        vs = atexit_state["val_state"]
+        if vs.get("epoch") == epoch and vs.get("n_samples") == n:
+            start_idx = vs.get("completed", 0)
+            resumed_results = vs.get("results")
+            if start_idx > 0:
+                print(f"  Resuming AR eval from sample {start_idx}/{n}", flush=True)
+
+    # Accumulators.
     exact_count = 0
     semantic_count = 0
     xml_ok_count = 0
-    total = len(samples)
-    ne_cer_chars = 0
     total_cer_edits = 0
-    ne_wer_words = 0
+    ne_cer_chars = 0
     total_wer_edits = 0
+    ne_wer_words = 0
     inferences = []
+    src_lens_list = []
 
-    # Batch decode ALL predictions to strings in one pass (one bulk GPU→CPU transfer).
-    if gpu_decoder is not None:
-        all_pred_texts = [gpu_decoder.decode(ids) for ids in all_pred_ids]
-    else:
-        all_pred_texts = [sp.decode(ids) for ids in all_pred_ids]
+    # Restore accumulated results from resume.
+    if resumed_results:
+        exact_count = resumed_results["exact"]
+        semantic_count = resumed_results["semantic"]
+        xml_ok_count = resumed_results["xml_ok"]
+        total_cer_edits = resumed_results["cer_edits"]
+        ne_cer_chars = resumed_results["cer_chars"]
+        total_wer_edits = resumed_results["wer_edits"]
+        ne_wer_words = resumed_results["wer_words"]
 
-    # All CPU scoring (regex, XML parse, exact check) — GPU is free.
-    nonexact_indices = []
-    for i, (pred, target) in enumerate(zip(all_pred_texts, targets)):
-        norm_pred = unicodedata.normalize("NFKD", re.sub(r"\s+", " ", pred.strip()))
-        norm_tgt = unicodedata.normalize("NFKD", re.sub(r"\s+", " ", target.strip()))
-        exact = norm_pred == norm_tgt
+    print(f"AR eval: {n} samples in chunks of {AR_CHUNK} on {device}...", flush=True)
 
-        try:
-            ET.fromstring(pred.strip())
-            xml_ok = True
-        except ET.ParseError:
-            xml_ok = False
+    for chunk_start in range(start_idx, n, AR_CHUNK):
+        chunk_end = min(chunk_start + AR_CHUNK, n)
+        chunk_indices = indices[chunk_start:chunk_end]
+        chunk_data = [val_dataset[i] for i in chunk_indices]
 
-        semantic = False
-        if not exact and xml_ok:
-            semantic = xml_semantically_equal(pred.strip(), target.strip())
+        # Decode targets/inputs to strings.
+        chunk_src_ids = [s["src_ids"].tolist() for s in chunk_data]
+        chunk_targets = [sp.decode(s["tgt_labels"][:-1].tolist()) for s in chunk_data]
+        chunk_inputs = [sp.decode(ids) for ids in chunk_src_ids]
 
-        char_ref_len = len(norm_tgt)
+        # Pad and AR decode.
+        _max_src = max(len(ids) for ids in chunk_src_ids)
+        _src_t = torch.zeros(len(chunk_src_ids), _max_src, dtype=torch.long, device=device)
+        _src_mask = torch.ones(len(chunk_src_ids), _max_src, dtype=torch.bool, device=device)
+        for i, ids in enumerate(chunk_src_ids):
+            _src_t[i, :len(ids)] = torch.tensor(ids, dtype=torch.long)
+            _src_mask[i, :len(ids)] = False
 
-        if exact:
-            exact_count += 1
-            char_edits = 0
-            wer_chars = 0
-        elif semantic:
-            semantic_count += 1
-            char_edits = 0
-            wer_chars = 0
+        with torch.no_grad():
+            pred_ids = ar_decode_parallel(model, _src_t, sp, max_len=max_tgt_len,
+                                          src_key_padding_mask=_src_mask)
+
+        # Decode predictions to strings.
+        if gpu_decoder is not None:
+            pred_texts = [gpu_decoder.decode(ids) for ids in pred_ids]
         else:
-            nonexact_indices.append(i)
-            ne_cer_chars += char_ref_len
-            ne_wer_words += char_ref_len
-            char_edits = -1
-            wer_chars = char_weighted_wer(norm_pred.split(), norm_tgt.split())
-            total_wer_edits += wer_chars
+            pred_texts = [sp.decode(ids) for ids in pred_ids]
 
-        if xml_ok:
-            xml_ok_count += 1
+        # Score each sample in chunk.
+        chunk_nonexact = []
+        for i, (pred, target) in enumerate(zip(pred_texts, chunk_targets)):
+            norm_pred = unicodedata.normalize("NFKD", re.sub(r"\s+", " ", pred.strip()))
+            norm_tgt = unicodedata.normalize("NFKD", re.sub(r"\s+", " ", target.strip()))
+            exact = norm_pred == norm_tgt
 
-        inferences.append({
-            "input": samples[i]["input"],
-            "expected": target,
-            "predicted": pred,
-            "exact": exact,
-            "semantic": semantic,
-            "xml_ok": xml_ok,
-            "cer": -1.0,
-            "wer": round(wer_chars / max(char_ref_len, 1), 6),
-            "char_edits": char_edits,
-            "wer_chars": wer_chars,
-        })
+            try:
+                ET.fromstring(pred.strip())
+                xml_ok = True
+            except ET.ParseError:
+                xml_ok = False
 
-    # Batched Triton CER for non-exact pairs — GPU decode + Levenshtein.
-    if nonexact_indices and gpu_decoder is not None:
-        nonexact_pred_bytes = [gpu_normalize_ws(gpu_decoder.decode_to_bytes(
-            list(all_pred_ids[i]))) for i in nonexact_indices]
-        nonexact_tgt_bytes = [gpu_normalize_ws(gpu_decoder.decode_to_bytes(
-            sp.encode(targets[i])[:max_tgt_len])) for i in nonexact_indices]
-        distances = batched_triton_levenshtein(nonexact_pred_bytes, nonexact_tgt_bytes,
-                                               gpu_decoder.device)
-        for idx, dist in zip(nonexact_indices, distances):
-            inferences[idx]["char_edits"] = dist
-            ref = max(len(re.sub(r"\s+", " ", targets[idx].strip())), 1)
-            inferences[idx]["cer"] = round(dist / ref, 6)
-            total_cer_edits += dist
+            semantic = False
+            if not exact and xml_ok:
+                semantic = xml_semantically_equal(pred.strip(), target.strip())
 
-    # Fill CER for exact matches.
+            char_ref_len = len(norm_tgt)
+            wer_chars = 0
+
+            if exact:
+                exact_count += 1
+            elif semantic:
+                semantic_count += 1
+            else:
+                chunk_nonexact.append(i)
+                ne_cer_chars += char_ref_len
+                ne_wer_words += char_ref_len
+                wer_chars = char_weighted_wer(norm_pred.split(), norm_tgt.split())
+                total_wer_edits += wer_chars
+
+            if xml_ok:
+                xml_ok_count += 1
+
+            src_lens_list.append(len(chunk_src_ids[i]))
+            inferences.append({
+                "input": chunk_inputs[i],
+                "expected": target,
+                "predicted": pred,
+                "exact": exact,
+                "semantic": semantic,
+                "xml_ok": xml_ok,
+                "cer": 0.0 if exact or semantic else -1.0,
+                "wer": round(wer_chars / max(char_ref_len, 1), 6),
+            })
+
+        # Batched Triton CER for non-exact pairs in this chunk.
+        if chunk_nonexact and gpu_decoder is not None:
+            ne_pred_bytes = [gpu_normalize_ws(gpu_decoder.decode_to_bytes(
+                list(pred_ids[i]))) for i in chunk_nonexact]
+            ne_tgt_bytes = [gpu_normalize_ws(gpu_decoder.decode_to_bytes(
+                sp.encode(chunk_targets[i])[:max_tgt_len])) for i in chunk_nonexact]
+            distances = batched_triton_levenshtein(ne_pred_bytes, ne_tgt_bytes, gpu_decoder.device)
+            for ci, dist in zip(chunk_nonexact, distances):
+                global_i = len(inferences) - len(pred_texts) + ci
+                ref = max(len(re.sub(r"\s+", " ", chunk_targets[ci].strip())), 1)
+                inferences[global_i]["cer"] = round(dist / ref, 6)
+                total_cer_edits += dist
+
+        completed = chunk_end
+        print(f"  AR eval {completed}/{n}: {exact_count} exact, {semantic_count} sem, {xml_ok_count} xml", flush=True)
+
+        # Save progress for resumability.
+        if atexit_state is not None:
+            atexit_state["val_state"] = {
+                "epoch": epoch, "n_samples": n, "completed": completed,
+                "results": {
+                    "exact": exact_count, "semantic": semantic_count, "xml_ok": xml_ok_count,
+                    "cer_edits": total_cer_edits, "cer_chars": ne_cer_chars,
+                    "wer_edits": total_wer_edits, "wer_words": ne_wer_words,
+                },
+            }
+
+        # Check stop signal.
+        if sig_state and sig_state["stop"]:
+            print(f"  AR eval interrupted at {completed}/{n}", flush=True)
+            break
+
+    # Fill CER for exact/semantic matches.
     for inf in inferences:
         if inf["cer"] < 0:
             inf["cer"] = 0.0
 
+    total = len(inferences) + start_idx  # total evaluated including resumed
     overall_cer = total_cer_edits / max(ne_cer_chars, 1)
     overall_wer = total_wer_edits / max(ne_wer_words, 1)
 
-    # Print per-sample results.
-    for i, inf in enumerate(inferences):
-        status = "exact" if inf["exact"] else ("semantic" if inf["semantic"] else ("xml_ok" if inf["xml_ok"] else "FAIL"))
-        detail = "" if inf["exact"] else f" cer={inf['cer']:.1%} wer={inf['wer']:.1%}"
-        print(f"  AR eval {i+1}/{total}: {len(src_ids_list[i])}→{len(all_pred_ids[i])} tokens [{status}]{detail}", flush=True)
-
-    # Per-bucket AR stats by source token length.
+    # Per-bucket stats.
     TOKEN_BINS = [(0, 64), (64, 128), (128, 256), (256, 384), (384, 512), (512, 768), (768, 1024), (1024, 9999)]
     BIN_NAMES = ["0-63", "64-127", "128-255", "256-383", "384-511", "512-767", "768-1023", "1024+"]
     ar_bucket_data = {}
     for i, inf in enumerate(inferences):
-        src_len = len(src_ids_list[i])
+        src_len = src_lens_list[i] if i < len(src_lens_list) else 0
         for (lo, hi), name in zip(TOKEN_BINS, BIN_NAMES):
             if lo <= src_len < hi:
                 if name not in ar_bucket_data:
@@ -2025,7 +1756,8 @@ def autoregressive_eval(model, sp, n_samples=10,
                 if inf["exact"]:
                     ar_bucket_data[name]["exact"] += 1
                 break
-    print(f"AR eval done: {exact_count}/{total} exact, {semantic_count}/{total} semantic, {xml_ok_count}/{total} xml_ok, CER={overall_cer:.2%}, WER={overall_wer:.2%}", flush=True)
+
+    print(f"AR eval done: {exact_count}/{n} exact, {semantic_count}/{n} semantic, {xml_ok_count}/{n} xml_ok, CER={overall_cer:.2%}, WER={overall_wer:.2%}", flush=True)
     if ar_bucket_data:
         print(f"  AR by src tokens:   {'Bucket':>10} {'Count':>6} {'Exact%':>7}", flush=True)
         for name in BIN_NAMES:
@@ -2042,7 +1774,7 @@ def autoregressive_eval(model, sp, n_samples=10,
             for inf in inferences:
                 f.write(json.dumps(inf) + "\n")
 
-    return exact_count, semantic_count, xml_ok_count, total, overall_cer, overall_wer, ar_bucket_data
+    return exact_count, semantic_count, xml_ok_count, n, overall_cer, overall_wer, ar_bucket_data
 
 
 def interrupt_filename():
@@ -2050,7 +1782,7 @@ def interrupt_filename():
     return f"interrupt_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pt"
 
 
-def save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, output_dir, filename, epoch_complete=True, epoch_step=0, epoch_seed=None, stage=1, stage_good_epochs=0, training_done=False, val_state=None, train_loss=0.0, cw_boost=0.0, pf_boost=0.0, sw_boost=0.0, prev_val_loss=None, best_ar_exact=0):
+def save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, best_val_loss, output_dir, filename, epoch_complete=True, epoch_step=0, epoch_seed=None, stage=1, stage_good_epochs=0, training_done=False, val_state=None, train_loss=0.0, best_ar_exact=0, wallclock=0.0, ar_train_frac=1.0):
     path = os.path.join(output_dir, filename)
     ckpt = {
         "epoch": epoch,
@@ -2063,11 +1795,9 @@ def save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, bes
         "stage": stage,
         "stage_good_epochs": stage_good_epochs,
         "train_loss": train_loss,
-        "cw_boost": cw_boost,
-        "pf_boost": pf_boost,
-        "sw_boost": sw_boost,
-        "prev_val_loss": prev_val_loss,
         "best_ar_exact": best_ar_exact,
+        "wallclock": wallclock,
+        "ar_train_frac": ar_train_frac,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
@@ -2110,39 +1840,18 @@ def main():
     parser.add_argument("--ar-eval-samples", type=int, default=50,
                         help="Number of samples for autoregressive eval per epoch")
 
-    # Loss weighting.
-    parser.add_argument("--content-weight", type=float, default=10.0,
-                        help="Weight multiplier for content tokens (numbers, strings). "
-                             "Structural XML tokens (0..structural-max-id) stay at 1.0.")
-    parser.add_argument("--structural-max-id", type=int, default=15,
-                        help="Token IDs 0..N are considered structural (XML tags, special tokens)")
-    parser.add_argument("--structural-weight", type=float, default=1.0,
-                        help="Weight multiplier for structural tokens. Prevents copy mechanism "
-                             "from dominating generation head. Try 5.0-10.0.")
-    parser.add_argument("--token-noise", type=float, default=0.15,
-                        help="Fallback probability of replacing a content token (used if stage not in PF_NOISE_SCHEDULE)")
-    parser.add_argument("--professor-forcing", action="store_true", default=True,
-                        help="Use model predictions instead of random tokens for noise (requires --token-noise > 0)")
-    parser.add_argument("--pf-iterations", type=int, default=1,
-                        help="Number of iterative PF passes (1=standard, 3+=cascading error approximation)")
     parser.add_argument("--ar-train-frac", type=float, default=0.0,
-                        help="Fraction of training batches using full AR decode as input (0.0=off, 0.1=10%%)")
-    parser.add_argument("--skip-data-gen", action="store_true", default=False,
-                        help="Skip val/train data generation on first epoch (reuse existing data)")
+                        help="Fraction of training batches using full AR decode as input (0.0=TF, 1.0=all AR)")
+    parser.add_argument("--override-ar-frac", type=float, default=None,
+                        help="Force this ar_train_frac on resume (overrides checkpoint)")
     parser.add_argument("--force-resume", action="store_true", default=False,
                         help="Resume from specified checkpoint even if newer ones exist")
 
-    # Haiku augmentation pipeline.
-    parser.add_argument("--augment-bin", type=str, default="/app/augment",
-                        help="Path to Go augment binary")
-    parser.add_argument("--dict-word-pct", type=float, default=None,
-                        help="Override dict-word-pct for all stages (0=shuffle only, 50=default, 100=all dict words)")
+    # Curriculum.
     parser.add_argument("--stage", type=int, default=1,
-                        help="Starting curriculum stage (1-6)")
-    parser.add_argument("--max-stage", type=int, default=6,
-                        help="Maximum curriculum stage (auto-advance stops here)")
-    parser.add_argument("--force-stage", type=int, default=None,
-                        help="Override checkpoint stage on resume (one-time use, do NOT put in run.sh)")
+                        help="Starting curriculum stage (1=clean, 2=+corrupt)")
+    parser.add_argument("--max-stage", type=int, default=2,
+                        help="Maximum curriculum stage")
     parser.add_argument("--stage-patience", type=int, default=2,
                         help="Consecutive epochs above threshold before advancing")
 

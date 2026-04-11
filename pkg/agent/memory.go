@@ -19,6 +19,9 @@ import "nickandperla.net/transmutation/pkg/randtext"
 
 func (g *Generator) generateMemory() []string {
 	n := 4 + g.rng.IntN(3) // 4-6 entries
+	if g.Short {
+		n = g.rng.IntN(3) // 0-2 entries
+	}
 	entries := make([]string, n)
 	for i := range entries {
 		if g.augment {

@@ -35,9 +35,10 @@ import (
 )
 
 type TrainingPair struct {
-	Input  string `json:"input"`
-	Target string `json:"target"`
-	augTag string // internal: "clean", "shortened", "compacted", "corrupted", "truncated", "augmented"
+	Input      string `json:"input"`
+	Target     string `json:"target"`
+	AugType    string `json:"aug_type"`
+	Complexity int    `json:"complexity"`
 }
 
 var specialProb float64
@@ -80,7 +81,7 @@ func main() {
 	flag.IntVar(&maxChars, "max-chars", 4769, "maximum input character length (0 = no filter, default fits 1152 tokens)")
 	flag.StringVar(&sampleType, "type", "all", "sample type filter: answer, tool, or all")
 	var maxComplexity int
-	flag.IntVar(&maxComplexity, "max-complexity", 0, "filter samples above this complexity score (1-10, 0=no filter)")
+	flag.IntVar(&maxComplexity, "max-complexity", 0, "filter samples above this complexity score (1-8, 0=no filter)")
 	var tokenizerPath string
 	flag.StringVar(&tokenizerPath, "tokenizer", "", "path to sentencepiece .model file for token-length binning")
 	flag.Parse()
@@ -178,7 +179,7 @@ func main() {
 			var r result
 
 			// Natural sample — always emit the original.
-			sample.augTag = "clean"
+			sample.AugType = "clean"
 			r.pairs = append(r.pairs, sample)
 			r.natural++
 
@@ -188,18 +189,18 @@ func main() {
 			cRng := rand.New(rand.NewPCG(cSeed, cSeed^0xf00d))
 			if shortenPct > 0 && cRng.Float64()*100 < shortenPct {
 				if s, err := shortenSample(sample, cRng); err == nil {
-					s.augTag = "shortened"
+					s.AugType = "shortened"
 					r.pairs = append(r.pairs, s)
 				}
 			}
 			if compactPct > 0 && cRng.Float64()*100 < compactPct {
-				compacted := TrainingPair{Input: compactJSON(sample.Input), Target: sample.Target, augTag: "compacted"}
+				compacted := TrainingPair{Input: compactJSON(sample.Input), Target: sample.Target, AugType: "compacted"}
 				r.pairs = append(r.pairs, compacted)
 				r.compacted++
 			}
 			if truncatePct > 0 && cRng.Float64()*100 < truncatePct {
 				if t, err := truncateSample(sample, cRng); err == nil {
-					t.augTag = "truncated"
+					t.AugType = "truncated"
 					r.pairs = append(r.pairs, t)
 					r.truncated++
 				}
@@ -208,7 +209,7 @@ func main() {
 				corrupted := TrainingPair{
 					Input:  corrupt.Apply(sample.Input, corruptionConfig(cRng), cRng),
 					Target: sample.Target,
-					augTag: "corrupted",
+					AugType: "corrupted",
 				}
 				r.pairs = append(r.pairs, corrupted)
 				r.corrupted++
@@ -225,25 +226,25 @@ func main() {
 					continue
 				}
 				// Always emit the augmented variant as-is.
-				aug.augTag = "augmented"
+				aug.AugType = "augmented"
 				r.pairs = append(r.pairs, aug)
 				r.augmented++
 
 				// Emit additional variants alongside the original augmented.
 				if shortenPct > 0 && augRng.Float64()*100 < shortenPct {
 					if s, err := shortenSample(aug, augRng); err == nil {
-						s.augTag = "shortened"
+						s.AugType = "shortened"
 						r.pairs = append(r.pairs, s)
 					}
 				}
 				if compactPct > 0 && augRng.Float64()*100 < compactPct {
-					compacted := TrainingPair{Input: compactJSON(aug.Input), Target: aug.Target, augTag: "compacted"}
+					compacted := TrainingPair{Input: compactJSON(aug.Input), Target: aug.Target, AugType: "compacted"}
 					r.pairs = append(r.pairs, compacted)
 					r.compacted++
 				}
 				if truncatePct > 0 && augRng.Float64()*100 < truncatePct {
 					if t, err := truncateSample(aug, augRng); err == nil {
-						t.augTag = "truncated"
+						t.AugType = "truncated"
 						r.pairs = append(r.pairs, t)
 						r.truncated++
 					}
@@ -255,7 +256,7 @@ func main() {
 						corrupted := TrainingPair{
 							Input:  corrupt.Apply(aug.Input, corruptionConfig(cRng), cRng),
 							Target: aug.Target,
-							augTag: "corrupted",
+							AugType: "corrupted",
 						}
 						r.pairs = append(r.pairs, corrupted)
 						r.corrupted++
@@ -301,6 +302,7 @@ func main() {
 	defer bw.Flush()
 	enc := json.NewEncoder(bw)
 	for _, idx := range outputIndices {
+		allPairs[idx].Complexity = complexityScore(allPairs[idx].Input)
 		enc.Encode(allPairs[idx])
 	}
 	bw.Flush()
@@ -339,7 +341,8 @@ func isToolSample(input string) bool {
 	return string(raw) != "null"
 }
 
-// complexityScore assigns a 1-10 score based on structural complexity.
+// complexityScore assigns a 1-8 score based on structural complexity.
+// Tool and answer are mutually exclusive in the agent schema, so max is 8.
 //
 //	Memory:  0 items=0, 1-3=+1, 4+=+2
 //	Tool:    null=0, present=+2, 3+ args=+1, nested arg values=+1
@@ -350,8 +353,7 @@ func isToolSample(input string) bool {
 //
 //	1-3: flat answer, short, no/small memory
 //	4-5: markdown answer or basic tool, some memory
-//	6-7: code/tables or complex tool, full memory
-//	8-10: all of the above combined
+//	6-8: code/tables or complex tool, full memory, long
 func complexityScore(input string) int {
 	score := 1 // base
 
@@ -416,8 +418,8 @@ func complexityScore(input string) int {
 		score++
 	}
 
-	if score > 10 {
-		score = 10
+	if score > 8 {
+		score = 8
 	}
 	return score
 }
@@ -706,7 +708,7 @@ func stratifiedSample(samples []TrainingPair, total int, rng *rand.Rand, sp *sen
 				break
 			}
 		}
-		at, ok := augIdx[samples[idx].augTag]
+		at, ok := augIdx[samples[idx].AugType]
 		if !ok {
 			at = 0 // default to "clean" if untagged
 		}

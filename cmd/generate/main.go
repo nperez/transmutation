@@ -46,6 +46,7 @@ type TrainingPair struct {
 
 var stage int
 var augmentPct float64
+var shortSamples bool
 
 func main() {
 	var (
@@ -66,6 +67,7 @@ func main() {
 	flag.BoolVar(&toStdout, "stdout", false, "write JSONL to stdout instead of files")
 	flag.IntVar(&stage, "stage", 0, "curriculum stage (1-5); 0 = legacy random JSON")
 	flag.BoolVar(&wrapStdin, "wrap", false, "read JSON from stdin, convert to JSONL training pairs on stdout")
+	flag.BoolVar(&shortSamples, "short", false, "generate short samples (40-180 tokens, simple answers only)")
 	var rejectFile string
 	flag.StringVar(&rejectFile, "reject-file", "", "write rejected raw lines to this file (one per line)")
 	var mixPct float64
@@ -238,7 +240,7 @@ func generateToWriter(w io.Writer, count int, baseSeed uint64, generated *atomic
 // generateAgentPair produces a training pair using the agent response schema.
 func generateAgentPair(rng *rand.Rand) TrainingPair {
 	augment := augmentPct > 0 && rng.Float64()*100 < augmentPct
-	gen := agent.NewGenerator(rng, agent.Stage(stage), augment)
+	gen := agent.NewGenerator(rng, agent.Stage(stage), augment, shortSamples)
 	cleanJSON, xmlOut := gen.Generate()
 
 	corrCfg := stageCorruptionConfig(rng)

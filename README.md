@@ -372,6 +372,91 @@ Phase transition 3x faster than previous runs due to balanced length distributio
 - **fp16 stability requires NormedInProj + QKNormCrossAttention** — non-negotiable for Mamba 3. Without both, NaN within 6 epochs
 - **Copy mechanism is harmful with RoPE** — Mamba 3 doesn't need it and the copy gate collapses training dynamics
 
+## Run 6 Results
+
+Run 6 tested whether pre-generated data + separated training phases (teacher forcing then autoregressive) could break past the 45% AR holdout ceiling from run 5. Same hardware (RTX 2060 6GB), same architecture (Mamba 3, 384d, 6+6 layers, ~25M params).
+
+### What Changed from Run 5
+
+- **Pre-generated dataset** — all training data generated and tokenized once upfront (`prepare_data.py`), stored as `dataset.pt`. Eliminates per-epoch data generation overhead.
+- **Logit soft cap (8.0)** — `cap * tanh(logits / cap)` applied in `decode()`, borrowed from Gemma 2. Prevents fp16 NaN from tied embedding weight scaling inflating logits to [-93, +386].
+- **BucketedBatchSampler** — stratified by `max(src_len, tgt_len)` with batch size scaling inversely with bucket max length. Equal representation across length buckets.
+- **Simplified curriculum** — 2 stages (clean only, then +corrupt) vs run 5's 6 stages.
+- **Removed** copy mechanism, PF noise schedule, content/structural weight boosting, 6-stage curriculum.
+
+### Training Phases
+
+**Phase 1: Full AR (epochs 1-16)**
+100% AR decode from step 1, no teacher forcing. Hypothesis: skip the TF trap entirely.
+
+Result: loss dropped from 7.87 to 4.37 over 16 epochs but zero AR exact, zero valid XML, CER stuck at 440-500%. The model couldn't bootstrap from its own garbage outputs. Abandoned.
+
+**Phase 2: Teacher Forcing (epochs 17-32)**
+Switched to 0% AR (pure TF). 6x faster training (5.9 it/s vs 0.5 it/s).
+
+| Epoch | Train Loss | CER | WER |
+|-------|-----------|-----|-----|
+| 17 | 3.17 | 460% | 566% |
+| 20 | 1.10 | 206% | 303% |
+| 23 | 0.97 | 133% | 210% |
+| 28 | 0.24 | 12.2% | 11.0% |
+| 29 | 0.18 | **0.86%** | 1.7% |
+| 32 | 0.17 | 6.8% | 6.6% |
+
+TF loss floored at ~0.17. CER best was 0.86% (epoch 29) but zero AR exact, zero valid XML across all TF epochs. CER regressed after epoch 29 (0.86% -> 4.8% -> 6.8%), suggesting TF overfitting was degrading AR quality.
+
+**Phase 3: Full AR at low LR (epoch 30, from epoch 29 checkpoint)**
+Switched to 100% AR with lr=2e-5 (10x lower than TF phase). Hypothesis: low LR prevents the feedback spiral.
+
+Result: loss bounded at 5-8 (no spiral), but not learning. Batch losses uncorrelated with sequence length — driven by structural complexity of the content, not length. Model either nailed the structure (loss ~0.001) or completely failed (loss ~8.0), regardless of sequence length.
+
+### Inference Analysis (epoch 29 checkpoint)
+
+GPU inference on 10 unseen samples: **4/10 valid XML, 0/10 exact match**.
+
+Failure patterns — all structural, not content:
+- Missing root `<object>` tag
+- Flattened nested objects (pulls inner keys to top level)
+- Cross-contamination between fields (answer text leaking into thought)
+- Dropped array elements
+
+Content was nearly perfect — correct CDATA values, correct text, correct escaping. The model knows WHAT to output but fails at WHERE to put structural delimiters.
+
+### Key Metrics
+
+| Epoch | Stage | Train Loss | AR Exact | AR XML | CER | WER | LR | Mode |
+|-------|-------|-----------|----------|--------|-----|-----|----|------|
+| 16 | 1 | 4.52 | 0/110 | 0/110 | 450% | 556% | 2e-4 | AR |
+| 17 | 1 | 3.17 | 0/157 | 0/157 | 460% | 566% | 2e-4 | TF |
+| 20 | 1 | 1.10 | 0/452 | 0/452 | 206% | 303% | 2e-4 | TF |
+| 29 | 1 | 0.18 | 0/50 | 0/50 | 0.86% | 1.7% | 2e-4 | TF |
+| 32 | 1 | 0.17 | 0/50 | 0/50 | 6.8% | 6.6% | 2e-4 | TF |
+
+### Infrastructure Built
+
+- `gpu-infer` command — GPU inference with `--ckpt` override
+- `--override-ar-frac` flag — force AR training fraction on resume (checkpoint-authoritative by default, like `--override-lr`)
+- Phase transition auto-switch — `ar_train_frac` automatically set to 1.0 when first `ar_xml_ok > 0` (never triggered)
+- AR eval sample cap — 50 samples until first valid XML, then scale with loss
+- Levenshtein overflow guard — skip pairs > 8192 bytes with max-distance
+- Post-eval signal check — stops cleanly after epoch completion instead of starting next epoch
+- Batch/seq logging — `B=<batch_size> seq=<max_seq>` in progress lines for bucket visibility
+
+### What Didn't Work
+
+- **Full AR from scratch** — 16 epochs, loss plateau at 4.3, zero AR exact. Can't bootstrap.
+- **Pure TF then cold AR switch** — TF drove CER to 0.86% but zero valid XML. Switching to 100% AR at lr=2e-4 caused immediate loss explosion (1.15 -> 7.0 in 500 batches).
+- **Full AR at low LR (2e-5)** — prevented spiral but didn't learn. Loss bounded at 5-8 on complex structures.
+- **The phase transition approach** — gating AR switch on first valid XML never triggered because TF alone cannot produce valid AR output.
+
+### Conclusion
+
+Run 6 confirmed run 5's finding: the SSM decoder cannot reliably maintain structural state during autoregressive generation. The 45% AR holdout ceiling from run 5 is an architectural limitation, not a training regime problem.
+
+The SSM state is the only mechanism for tracking output structure (nesting depth, open tags, current context). When a structural token is wrong, the state is corrupted for all subsequent positions with no recovery path. A transformer decoder handles this via self-attention over all previous tokens — any position can "look back" and see the open tags. The SSM cannot.
+
+TF trains the model to produce perfect output given perfect context. AR training requires the model to recover from structural errors in its own output. The SSM's compressed state makes error recovery fundamentally harder than for attention-based decoders.
+
 ## Data Pipelines
 
 ### Haiku-First Pipeline (Run 2, current)

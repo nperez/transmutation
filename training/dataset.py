@@ -209,6 +209,52 @@ class TransmutationDataset(Dataset):
         }
 
 
+class PrebuiltDataset(Dataset):
+    """Loads pre-tokenized dataset.pt and filters by curriculum stage."""
+
+    def __init__(self, data_path, tokenizer_path):
+        data = torch.load(data_path, weights_only=True)
+        self._src_pad = data["src"]           # (N, max_src) int16
+        self._tgt_pad = data["tgt"]           # (N, max_tgt) int16
+        self._src_lens = data["src_lens"]     # (N,) int32
+        self._tgt_lens = data["tgt_lens"]     # (N,) int32
+        self._complexity = data["complexity"] # (N,) int8
+        self._corrupt = data["corrupt"]       # (N,) bool
+        sp = spm.SentencePieceProcessor()
+        sp.load(tokenizer_path)
+        self.bos_id = sp.bos_id()
+        self.eos_id = sp.eos_id()
+        self.pad_id = sp.pad_id()
+        self._active_indices = torch.arange(len(self._src_lens))
+        print(f"  PrebuiltDataset: {len(self._src_lens)} total samples loaded", flush=True)
+
+    def apply_stage_filter(self, max_src_tokens, max_complexity, allow_corrupt):
+        """Filter samples by stage criteria. Returns count of active samples."""
+        mask = (self._src_lens <= max_src_tokens)
+        mask &= (self._complexity <= max_complexity)
+        if not allow_corrupt:
+            mask &= ~self._corrupt
+        self._active_indices = mask.nonzero(as_tuple=True)[0]
+        return len(self._active_indices)
+
+    def __len__(self):
+        return len(self._active_indices)
+
+    def __getitem__(self, idx):
+        real_idx = self._active_indices[idx].item()
+        sl = self._src_lens[real_idx].item()
+        tl = self._tgt_lens[real_idx].item()
+        src_ids = self._src_pad[real_idx, :sl].long()
+        tgt_ids = self._tgt_pad[real_idx, :tl].long()
+        bos = torch.tensor([self.bos_id], dtype=torch.long)
+        eos = torch.tensor([self.eos_id], dtype=torch.long)
+        return {
+            "src_ids": src_ids,
+            "tgt_input": torch.cat([bos, tgt_ids]),
+            "tgt_labels": torch.cat([tgt_ids, eos]),
+        }
+
+
 def collate_fn(batch, pad_id=0):
     """Pad sequences to the same length within a batch."""
     src_ids = [item["src_ids"] for item in batch]
@@ -256,6 +302,82 @@ class ResumableRandomSampler(Sampler):
         return max(0, n - self.start_index)
 
 
+class BucketedBatchSampler(Sampler):
+    """Stratified length-bucketed batch sampler.
+
+    Equal samples per bucket (stratified), larger batch sizes for shorter
+    sequences (efficient padding), interleaved bucket order (diversity).
+    """
+
+    BINS = [0, 64, 128, 256, 384, 512, 768, 1024, 1152]
+
+    def __init__(self, dataset, seed, base_batch_size, max_src_len,
+                 start_index=0, max_samples=0):
+        self.seed = seed
+        src_lens = dataset._src_lens[dataset._active_indices]
+        tgt_lens = dataset._tgt_lens[dataset._active_indices]
+        # Bucket by max(src, tgt) — controls both padding waste and AR decode length.
+        seq_lens = torch.maximum(src_lens, tgt_lens)
+        n = len(seq_lens)
+        g = torch.Generator()
+        g.manual_seed(seed)
+
+        # Assign samples to length buckets.
+        n_bins = len(self.BINS)
+        bucket_ids = torch.zeros(n, dtype=torch.long)
+        for i in range(n_bins - 1):
+            mask = (seq_lens >= self.BINS[i]) & (seq_lens < self.BINS[i + 1])
+            bucket_ids[mask] = i
+        bucket_ids[seq_lens >= self.BINS[-1]] = n_bins - 1
+
+        # Collect per-bucket indices, compute batch sizes.
+        bucket_indices = []
+        bucket_batch_sizes = []
+        for b in range(n_bins):
+            indices = (bucket_ids == b).nonzero(as_tuple=True)[0]
+            if len(indices) == 0:
+                continue
+            bucket_max = self.BINS[min(b + 1, n_bins - 1)]
+            if bucket_max == 0:
+                bucket_max = self.BINS[1]
+            # Scale batch size inversely with sequence length.
+            # AR decode roughly doubles memory vs forward-only, so scale conservatively.
+            bs = max(base_batch_size, int(base_batch_size * max_src_len / bucket_max / 2))
+            # Shuffle within bucket.
+            perm = torch.randperm(len(indices), generator=g)
+            bucket_indices.append(indices[perm])
+            bucket_batch_sizes.append(bs)
+
+        # Stratify: cap each bucket to equal sample count.
+        n_active = len(bucket_indices)
+        if max_samples > 0 and n_active > 0:
+            per_bucket = max_samples // n_active
+        else:
+            per_bucket = max(len(b) for b in bucket_indices) if bucket_indices else 0
+
+        # Build batches per bucket with per-bucket cap.
+        self._batches = []
+        for indices, bs in zip(bucket_indices, bucket_batch_sizes):
+            capped = indices[:per_bucket]
+            for i in range(0, len(capped), bs):
+                self._batches.append(capped[i:i + bs].tolist())
+
+        # Shuffle batch order for diversity across buckets.
+        batch_perm = torch.randperm(len(self._batches), generator=g)
+        self._batches = [self._batches[i] for i in batch_perm]
+
+        # Skip batches for resume.
+        if start_index > 0:
+            self._batches = self._batches[start_index:]
+
+    def __iter__(self):
+        for batch in self._batches:
+            yield batch
+
+    def __len__(self):
+        return len(self._batches)
+
+
 def create_dataloader(
     data_dir: str,
     tokenizer_path: str,
@@ -268,8 +390,9 @@ def create_dataloader(
     epoch_seed: int | None = None,
     start_index: int = 0,
     max_samples: int = 0,
-    dataset: "TransmutationDataset | None" = None,
-) -> "tuple[DataLoader, int, TransmutationDataset]":
+    dataset: "TransmutationDataset | PrebuiltDataset | None" = None,
+    bucketed: bool = False,
+) -> "tuple[DataLoader, int, TransmutationDataset | PrebuiltDataset]":
     if dataset is None:
         dataset = TransmutationDataset(
             data_dir=data_dir,
@@ -277,14 +400,28 @@ def create_dataloader(
             max_src_len=max_src_len,
             max_tgt_len=max_tgt_len,
         )
+    if epoch_seed is None:
+        epoch_seed = torch.randint(0, 2**31, (1,)).item()
+
+    if bucketed and isinstance(dataset, PrebuiltDataset):
+        batch_sampler = BucketedBatchSampler(
+            dataset, seed=epoch_seed, base_batch_size=batch_size,
+            max_src_len=max_src_len, start_index=start_index,
+            max_samples=max_samples,
+        )
+        return DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            num_workers=num_workers,
+            collate_fn=lambda batch: collate_fn(batch, pad_id),
+            pin_memory=True,
+        ), epoch_seed, dataset
+
     sampler = None
     if shuffle:
-        if epoch_seed is None:
-            epoch_seed = torch.randint(0, 2**31, (1,)).item()
         sampler = ResumableRandomSampler(dataset, seed=epoch_seed,
                                          start_index=start_index, max_samples=max_samples)
     elif start_index > 0:
-        # Sequential skip: yield indices from start_index onward.
         sampler = list(range(start_index, len(dataset)))
     return DataLoader(
         dataset,

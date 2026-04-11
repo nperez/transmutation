@@ -27,7 +27,7 @@ func TestGenerateAllStages(t *testing.T) {
 	for stage := StageSimple; stage <= StageWrapper; stage++ {
 		for seed := range uint64(50) {
 			rng := rand.New(rand.NewPCG(seed, seed+1))
-			gen := NewGenerator(rng, stage, false)
+			gen := NewGenerator(rng, stage, false, false)
 			cleanJSON, xmlOut := gen.Generate()
 
 			// JSON must be valid.
@@ -79,7 +79,7 @@ func TestStageContentDistribution(t *testing.T) {
 	// Stage 1 should only produce answers (no tools).
 	for seed := range uint64(100) {
 		rng := rand.New(rand.NewPCG(seed, seed+1))
-		gen := NewGenerator(rng, StageSimple, false)
+		gen := NewGenerator(rng, StageSimple, false, false)
 		cleanJSON, _ := gen.Generate()
 
 		var obj map[string]any
@@ -94,7 +94,7 @@ func TestStageContentDistribution(t *testing.T) {
 	toolCount := 0
 	for seed := range uint64(200) {
 		rng := rand.New(rand.NewPCG(seed, seed+1))
-		gen := NewGenerator(rng, StageTools, false)
+		gen := NewGenerator(rng, StageTools, false, false)
 		cleanJSON, _ := gen.Generate()
 
 		var obj map[string]any
@@ -117,7 +117,7 @@ func TestAugmentedGeneration(t *testing.T) {
 	for stage := StageSimple; stage <= StageWrapper; stage++ {
 		for seed := range uint64(50) {
 			rng := rand.New(rand.NewPCG(seed, seed+1))
-			gen := NewGenerator(rng, stage, true)
+			gen := NewGenerator(rng, stage, true, false)
 			cleanJSON, xmlOut := gen.Generate()
 
 			var raw any

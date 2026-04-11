@@ -69,17 +69,20 @@ type Generator struct {
 	langs   map[string]languages.Generator
 	stage   Stage
 	augment bool
+	Short   bool
 }
 
 // NewGenerator creates an agent data generator for the given curriculum stage.
 // When augment is true, text fields use randomized dictionary words and
 // shuffled content with special character injection to prevent memorization.
-func NewGenerator(rng *rand.Rand, stage Stage, augment bool) *Generator {
+// When short is true, samples are constrained to ~40-180 tokens (simple answers,
+// short thoughts, minimal memory).
+func NewGenerator(rng *rand.Rand, stage Stage, augment bool, short bool) *Generator {
 	langMap := make(map[string]languages.Generator)
 	for _, g := range languages.All() {
 		langMap[g.Name()] = g
 	}
-	return &Generator{rng: rng, langs: langMap, stage: stage, augment: augment}
+	return &Generator{rng: rng, langs: langMap, stage: stage, augment: augment, Short: short}
 }
 
 // Generate produces a clean JSON string and its target XML.
@@ -129,6 +132,9 @@ func (g *Generator) generateResponse() *Response {
 }
 
 func (g *Generator) pickContent() contentKind {
+	if g.Short {
+		return contentSimpleAnswer
+	}
 	r := g.rng.Float64()
 	switch g.stage {
 	case StageSimple:

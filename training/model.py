@@ -181,6 +181,7 @@ class TransmutationModel(nn.Module):
         # Shared embedding (input and output share the same vocabulary).
         self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_id)
         self.pos_scale = math.sqrt(d_model)
+        self.logit_soft_cap = 8.0
 
         # Encoder: stack of Mamba3 blocks.
         self.encoder_layers = nn.ModuleList([
@@ -235,7 +236,9 @@ class TransmutationModel(nn.Module):
             x = layer(x, memory, memory_key_padding_mask)
 
         x = self.decoder_norm(x)
-        return self.output_proj(x)
+        logits = self.output_proj(x)
+        logits = self.logit_soft_cap * torch.tanh(logits / self.logit_soft_cap)
+        return logits
 
     def forward(
         self, src_ids: torch.Tensor, tgt_ids: torch.Tensor,
@@ -284,7 +287,9 @@ class TransmutationModel(nn.Module):
             for layer, state in zip(self.decoder_layers, states):
                 x, _ = layer.step(x, mem, state, memory_key_padding_mask=mask)
             x = self.decoder_norm(x)
-            nxt.copy_(self.output_proj(x[:, 0, :]).argmax(dim=-1))
+            logits = self.output_proj(x[:, 0, :])
+            logits = self.logit_soft_cap * torch.tanh(logits / self.logit_soft_cap)
+            nxt.copy_(logits.argmax(dim=-1))
 
         cache["step_fn"] = _step
 

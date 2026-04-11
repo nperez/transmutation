@@ -18,10 +18,14 @@ package agent
 import "nickandperla.net/transmutation/pkg/randtext"
 
 func (g *Generator) answerThought() string {
-	if g.augment {
-		return randtext.AugmentedThought(g.rng, 3, 6)
+	minSent, maxSent := 3, 6
+	if g.Short {
+		minSent, maxSent = 1, 2
 	}
-	return randtext.Thought(g.rng, 3, 6)
+	if g.augment {
+		return randtext.AugmentedThought(g.rng, minSent, maxSent)
+	}
+	return randtext.Thought(g.rng, minSent, maxSent)
 }
 
 func (g *Generator) toolThought(toolName string) string {
