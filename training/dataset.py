@@ -275,6 +275,94 @@ def collate_fn(batch, pad_id=0):
     }
 
 
+DIFFUSION_LENGTH_BUCKETS = [64, 128, 256, 384, 512, 768, 1024, 1536]
+
+
+def _assign_bucket(length):
+    """Assign a token length to the smallest bucket that fits it."""
+    for i, b in enumerate(DIFFUSION_LENGTH_BUCKETS):
+        if length <= b:
+            return i
+    return len(DIFFUSION_LENGTH_BUCKETS) - 1  # last bucket
+
+
+class PrebuiltDiffusionDataset(Dataset):
+    """Pre-tokenized dataset for diffusion training.
+
+    Returns raw token IDs without BOS/EOS (diffusion operates in continuous
+    embedding space, not autoregressive token space).
+    """
+
+    def __init__(self, data_path, tokenizer_path):
+        data = torch.load(data_path, weights_only=True)
+        self._src_pad = data["src"]           # (N, max_src) int16
+        self._tgt_pad = data["tgt"]           # (N, max_tgt) int16
+        self._src_lens = data["src_lens"]     # (N,) int32
+        self._tgt_lens = data["tgt_lens"]     # (N,) int32
+        self._complexity = data["complexity"] # (N,) int8
+        self._corrupt = data["corrupt"]       # (N,) bool
+        sp = spm.SentencePieceProcessor()
+        sp.load(tokenizer_path)
+        self.pad_id = sp.pad_id()
+        self._active_indices = torch.arange(len(self._src_lens))
+        print(f"  PrebuiltDiffusionDataset: {len(self._src_lens)} total samples loaded", flush=True)
+
+    def apply_stage_filter(self, max_src_tokens, max_complexity, allow_corrupt):
+        """Filter samples by stage criteria. Returns count of active samples."""
+        mask = (self._src_lens <= max_src_tokens)
+        mask &= (self._complexity <= max_complexity)
+        if not allow_corrupt:
+            mask &= ~self._corrupt
+        self._active_indices = mask.nonzero(as_tuple=True)[0]
+        return len(self._active_indices)
+
+    def __len__(self):
+        return len(self._active_indices)
+
+    def __getitem__(self, idx):
+        real_idx = self._active_indices[idx].item()
+        sl = self._src_lens[real_idx].item()
+        tl = self._tgt_lens[real_idx].item()
+        src_ids = self._src_pad[real_idx, :sl].long()
+        tgt_ids = self._tgt_pad[real_idx, :tl].long()
+        return {
+            "src_ids": src_ids,
+            "tgt_ids": tgt_ids,
+            "tgt_len": tl,
+        }
+
+
+def diffusion_collate_fn(batch, pad_id=0):
+    """Collate for diffusion: pad src to max in batch, pad tgt to bucket ceiling."""
+    src_ids = [item["src_ids"] for item in batch]
+    tgt_ids = [item["tgt_ids"] for item in batch]
+    tgt_lens = [item["tgt_len"] for item in batch]
+
+    # Pad source to max in batch
+    src_padded = torch.nn.utils.rnn.pad_sequence(src_ids, batch_first=True, padding_value=pad_id)
+    src_mask = (src_padded == pad_id)
+
+    # Pad target to bucket ceiling (all targets in batch get same length)
+    max_tgt = max(tgt_lens)
+    bucket_idx = _assign_bucket(max_tgt)
+    bucket_len = DIFFUSION_LENGTH_BUCKETS[bucket_idx]
+    tgt_padded = torch.full((len(batch), bucket_len), pad_id, dtype=torch.long)
+    for i, ids in enumerate(tgt_ids):
+        tgt_padded[i, :len(ids)] = ids
+    tgt_mask = (tgt_padded == pad_id)
+
+    # Bucket labels for length prediction loss
+    bucket_labels = torch.tensor([_assign_bucket(l) for l in tgt_lens], dtype=torch.long)
+
+    return {
+        "src_ids": src_padded,
+        "tgt_ids": tgt_padded,
+        "src_mask": src_mask,
+        "tgt_mask": tgt_mask,
+        "bucket_labels": bucket_labels,
+    }
+
+
 class ResumableRandomSampler(Sampler):
     """Random sampler with a known seed that can resume from a given offset.
 
@@ -403,17 +491,18 @@ def create_dataloader(
     if epoch_seed is None:
         epoch_seed = torch.randint(0, 2**31, (1,)).item()
 
-    if bucketed and isinstance(dataset, PrebuiltDataset):
+    if bucketed and isinstance(dataset, (PrebuiltDataset, PrebuiltDiffusionDataset)):
         batch_sampler = BucketedBatchSampler(
             dataset, seed=epoch_seed, base_batch_size=batch_size,
             max_src_len=max_src_len, start_index=start_index,
             max_samples=max_samples,
         )
+        cfn = diffusion_collate_fn if isinstance(dataset, PrebuiltDiffusionDataset) else collate_fn
         return DataLoader(
             dataset,
             batch_sampler=batch_sampler,
             num_workers=num_workers,
-            collate_fn=lambda batch: collate_fn(batch, pad_id),
+            collate_fn=lambda batch, _cfn=cfn, _pid=pad_id: _cfn(batch, _pid),
             pin_memory=True,
         ), epoch_seed, dataset
 

@@ -1,4 +1,14 @@
 #!/bin/bash
+# ── Destructive operation authorization ─────────────────────────────────────
+# Destructive commands (clean-run, clean-generated, clean-all, kill) require
+# an authorization token created from an interactive terminal.
+#
+# Workflow:
+#   1. Claude asks user to run: ! ./training/run.sh authorize <action>
+#   2. User runs it (TTY check passes), token created (valid 5 minutes)
+#   3. Claude runs the destructive command, token consumed
+#
+# Claude cannot bypass this: its bash tool is never a TTY.
 # Copyright (C) 2026 Nicholas Perez
 #
 # This program is free software: you can redistribute it and/or modify
@@ -21,6 +31,34 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 TRAIN_IMAGE="transmutation-train"
 INFER_IMAGE="transmutation-infer"
 CONTAINER_NAME="transmutation-train"
+AUTH_TOKEN_FILE="$PROJECT_DIR/.destructive-auth"
+AUTH_MAX_AGE=300
+
+require_auth() {
+    local action="$1"
+    if [ ! -f "$AUTH_TOKEN_FILE" ]; then
+        echo "ERROR: No authorization token."
+        echo "  Run:  ! ./training/run.sh authorize $action"
+        exit 1
+    fi
+    local token_time token_action now age
+    token_time=$(awk '{print $1}' "$AUTH_TOKEN_FILE")
+    token_action=$(cut -d' ' -f2- "$AUTH_TOKEN_FILE")
+    now=$(date +%s)
+    age=$(( now - token_time ))
+    if [ "$age" -gt "$AUTH_MAX_AGE" ]; then
+        rm -f "$AUTH_TOKEN_FILE"
+        echo "ERROR: Authorization expired (${age}s old, max ${AUTH_MAX_AGE}s)."
+        echo "  Run:  ! ./training/run.sh authorize $action"
+        exit 1
+    fi
+    if [ "$token_action" != "$action" ]; then
+        echo "ERROR: Authorization is for '$token_action', not '$action'."
+        echo "  Run:  ! ./training/run.sh authorize $action"
+        exit 1
+    fi
+    rm -f "$AUTH_TOKEN_FILE"
+}
 
 # ── Current run ──────────────────────────────────────────────────────────────
 # Each run gets its own directory under models/ (checkpoints, tokenizer, ONNX,
@@ -36,30 +74,6 @@ else
     fi
 fi
 RUN_DIR="models/$RUN"
-
-# ── Wheels ───────────────────────────────────────────────────────────────────
-
-WHEELS_DIR="$SCRIPT_DIR/wheels"
-CAUSAL_CONV1D_VER="1.5.0.post8"
-MAMBA_SSM_VER="2.2.4"
-WHL_SUFFIX="cu12torch2.5cxx11abiFALSE-cp310-cp310-linux_x86_64"
-
-fetch_wheels() {
-    mkdir -p "$WHEELS_DIR"
-    local cc_whl="causal_conv1d-${CAUSAL_CONV1D_VER}+${WHL_SUFFIX}.whl"
-    local mm_whl="mamba_ssm-${MAMBA_SSM_VER}+${WHL_SUFFIX}.whl"
-
-    if [ ! -f "$WHEELS_DIR/$cc_whl" ]; then
-        echo "Downloading causal-conv1d wheel..."
-        curl -fSL -o "$WHEELS_DIR/$cc_whl" \
-            "https://github.com/Dao-AILab/causal-conv1d/releases/download/v${CAUSAL_CONV1D_VER}/$(echo "$cc_whl" | sed 's/+/%2B/g')"
-    fi
-    if [ ! -f "$WHEELS_DIR/$mm_whl" ]; then
-        echo "Downloading mamba-ssm wheel..."
-        curl -fSL -o "$WHEELS_DIR/$mm_whl" \
-            "https://github.com/state-spaces/mamba/releases/download/v${MAMBA_SSM_VER}/$(echo "$mm_whl" | sed 's/+/%2B/g')"
-    fi
-}
 
 # ── Build ────────────────────────────────────────────────────────────────────
 
@@ -83,7 +97,6 @@ build_augment() {
 }
 
 build_train() {
-    fetch_wheels
     build_generator
     build_augment
     echo "Building training image..."
@@ -99,7 +112,9 @@ build_infer() {
 
 # Run a GPU container in the foreground (blocking).
 run_gpu() {
+    docker rm "$CONTAINER_NAME" 2>/dev/null || true
     docker run --rm --gpus all \
+        -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
         --name "$CONTAINER_NAME" \
         -v "$PROJECT_DIR/data:/app/data" \
         -v "$PROJECT_DIR/models:/app/models" \
@@ -114,6 +129,7 @@ run_gpu() {
 # Run a GPU container detached. Returns container ID.
 run_gpu_detached() {
     docker run -d --gpus all \
+        -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
         --name "$CONTAINER_NAME" \
         -v "$PROJECT_DIR/data:/app/data" \
         -v "$PROJECT_DIR/models:/app/models" \
@@ -167,19 +183,19 @@ case "${1:-help}" in
         build_generator
         build_augment
 
-        mkdir -p "$PROJECT_DIR/data/run6/train" "$PROJECT_DIR/data/run6/val"
+        mkdir -p "$PROJECT_DIR/data/run7/train" "$PROJECT_DIR/data/run7/val"
 
         # Step 1: Short synthetic samples (idempotent — skip if shards exist).
-        if ls "$PROJECT_DIR/data/run6/train"/shard_*.jsonl 1>/dev/null 2>&1; then
+        if ls "$PROJECT_DIR/data/run7/train"/shard_*.jsonl 1>/dev/null 2>&1; then
             echo "Short synthetic samples already exist, skipping."
         else
             echo "Generating short synthetic samples..."
             "$GENERATE_BIN" -stage 1 -short -train 50000 -val 5000 \
-                -seed 42 -out "$PROJECT_DIR/data/run6"
+                -seed 42 -out "$PROJECT_DIR/data/run7"
         fi
 
         # Step 2: Haiku augmentation (idempotent — skip if haiku_all.jsonl exists and is non-empty).
-        if [ -s "$PROJECT_DIR/data/run6/train/haiku_all.jsonl" ]; then
+        if [ -s "$PROJECT_DIR/data/run7/train/haiku_all.jsonl" ]; then
             echo "Haiku train augmentation already exists, skipping."
         else
             echo "Augmenting haiku corpus (train)..."
@@ -190,10 +206,10 @@ case "${1:-help}" in
                 -shorten-pct 30 -drop-memory-pct 30 \
                 -tokenizer "$PROJECT_DIR/$RUN_DIR/tokenizer.model" \
                 -seed 42 \
-                > "$PROJECT_DIR/data/run6/train/haiku_all.jsonl"
+                > "$PROJECT_DIR/data/run7/train/haiku_all.jsonl"
         fi
 
-        if [ -s "$PROJECT_DIR/data/run6/val/haiku_all.jsonl" ]; then
+        if [ -s "$PROJECT_DIR/data/run7/val/haiku_all.jsonl" ]; then
             echo "Haiku val augmentation already exists, skipping."
         else
             echo "Augmenting haiku corpus (val)..."
@@ -204,19 +220,19 @@ case "${1:-help}" in
                 -shorten-pct 30 -drop-memory-pct 30 \
                 -tokenizer "$PROJECT_DIR/$RUN_DIR/tokenizer.model" \
                 -seed 42 -val \
-                > "$PROJECT_DIR/data/run6/val/haiku_all.jsonl"
+                > "$PROJECT_DIR/data/run7/val/haiku_all.jsonl"
         fi
 
         # Step 3: Tokenize (idempotent — skip if dataset.pt exists and is newer than all JSONL).
-        if [ -f "$PROJECT_DIR/data/run6/train/dataset.pt" ] && \
-           [ -f "$PROJECT_DIR/data/run6/val/dataset.pt" ] && \
-           ! find "$PROJECT_DIR/data/run6" -name "*.jsonl" -newer "$PROJECT_DIR/data/run6/train/dataset.pt" 2>/dev/null | grep -q .; then
+        if [ -f "$PROJECT_DIR/data/run7/train/dataset.pt" ] && \
+           [ -f "$PROJECT_DIR/data/run7/val/dataset.pt" ] && \
+           ! find "$PROJECT_DIR/data/run7" -name "*.jsonl" -newer "$PROJECT_DIR/data/run7/train/dataset.pt" 2>/dev/null | grep -q .; then
             echo "dataset.pt already up to date, skipping tokenization."
         else
             echo "Tokenizing and preparing dataset..."
             run_gpu training/prepare_data.py \
                 --tokenizer "$RUN_DIR/tokenizer.model" \
-                --data-dir data/run6 \
+                --data-dir data/run7 \
                 --max-src-len 1152 --max-tgt-len 1536
         fi
 
@@ -266,36 +282,34 @@ case "${1:-help}" in
             run_gpu training/tokenizer_train.py \
                 --data-dir data \
                 --output-dir "$RUN_DIR" \
-                --vocab-size 8000
+                --vocab-size 16000
             echo "Tokenizer trained."
         fi
 
         echo "Run: $RUN ($RUN_DIR)"
         CID=$(run_gpu_detached training/train.py \
-            --data-dir data/run6 \
+            --data-dir data/run7 \
             --tokenizer "$RUN_DIR/tokenizer.model" \
             --output-dir "$RUN_DIR" \
-            --batch-size 3 \
-            --grad-accum 11 \
-            --d-state 64 \
-            --headdim 64 \
+            --batch-size 4 \
+            --grad-accum 8 \
+            --d-model 512 \
+            --n-layers 10 \
+            --n-heads 8 \
+            --d-ff 1536 \
+            --emb-rank 128 \
             --max-src-len 1152 \
             --max-tgt-len 1536 \
             --epochs 100 \
-            --lr 2e-4 \
-            --warmup-steps 500 \
+            --lr 3e-4 \
+            --warmup-steps 2000 \
             --save-every 1 \
             --fp16 \
+            --eval-denoise-steps 4 \
+            --override-lr 3e-4 \
             --stage 1 \
             --max-stage 2 \
             --stage-patience 2 \
-            --mrt-weight 10 \
-            --mrt-threshold 0.90 \
-            --cdata-weight 0 \
-            --ar-train-frac 0.0 \
-            --override-ar-frac 1.0 \
-            --override-lr 2e-5 \
-            --ar-eval-samples 250 \
             --max-epoch-samples 33000 \
             $RESUME_FLAG \
             "$@")
@@ -375,13 +389,14 @@ case "${1:-help}" in
 import json, sys
 entries = json.load(open('$PROJECT_DIR/$RUN_DIR/training_log.json'))
 for e in entries[-10:]:
-    ar = f\"ar={e.get('ar_exact','?')}/{e.get('ar_total','?')}exact {e.get('ar_xml_ok','?')}/{e.get('ar_total','?')}xml\" if 'ar_total' in e else ''
-    er = f\" CER={e['ar_cer']:.2%} WER={e['ar_wer']:.2%}\" if 'ar_cer' in e else ''
+    ev = f\"eval={e.get('eval_exact','?')}/{e.get('eval_total','?')}exact {e.get('eval_xml_ok','?')}/{e.get('eval_total','?')}xml\" if 'eval_total' in e else (f\"ar={e.get('ar_exact','?')}/{e.get('ar_total','?')}exact {e.get('ar_xml_ok','?')}/{e.get('ar_total','?')}xml\" if 'ar_total' in e else '')
+    cer_key = 'eval_cer' if 'eval_cer' in e else 'ar_cer'
+    wer_key = 'eval_wer' if 'eval_wer' in e else 'ar_wer'
+    er = f\" CER={e[cer_key]:.2%} WER={e[wer_key]:.2%}\" if cer_key in e else ''
     stg = f\"s{e['stage']}\" if 'stage' in e else ''
     wc = f\" {e['wallclock']/3600:.1f}h\" if 'wallclock' in e else ''
-    af = e.get('ar_train_frac')
-    mode = ' [AR]' if af is not None and af >= 1.0 else ' [TF]' if af is not None else ''
-    print(f\"  epoch={e['epoch']} {stg} train={e['train_loss']:.4f} {ar}{er} lr={e['lr']:.2e}{wc}{mode}\")
+    ds = f\" {e['denoise_steps']}step\" if 'denoise_steps' in e else ''
+    print(f\"  epoch={e['epoch']} {stg} train={e['train_loss']:.4f} {ev}{er} lr={e['lr']:.2e}{wc}{ds}\")
 " 2>/dev/null || echo "  (empty or parse error)"
         else
             echo "  (no training_log.json yet)"
@@ -418,7 +433,7 @@ for e in entries[-10:]:
         run_gpu training/tokenizer_train.py \
             --data-dir data \
             --output-dir "$RUN_DIR" \
-            --vocab-size 8000
+            --vocab-size 16000
         ;;
 
     export)
@@ -556,8 +571,10 @@ for e in entries[-10:]:
             --entrypoint sh \
             "$INFER_IMAGE" \
             -c "cat /app/input.jsonl | infer \
-                -encoder $RUN_DIR/onnx/encoder_int8.onnx \
-                -decoder $RUN_DIR/onnx/decoder_int8.onnx \
+                -model $RUN_DIR/onnx/diffusion_int8.onnx \
+                -length-model $RUN_DIR/onnx/length_predictor_int8.onnx \
+                -emb-down $RUN_DIR/onnx/emb_down.npy \
+                -emb-up $RUN_DIR/onnx/emb_up.npy \
                 -tokenizer $RUN_DIR/tokenizer.model \
                 -ort-lib /usr/local/lib/libonnxruntime.so \
                 -n $N_SAMPLES \
@@ -584,8 +601,10 @@ for e in entries[-10:]:
             --entrypoint sh \
             "$INFER_IMAGE" \
             -c "cat /app/input.jsonl | infer \
-                -encoder $RUN_DIR/onnx/encoder_int8.onnx \
-                -decoder $RUN_DIR/onnx/decoder_int8.onnx \
+                -model $RUN_DIR/onnx/diffusion_int8.onnx \
+                -length-model $RUN_DIR/onnx/length_predictor_int8.onnx \
+                -emb-down $RUN_DIR/onnx/emb_down.npy \
+                -emb-up $RUN_DIR/onnx/emb_up.npy \
                 -tokenizer $RUN_DIR/tokenizer.model \
                 -ort-lib /usr/local/lib/libonnxruntime.so \
                 -n $N_SAMPLES \
@@ -599,22 +618,31 @@ for e in entries[-10:]:
         run_gpu training/tokenizer_train.py \
             --data-dir data \
             --output-dir "$RUN_DIR" \
-            --vocab-size 8000
+            --vocab-size 16000
 
         echo "=== Step 2: Train ==="
         run_gpu training/train.py \
-            --data-dir data \
+            --data-dir data/run7 \
             --tokenizer "$RUN_DIR/tokenizer.model" \
             --output-dir "$RUN_DIR" \
-            --batch-size 2 \
-            --grad-accum 16 \
+            --batch-size 4 \
+            --grad-accum 8 \
+            --d-model 512 \
+            --n-layers 10 \
+            --n-heads 8 \
+            --d-ff 1536 \
+            --emb-rank 128 \
             --max-src-len 1152 \
             --max-tgt-len 1536 \
-            --epochs 30 \
-            --lr 2e-4 \
+            --epochs 100 \
+            --lr 3e-4 \
             --warmup-steps 2000 \
             --save-every 1 \
-            --fp16
+            --fp16 \
+            --eval-denoise-steps 4 \
+            --override-lr 3e-4 \
+            --stage 1 \
+            --max-stage 2
 
         echo "=== Step 3: Export ==="
         run_gpu training/export.py \
@@ -667,12 +695,14 @@ for e in entries[-10:]:
         ;;
 
     clean-generated)
+        require_auth "clean-generated"
         echo "Cleaning generated train/val data (preserving haiku)..."
         rm -rf "$PROJECT_DIR/data/train" "$PROJECT_DIR/data/val"
         echo "Done."
         ;;
 
     clean-all)
+        require_auth "clean-all"
         echo "Cleaning all data (train, val, haiku)..."
         rm -rf "$PROJECT_DIR/data/train" "$PROJECT_DIR/data/val" "$PROJECT_DIR/data/haiku" "$PROJECT_DIR/data/haiku_train" "$PROJECT_DIR/data/haiku_val"
         echo "Done."
@@ -681,6 +711,7 @@ for e in entries[-10:]:
     # Clean checkpoints, logs, ONNX, and AR inferences for a run.
     # Does NOT remove the tokenizer — that requires retraining.
     clean-run)
+        require_auth "clean-run"
         shift
         TARGET="${1:-$RUN}"
         TARGET_DIR="$PROJECT_DIR/models/$TARGET"
@@ -690,7 +721,7 @@ for e in entries[-10:]:
         fi
         echo "Cleaning $TARGET ($TARGET_DIR)..."
         rm -f "$TARGET_DIR"/*.pt "$TARGET_DIR"/training_log.json
-        rm -rf "$TARGET_DIR"/ar_inferences "$TARGET_DIR"/onnx
+        rm -rf "$TARGET_DIR"/eval_inferences "$TARGET_DIR"/onnx
         echo "Done. Tokenizer preserved."
         ;;
 
@@ -759,7 +790,7 @@ for e in entries[-10:]:
 
         # Accept explicit checkpoint: ./training/run.sh eval 250 --ckpt models/run5/epoch_74.pt
         RESUME_CKPT=$(find_resume_flag | sed 's/--resume //')
-        CHECKPOINT="${RESUME_CKPT:-$RUN_DIR/best_ar.pt}"
+        CHECKPOINT="${RESUME_CKPT:-$RUN_DIR/best.pt}"
         _prev=""
         _remaining=()
         for _arg in "$@"; do
@@ -918,6 +949,17 @@ for e in entries[-10:]:
         echo "Done. Run './training/run.sh eval' to evaluate."
         ;;
 
+    authorize)
+        if [ ! -t 0 ]; then
+            echo "ERROR: authorize must be run from an interactive terminal."
+            exit 1
+        fi
+        shift
+        ACTION="${*:?Usage: ./training/run.sh authorize <action>}"
+        echo "$(date +%s) $ACTION" > "$AUTH_TOKEN_FILE"
+        echo "Authorized '$ACTION' (valid ${AUTH_MAX_AGE}s)."
+        ;;
+
     help|*)
         cat <<'USAGE'
 Usage: ./training/run.sh <command> [args...]
@@ -931,14 +973,14 @@ Training:
   status            Show checkpoints, metrics, container state.
 
 Inference:
-  infer [N] [stage] [--beam-width K] [--length-penalty A]
+  infer [N] [stage] [--denoise-steps N]
                         CPU inference on N samples (default 10, stage 3).
   infer-rejects [N]    CPU inference on N rejected haiku samples (default 10).
   eval [N]             Holdout eval (background): generate unseen data, infer, bucket by token length.
   eval-logs [N]        Follow eval log, or show last N lines.
   eval-kill            Kill running eval.
   eval-regen [N]       Regenerate holdout set (N samples, default 500).
-  go-infer [N] [stage] [-beam-width K] [-length-penalty A]
+  go-infer [N] [stage] [-denoise-steps N]
                         Go ONNX inference on N samples (default 10, stage 3).
   go-infer-rejects [N]  Go ONNX inference on N rejected haiku samples (default 10).
 
@@ -961,7 +1003,7 @@ Runs:
   Override with TRANSMUTATION_RUN=runN.
 
 Other:
-  prepare-data      Pre-generate and tokenize run6 dataset.
+  prepare-data      Pre-generate and tokenize run7 dataset.
   export [ckpt]     Export checkpoint to ONNX (default: best.pt).
   tokenizer         Train the tokenizer.
   build             Build the training Docker image.

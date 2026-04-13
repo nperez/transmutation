@@ -8,8 +8,15 @@ XML was chosen as the output format because it cleanly handles embedded content 
 
 ## Architecture
 
-**Model**: Mamba-based seq2seq encoder-decoder (~25M parameters)
-- Mamba (state space model) for linear-time inference on long sequences
+**Model (run 7)**: DiT bidirectional transformer (~45.7M parameters)
+- Diffusion Transformer with adaLN-Zero timestep conditioning
+- 10 layers, d_model=512, 8 heads, d_ff=1536
+- Factored embedding (16k vocab, rank-128 bottleneck)
+- RoPE positional encoding, segment embeddings
+- Subword tokenization (BPE, 16k vocab) via SentencePiece
+
+**Model (runs 1-6)**: Mamba-based seq2seq encoder-decoder (~25M parameters)
+- Mamba 3 (run 5-6) / Mamba 1 (runs 1-4) state space model
 - 6 encoder layers, 6 decoder layers, d_model=384
 - Cross-attention between decoder and encoder states
 - Subword tokenization (BPE, 8k vocab) via SentencePiece
@@ -456,6 +463,98 @@ Run 6 confirmed run 5's finding: the SSM decoder cannot reliably maintain struct
 The SSM state is the only mechanism for tracking output structure (nesting depth, open tags, current context). When a structural token is wrong, the state is corrupted for all subsequent positions with no recovery path. A transformer decoder handles this via self-attention over all previous tokens — any position can "look back" and see the open tags. The SSM cannot.
 
 TF trains the model to produce perfect output given perfect context. AR training requires the model to recover from structural errors in its own output. The SSM's compressed state makes error recovery fundamentally harder than for attention-based decoders.
+
+## Run 7 Results
+
+Run 7 replaced the Mamba3 SSM encoder-decoder with a DiT (Diffusion Transformer) to eliminate the autoregressive bottleneck. Instead of sequential token generation, the model sees all positions simultaneously via bidirectional attention and iteratively refines the output. Same hardware (RTX 2060 6GB).
+
+### Architecture Changes
+
+- **DiT bidirectional transformer** — 512d, 10 layers, 8 heads, d_ff=1536, ~45.7M params. adaLN-Zero timestep conditioning (gate params initialized to zero so each layer starts as identity).
+- **Factored embedding** — rank-128 bottleneck: (16k, 128) @ (128, 512). Reduces embedding params from 8.2M to 2.2M. `project_to_vocab()` inverts the factorization for output logits.
+- **16k BPE vocab** — up from 8k in runs 5/6.
+- **RoPE** on Q, K in every layer. Segment embeddings (JSON=0, XML=1).
+- **Prefix conditioning** — input is [JSON tokens | corrupted XML tokens], model outputs logits over XML positions only.
+- **Length predictor** — mean-pool JSON embeddings → 8-bucket classifier [64, 128, 256, 384, 512, 768, 1024, 1536].
+- **Removed** Mamba SSM, cross-attention, copy mechanism, AR decode, professor forcing, all Triton AR kernels.
+
+### Pipeline Evolution
+
+The diffusion pipeline went through five iterations before settling on the final architecture:
+
+1. **CDCD continuous diffusion** — Gaussian noise in embedding space, MSE loss, consistency training with EMA. Loss dropped but CER regressed (265%→679%). Model learned manifold detection instead of contextual correction.
+2. **Direct denoising with MSE** — removed consistency training. MSE doesn't track CER — model gets close in embedding space but discretizes to wrong tokens (Voronoi boundary problem).
+3. **Cross-entropy on vocab projection** — CE loss aligned with CER for the first time. Required gradient checkpointing for (B, S, 16000) logits tensor. But continuous noise still created off-manifold inputs.
+4. **Token-manifold noise** — interpolation between clean and random token embeddings. On-manifold perturbations still didn't cross Voronoi boundaries. Refinement steps produced Δ0.
+5. **Fully discrete corruption** (final) — replace t% of token IDs with random tokens, model predicts clean tokens via CE. Inference: random tokens → model → argmax → feed back.
+
+### Training Budget
+
+| Metric | Run 6 | Run 7 |
+|--------|-------|-------|
+| Epochs | 32 | 44 |
+| Gradient steps | — | 28,292 |
+| Wall time | — | 16.7h |
+| Best eval exact | 0/50 (0%) | 0/500 (0%) |
+| Best eval XML OK | 0/50 | 5/500 |
+| Best eval CER | 0.86% (TF) | 86.7% (diffusion) |
+
+### Key Metrics
+
+| Epoch | Train Loss | Eval Exact | XML OK | CER | WER |
+|-------|-----------|-----------|--------|------|------|
+| 1 | 7.59 | 0/500 | 0 | 100.0% | 100.0% |
+| 5 | 3.89 | 0/500 | 1 | 87.6% | 92.0% |
+| 6 | 3.58 | 0/500 | 0 | **86.7%** | 99.1% |
+| 8 | 2.77 | 0/500 | 0 | 87.0% | 101.9% |
+| 10 | 1.87 | 0/500 | 0 | 112.9% | 173.2% |
+| 20 | 0.98 | 0/500 | 0 | 188.7% | 202.7% |
+| 30 | 0.85 | 0/500 | 0 | 231.9% | 288.2% |
+| 44 | 0.74 | 0/500 | 0 | 268.7% | 273.5% |
+
+Train loss dropped steadily from 7.59 to 0.74 (perplexity ~2). Eval CER hit a floor at 87% around epoch 6, then diverged catastrophically — reaching 200-500% by epoch 20+ while train loss continued improving.
+
+### Three Phases of Eval Behavior
+
+**Epochs 1-8 (learning)**: CER dropped 100%→87%. Model learned XML structural tokens. Refinement steps showed Δ1-7 token changes. Output had recognizable structure.
+
+**Epochs 9-20 (divergence)**: Train loss dropped 2.5→1.0 but CER spiked to 200-400%. Repetition collapse began — high-frequency tokens amplified over denoising iterations.
+
+**Epochs 20-44 (plateau)**: Train loss plateaued 0.74-0.85. Eval CER oscillated 150-590% per epoch. Output was repetitive tokens with occasional structural fragments. More denoising steps (20-50) made output worse.
+
+### Root Cause: Train/Inference Distribution Mismatch
+
+The model trains on `(corrupted_target, t)` where the corrupted target is always a perturbation of real XML. At inference, the model's input is its own previous output — a completely different error distribution.
+
+At t=0.125 (refinement steps), the model treats input as "87.5% correct." When fed its own predictions, it barely changes anything (Δ0-2), and what it does change trends toward high-frequency tokens. Over multiple steps, this self-reinforcing feedback loop produces pure repetition (`pullpullpull`, `thethethe`).
+
+Testing with 20 denoising steps confirmed: step 1 produces partial structure (correct `<object><entry><key>answer</key>`), but subsequent steps progressively destroy it by amplifying common tokens.
+
+### What Worked
+
+- **Factored embedding** — rank-128 bottleneck reduced params, enabled `project_to_vocab()` for output
+- **adaLN-Zero** — clean timestep conditioning, identity initialization
+- **`predict_tokens()` method** — chunked vocab projection for VRAM-efficient eval (peak: B×256×16k instead of B×1536×16k)
+- **Discrete corruption aligned loss with eval** (epochs 1-8) — CE on token prediction directly measures what eval measures
+- **Resumable eval** — eval progress saved to checkpoint via `val_state`, survives interrupts
+- **`torch.compile(dynamic=True)`** — works after moving compile after checkpoint load
+
+### What Didn't Work
+
+- **All five continuous/manifold noise variants** — Gaussian noise creates off-manifold inputs. Token-manifold interpolation stays within Voronoi cells. Neither teaches contextual correction.
+- **Multi-step discrete refinement** — self-reinforcing feedback loop. The model's own output becomes the input distribution it never trained on.
+- **ReduceLROnPlateau** — halved LR 3 times, killed training. Constant LR is standard for diffusion.
+- **Consistency training** — vacuous loss, slow signal propagation.
+
+### Conclusion
+
+Discrete diffusion cannot produce valid structured output for this task. The fundamental limitation is threefold:
+
+1. **Independent per-position prediction** — each token is classified independently. The model cannot enforce that `<entry>` at position 40 requires `</entry>` at position 55. XML requires coordinated structural decisions that per-position argmax cannot provide.
+2. **Train/inference distribution mismatch** — training sees corrupted versions of real XML. Inference sees the model's own (wrong) predictions. The model optimizes the training task (lower loss) without improving the inference task (lower CER).
+3. **Pointwise discretization bottleneck** — confirmed by CoDAR (Shen et al. 2026): pointwise projection from embeddings to tokens has an irreducible optimality gap due to conditional total correlation between positions.
+
+The 45% AR ceiling from runs 5-6 was an SSM state limitation. The 0% diffusion ceiling from run 7 is a more fundamental limitation of independent per-position token prediction without holistic sequence representation.
 
 ## Data Pipelines
 
