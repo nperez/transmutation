@@ -8,7 +8,15 @@ XML was chosen as the output format because it cleanly handles embedded content 
 
 ## Architecture
 
-**Model (run 7)**: DiT bidirectional transformer (~45.7M parameters)
+**Model (run 8, current)**: Three-stage latent-translation pipeline
+- JSON autoencoder (~17.2M params, 4 enc / 2 dec transformer layers) → continuous 384d latent
+- Translator (TBD) maps JSON latent → XML latent (starting with Procrustes alignment)
+- XML autoencoder (~20M params, 4 enc / 4 dec transformer layers) → decodes latent to XML
+- Hybrid CNN + Transformer AE: FactoredEmbedding + 3× stride-2 Conv1d + 384d transformer stack
+- Subword tokenization (BPE, 16k vocab) via SentencePiece
+- See [docs/run8_notes.md](docs/run8_notes.md) for details
+
+**Model (run 7, abandoned)**: DiT bidirectional transformer (~45.7M parameters)
 - Diffusion Transformer with adaLN-Zero timestep conditioning
 - 10 layers, d_model=512, 8 heads, d_ff=1536
 - Factored embedding (16k vocab, rank-128 bottleneck)
@@ -555,6 +563,48 @@ Discrete diffusion cannot produce valid structured output for this task. The fun
 3. **Pointwise discretization bottleneck** — confirmed by CoDAR (Shen et al. 2026): pointwise projection from embeddings to tokens has an irreducible optimality gap due to conditional total correlation between positions.
 
 The 45% AR ceiling from runs 5-6 was an SSM state limitation. The 0% diffusion ceiling from run 7 is a more fundamental limitation of independent per-position token prediction without holistic sequence representation.
+
+## Run 8 Results (current, in progress)
+
+Run 8 abandons the direct JSON→XML seq2seq approach for a three-stage pipeline:
+
+```
+JSON tokens → JSON encoder → latent → translator → latent → XML decoder → XML tokens
+```
+
+Two autoencoders compress their respective formats into continuous latents. A translator maps between latent spaces. Only the JSON encoder and XML decoder are kept — their paired decoder/encoder are training scaffolding. No discretization happens mid-pipeline, sidestepping the pointwise bottleneck that limited run 7.
+
+See [docs/run8_notes.md](docs/run8_notes.md) for detailed architecture, training recipe, findings, and references.
+
+**Architecture**: Hybrid CNN + Transformer, 384d end-to-end, 8x spatial compression.
+- JSON AE: 4 encoder / 2 decoder layers, ~17.2M params (heavy encoder — kept side)
+- XML AE: 4 encoder / 4 decoder layers, ~20M params (heavy decoder — both sides strong for latent pairing)
+- FactoredEmbedding (16k vocab, rank 128, d_emb=384)
+- 3× strided Conv1d (channels 384→384→384, stride 2 each)
+- Transformer stack at 384d, 6 heads, d_ff=1152
+- No latent projection — transformer output IS the latent
+
+**Training recipe**:
+- Freq-weighted CE loss (inverse-sqrt) — addresses rare-token collapse on structured data
+- Single-shot noise schedule: 20% token corruption initially, drops to 0 on first plateau
+- All aug_types in training: the encoder must faithfully represent any input the translator will see
+- Dynamic val scaling (n_val ∝ 1/error_rate) for high-accuracy measurement
+- Full interrupt resumability: mid-training, mid-validation, post-epoch
+
+**JSON AE (complete)**:
+
+| Epoch | Noise | Acc    | CER    | Perfect |
+|-------|-------|--------|--------|---------|
+| 1     | 0.20  | 99.16% | 1.01%  | 50.6%   |
+| 2     | 0.20  | 99.71% | 0.25%  | 41.3%   |
+| 6     | 0.20  | 99.84% | 0.16%  | 58.7%   |
+| 7     | 0     | **99.98%** | **0.015%** | **94.1%** |
+
+Dropping noise after plateau produced a 14 basis point accuracy jump and 10x CER reduction in one epoch. The denoising objective was the ceiling — not architectural capacity.
+
+**XML AE**: not yet trained.
+**Translator**: not yet built. Starting with Procrustes alignment (closed-form, zero-parameter); escalating to learned linear / MLP / small transformer only if needed.
+**End-to-end fine-tune**: planned, introduces noise robustness at the pipeline level rather than at the AE level.
 
 ## Data Pipelines
 

@@ -31,6 +31,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 TRAIN_IMAGE="transmutation-train"
 INFER_IMAGE="transmutation-infer"
 CONTAINER_NAME="transmutation-train"
+AE_CONTAINER_NAME="transmutation-train-ae"
 AUTH_TOKEN_FILE="$PROJECT_DIR/.destructive-auth"
 AUTH_MAX_AGE=300
 
@@ -153,7 +154,7 @@ run_cpu_stdin() {
 
 # Find the training container (running or stopped).
 find_train_container() {
-    docker ps -a --filter "name=$CONTAINER_NAME" --format '{{.ID}}' | head -1 || true
+    docker ps -a --filter "name=^/${CONTAINER_NAME}$" --format '{{.ID}}' | head -1 || true
 }
 
 # ── Auto-resume logic ───────────────────────────────────────────────────────
@@ -385,19 +386,17 @@ case "${1:-help}" in
         echo
         echo "=== Training Log ==="
         if [ -f "$PROJECT_DIR/$RUN_DIR/training_log.json" ]; then
-            python3 -c "
-import json, sys
-entries = json.load(open('$PROJECT_DIR/$RUN_DIR/training_log.json'))
-for e in entries[-10:]:
-    ev = f\"eval={e.get('eval_exact','?')}/{e.get('eval_total','?')}exact {e.get('eval_xml_ok','?')}/{e.get('eval_total','?')}xml\" if 'eval_total' in e else (f\"ar={e.get('ar_exact','?')}/{e.get('ar_total','?')}exact {e.get('ar_xml_ok','?')}/{e.get('ar_total','?')}xml\" if 'ar_total' in e else '')
-    cer_key = 'eval_cer' if 'eval_cer' in e else 'ar_cer'
-    wer_key = 'eval_wer' if 'eval_wer' in e else 'ar_wer'
-    er = f\" CER={e[cer_key]:.2%} WER={e[wer_key]:.2%}\" if cer_key in e else ''
-    stg = f\"s{e['stage']}\" if 'stage' in e else ''
-    wc = f\" {e['wallclock']/3600:.1f}h\" if 'wallclock' in e else ''
-    ds = f\" {e['denoise_steps']}step\" if 'denoise_steps' in e else ''
-    print(f\"  epoch={e['epoch']} {stg} train={e['train_loss']:.4f} {ev}{er} lr={e['lr']:.2e}{wc}{ds}\")
-" 2>/dev/null || echo "  (empty or parse error)"
+            jq -r '.[-10:] [] |
+              "  epoch=\(.epoch)\(if .stage then " s\(.stage)" else "" end) train=\(.train_loss | tostring | .[:6])\(
+                if .eval_total then " eval=\(.eval_exact)/\(.eval_total)exact \(.eval_xml_ok)/\(.eval_total)xml"
+                elif .ar_total then " ar=\(.ar_exact)/\(.ar_total)exact \(.ar_xml_ok)/\(.ar_total)xml"
+                else "" end)\(
+                if .eval_cer then " CER=\(.eval_cer * 100 | tostring | .[:5])% WER=\(.eval_wer * 100 | tostring | .[:5])%"
+                elif .ar_cer then " CER=\(.ar_cer * 100 | tostring | .[:5])% WER=\(.ar_wer * 100 | tostring | .[:5])%"
+                else "" end) lr=\(.lr | tostring)\(
+                if .wallclock then " \(.wallclock / 3600 | tostring | .[:4])h" else "" end)\(
+                if .denoise_steps then " \(.denoise_steps)step" else "" end)"' \
+                "$PROJECT_DIR/$RUN_DIR/training_log.json" 2>/dev/null || echo "  (empty or parse error)"
         else
             echo "  (no training_log.json yet)"
         fi
@@ -414,6 +413,44 @@ for e in entries[-10:]:
             fi
         else
             echo "  (not running)"
+        fi
+
+        # ── AE status (if ae/ directory exists) ──
+        AE_DIR="$PROJECT_DIR/$RUN_DIR/ae"
+        if [ -d "$AE_DIR" ]; then
+            echo
+            echo "=== AE Checkpoints ($RUN_DIR/ae) ==="
+            if ls "$AE_DIR"/*.pt 1>/dev/null 2>&1; then
+                ls -1 "$AE_DIR"/*.pt | while read f; do
+                    name=$(basename "$f")
+                    sz=$(du -h "$f" | cut -f1)
+                    echo "  $name  $sz"
+                done
+            else
+                echo "  (none)"
+            fi
+            echo
+            echo "=== AE Training Log ==="
+            if [ -f "$AE_DIR/training_log.json" ]; then
+                jq -r '.[-10:] [] | "  epoch=\(.epoch) \(.format) train=\(.train_loss | tostring | .[:6]) val=\(.val_loss | tostring | .[:6]) acc=\(.token_acc | tostring | .[:6])\(if .cer then " CER=\(.cer * 100 | tostring | .[:5])%" else "" end)\(if .perfect then " pf=\(.perfect)/\(.n_val)(\(.perfect_rate * 100 | tostring | .[:4])%)" else "" end) lr=\(.lr | tostring)\(if .wallclock then " \(.wallclock / 3600 | tostring | .[:4])h" else "" end)"' \
+                    "$AE_DIR/training_log.json" 2>/dev/null || echo "  (empty or parse error)"
+            else
+                echo "  (no training_log.json yet)"
+            fi
+            echo
+            echo "=== AE Container ==="
+            AE_CID=$(docker ps -a --filter "name=$AE_CONTAINER_NAME" --format '{{.ID}}' | head -1 || true)
+            if [ -n "$AE_CID" ]; then
+                AE_STATE=$(docker inspect --format '{{.State.Status}}' "$AE_CID" 2>/dev/null || echo "unknown")
+                echo "  $AE_CONTAINER_NAME ($AE_CID): $AE_STATE"
+                if [ "$AE_STATE" = "running" ]; then
+                    echo
+                    echo "=== AE Recent Output ==="
+                    docker logs --tail 5 "$AE_CID" 2>&1 | tr '\r' '\n' | grep -v '^$' | tail -5
+                fi
+            else
+                echo "  (not running)"
+            fi
         fi
         ;;
 
@@ -713,16 +750,28 @@ for e in entries[-10:]:
     clean-run)
         require_auth "clean-run"
         shift
-        TARGET="${1:-$RUN}"
-        TARGET_DIR="$PROJECT_DIR/models/$TARGET"
-        if [ ! -d "$TARGET_DIR" ]; then
-            echo "Error: $TARGET_DIR does not exist"
-            exit 1
+        # Check for --ae flag.
+        if [ "${1:-}" = "--ae" ]; then
+            AE_DIR="$PROJECT_DIR/$RUN_DIR/ae"
+            if [ ! -d "$AE_DIR" ]; then
+                echo "Error: $AE_DIR does not exist"
+                exit 1
+            fi
+            echo "Cleaning AE checkpoints in $RUN_DIR/ae (archive preserved)..."
+            rm -f "$AE_DIR"/*.pt "$AE_DIR"/training_log.json
+            echo "Done. Archive directory preserved."
+        else
+            TARGET="${1:-$RUN}"
+            TARGET_DIR="$PROJECT_DIR/models/$TARGET"
+            if [ ! -d "$TARGET_DIR" ]; then
+                echo "Error: $TARGET_DIR does not exist"
+                exit 1
+            fi
+            echo "Cleaning $TARGET ($TARGET_DIR)..."
+            rm -f "$TARGET_DIR"/*.pt "$TARGET_DIR"/training_log.json
+            rm -rf "$TARGET_DIR"/eval_inferences "$TARGET_DIR"/onnx
+            echo "Done. Tokenizer preserved."
         fi
-        echo "Cleaning $TARGET ($TARGET_DIR)..."
-        rm -f "$TARGET_DIR"/*.pt "$TARGET_DIR"/training_log.json
-        rm -rf "$TARGET_DIR"/eval_inferences "$TARGET_DIR"/onnx
-        echo "Done. Tokenizer preserved."
         ;;
 
     new-run)
@@ -949,6 +998,329 @@ for e in entries[-10:]:
         echo "Done. Run './training/run.sh eval' to evaluate."
         ;;
 
+    # ── Autoencoder Training (Run 8) ──────────────────────────────────────────
+
+    train-ae)
+        build_train
+        shift
+        FORMAT="${1:?Usage: train-ae <json|xml> [--resume PATH] [--override-lr LR] [--freq-weight] [--freeze-encoder] [--freeze-decoder]}"
+        shift
+
+        if [ "$FORMAT" != "json" ] && [ "$FORMAT" != "xml" ]; then
+            echo "Error: format must be 'json' or 'xml', got '$FORMAT'"
+            exit 1
+        fi
+
+        # Parse optional flags.
+        OVERRIDE_LR=""
+        RESUME_CKPT=""
+        FREQ_WEIGHT=""
+        FREEZE_ENCODER=""
+        FREEZE_DECODER=""
+        EPOCHS="50"
+        LR_PATIENCE="3"
+        CONV_STRIDES=""
+        NOISE_FRAC="0.20"
+        CLEAN=""
+        NOISE_SCHEDULE=""
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --override-lr) OVERRIDE_LR="--override-lr $2"; shift 2 ;;
+                --resume)      RESUME_CKPT="$2"; shift 2 ;;
+                --freq-weight) FREQ_WEIGHT="--freq-weight"; shift ;;
+                --freeze-encoder) FREEZE_ENCODER="--freeze-encoder"; shift ;;
+                --freeze-decoder) FREEZE_DECODER="--freeze-decoder"; shift ;;
+                --epochs)      EPOCHS="$2"; shift 2 ;;
+                --lr-patience) LR_PATIENCE="$2"; shift 2 ;;
+                --conv-strides) CONV_STRIDES="$2"; shift 2 ;;
+                --noise-frac) NOISE_FRAC="$2"; shift 2 ;;
+                --clean) CLEAN="--clean"; shift ;;
+                --noise-schedule) NOISE_SCHEDULE="--noise-schedule"; shift ;;
+                *) echo "Unknown flag: $1"; exit 1 ;;
+            esac
+        done
+
+        # Bail if already running.
+        if docker ps --filter "name=$AE_CONTAINER_NAME" --format '{{.ID}}' | grep -q .; then
+            echo "AE training is already running. Use 'ae-stop' first."
+            exit 1
+        fi
+        docker rm "$AE_CONTAINER_NAME" 2>/dev/null || true
+
+        AE_DIR="$PROJECT_DIR/$RUN_DIR/ae"
+        mkdir -p "$AE_DIR"
+
+        # Resume: explicit --resume, or auto-detect latest checkpoint.
+        RESUME_FLAG=""
+        if [ -n "$RESUME_CKPT" ]; then
+            RESUME_FLAG="--resume $RUN_DIR/ae/$(basename "$RESUME_CKPT")"
+            echo "Resuming: $RESUME_FLAG"
+        else
+            LATEST=$(ls -t "$AE_DIR"/${FORMAT}_best.pt \
+                          "$AE_DIR"/${FORMAT}_interrupt_*.pt \
+                          "$AE_DIR"/${FORMAT}_epoch_*.pt \
+                          2>/dev/null | head -1 || true)
+            if [ -n "$LATEST" ]; then
+                RESUME_FLAG="--resume $RUN_DIR/ae/$(basename "$LATEST")"
+                echo "Auto-resuming: $RESUME_FLAG"
+            else
+                echo "Starting fresh $FORMAT AE training"
+            fi
+        fi
+
+        echo "Run: $RUN ($RUN_DIR/ae), format: $FORMAT"
+        CID=$(docker run -d --gpus all \
+            -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+            --name "$AE_CONTAINER_NAME" \
+            -v "$PROJECT_DIR/data:/app/data" \
+            -v "$PROJECT_DIR/models:/app/models" \
+            -v "$SCRIPT_DIR:/app/training:ro" \
+            -v "$PROJECT_DIR/tmp/triton_cache:/home/trainer/.triton" \
+            "$TRAIN_IMAGE" \
+            training/train_ae.py \
+            --format "$FORMAT" \
+            --data-dir data/run7 \
+            --tokenizer "$RUN_DIR/tokenizer.model" \
+            --output-dir "$RUN_DIR/ae" \
+            --batch-size 16 \
+            --grad-accum 4 \
+            --epochs "$EPOCHS" \
+            --lr 3e-4 \
+            --warmup-steps 1000 \
+            --noise-frac "$NOISE_FRAC" \
+            --max-seq-len 1536 \
+            --d-emb 384 \
+            --emb-rank 128 \
+            --conv-channels 384,384,384 \
+            --n-enc-layers 4 \
+            --n-dec-layers 2 \
+            --save-every 1 \
+            --lr-patience "$LR_PATIENCE" \
+            --fp16 \
+            $RESUME_FLAG \
+            $OVERRIDE_LR \
+            $FREQ_WEIGHT \
+            $FREEZE_ENCODER \
+            $FREEZE_DECODER \
+            $CLEAN \
+            $NOISE_SCHEDULE \
+            ${CONV_STRIDES:+--conv-strides $CONV_STRIDES})
+
+        echo "Container: $CID"
+        echo "Use './training/run.sh ae-logs' to follow output."
+        ;;
+
+    ae-stop)
+        CID=$(docker ps -a --filter "name=$AE_CONTAINER_NAME" --format '{{.ID}}' | head -1 || true)
+        if [ -z "$CID" ]; then
+            echo "No AE training container found."
+            exit 0
+        fi
+        echo "Sending SIGTERM (will checkpoint and exit)..."
+        docker stop -t 120 "$CID"
+        echo "Stopped."
+        ;;
+
+    ae-logs)
+        CID=$(docker ps -a --filter "name=$AE_CONTAINER_NAME" --format '{{.ID}}' | head -1 || true)
+        if [ -z "$CID" ]; then
+            echo "No AE training container found."
+            exit 1
+        fi
+        if [ -n "${2:-}" ]; then
+            docker logs --tail "$2" "$CID" 2>&1 | tr '\r' '\n'
+        else
+            docker logs -f "$CID" 2>&1 | tr '\r' '\n'
+        fi
+        ;;
+
+    ae-status)
+        AE_DIR="$PROJECT_DIR/$RUN_DIR/ae"
+        echo "=== AE Run: $RUN ($RUN_DIR/ae) ==="
+        echo
+        echo "=== Checkpoints ==="
+        if ls "$AE_DIR"/*.pt 1>/dev/null 2>&1; then
+            ls -1 "$AE_DIR"/*.pt | while read f; do
+                name=$(basename "$f")
+                sz=$(du -h "$f" | cut -f1)
+                echo "  $name  $sz"
+            done
+        else
+            echo "  (none)"
+        fi
+        echo
+        echo "=== Training Log ==="
+        if [ -f "$AE_DIR/training_log.json" ]; then
+            jq -r '.[-10:] [] | "  epoch=\(.epoch) \(.format) train=\(.train_loss | tostring | .[:6]) val=\(.val_loss | tostring | .[:6]) acc=\(.token_acc | tostring | .[:6])\(if .cer then " CER=\(.cer * 100 | tostring | .[:5])%" else "" end)\(if .perfect then " pf=\(.perfect)/\(.n_val)(\(.perfect_rate * 100 | tostring | .[:4])%)" else "" end) lr=\(.lr | tostring)\(if .wallclock then " \(.wallclock / 3600 | tostring | .[:4])h" else "" end)"' \
+                "$AE_DIR/training_log.json" 2>/dev/null || echo "  (empty or parse error)"
+        else
+            echo "  (no training_log.json yet)"
+        fi
+        echo
+        echo "=== Container ==="
+        CID=$(docker ps -a --filter "name=$AE_CONTAINER_NAME" --format '{{.ID}}' | head -1 || true)
+        if [ -n "$CID" ]; then
+            STATE=$(docker inspect --format '{{.State.Status}}' "$CID" 2>/dev/null || echo "unknown")
+            echo "  $AE_CONTAINER_NAME ($CID): $STATE"
+            if [ "$STATE" = "running" ]; then
+                echo
+                echo "=== Recent Output ==="
+                docker logs --tail 5 "$CID" 2>&1 | tr '\r' '\n' | grep -v '^$' | tail -5
+            fi
+        else
+            echo "  (not running)"
+        fi
+        ;;
+
+    ae-infer)
+        build_train
+        shift
+        FORMAT="${1:?Usage: ae-infer <json|xml> [N]}"
+        shift
+        N_SAMPLES="${1:-10}"
+        if [ -n "${1:-}" ]; then shift; fi
+
+        AE_DIR="$RUN_DIR/ae"
+        # Accept --ckpt override, otherwise use best.
+        CHECKPOINT="$AE_DIR/${FORMAT}_best.pt"
+        _prev=""
+        _remaining=()
+        for _arg in "$@"; do
+            if [ "$_prev" = "--ckpt" ]; then CHECKPOINT="$_arg"; _prev=""; continue; fi
+            if [ "$_arg" = "--ckpt" ]; then _prev="$_arg"; continue; fi
+            _remaining+=("$_arg")
+        done
+        set -- "${_remaining[@]+"${_remaining[@]}"}"
+        if [ ! -f "$PROJECT_DIR/$CHECKPOINT" ]; then
+            echo "No checkpoint found at $CHECKPOINT"
+            exit 1
+        fi
+
+        # Check if --gpu is in remaining args.
+        GPU_DOCKER=""
+        GPU_FLAG=""
+        for _arg in "$@"; do
+            if [ "$_arg" = "--gpu" ]; then
+                GPU_DOCKER="--gpus all"
+                GPU_FLAG="--gpu"
+            fi
+        done
+
+        echo "AE inference: $CHECKPOINT ($N_SAMPLES per bucket, format=$FORMAT${GPU_FLAG:+, GPU})..."
+        docker run --rm $GPU_DOCKER \
+            -v "$PROJECT_DIR/data:/app/data:ro" \
+            -v "$PROJECT_DIR/models:/app/models:ro" \
+            -v "$SCRIPT_DIR:/app/training:ro" \
+            -v "$PROJECT_DIR/tmp/triton_cache:/home/trainer/.triton" \
+            "$TRAIN_IMAGE" \
+            training/ae_infer.py "$CHECKPOINT" \
+            -n "$N_SAMPLES" \
+            --format "$FORMAT" \
+            --data-dir data/run7 \
+            --tokenizer "$RUN_DIR/tokenizer.model" \
+            "$@"
+        ;;
+
+    ae-edit-layers)
+        build_train
+        shift
+        FORMAT="${1:?Usage: ae-edit-layers <json|xml> --enc-layers N --dec-layers N [--strategy append|interleave]}"
+        shift
+
+        # Parse flags.
+        ENC_LAYERS=""
+        DEC_LAYERS=""
+        STRATEGY="append"
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --enc-layers) ENC_LAYERS="$2"; shift 2 ;;
+                --dec-layers) DEC_LAYERS="$2"; shift 2 ;;
+                --strategy)   STRATEGY="$2"; shift 2 ;;
+                *) echo "Unknown flag: $1"; exit 1 ;;
+            esac
+        done
+
+        if [ -z "$ENC_LAYERS" ] || [ -z "$DEC_LAYERS" ]; then
+            echo "Error: --enc-layers and --dec-layers are required"
+            exit 1
+        fi
+
+        AE_DIR="$RUN_DIR/ae"
+        INPUT="$AE_DIR/${FORMAT}_best.pt"
+        OUTPUT="$AE_DIR/${FORMAT}_edited.pt"
+        if [ ! -f "$PROJECT_DIR/$INPUT" ]; then
+            echo "No checkpoint found at $INPUT"
+            exit 1
+        fi
+
+        echo "Editing $INPUT layers (enc=$ENC_LAYERS, dec=$DEC_LAYERS, strategy=$STRATEGY) -> $OUTPUT"
+        docker run --rm \
+            -v "$PROJECT_DIR/models:/app/models" \
+            -v "$SCRIPT_DIR:/app/training:ro" \
+            "$TRAIN_IMAGE" \
+            training/edit_layers.py "$INPUT" "$OUTPUT" \
+            --enc-layers "$ENC_LAYERS" --dec-layers "$DEC_LAYERS" \
+            --strategy "$STRATEGY"
+        ;;
+
+    ae-edit-convs)
+        build_train
+        shift
+        FORMAT="${1:?Usage: ae-edit-convs <json|xml> --strides S0,S1}"
+        shift
+
+        STRIDES=""
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --strides) STRIDES="$2"; shift 2 ;;
+                *) echo "Unknown flag: $1"; exit 1 ;;
+            esac
+        done
+
+        if [ -z "$STRIDES" ]; then
+            echo "Error: --strides is required (e.g. --strides 2,4)"
+            exit 1
+        fi
+
+        AE_DIR="$RUN_DIR/ae"
+        INPUT="$AE_DIR/${FORMAT}_best.pt"
+        OUTPUT="$AE_DIR/${FORMAT}_edited.pt"
+        if [ ! -f "$PROJECT_DIR/$INPUT" ]; then
+            echo "No checkpoint found at $INPUT"
+            exit 1
+        fi
+
+        echo "Editing $INPUT conv strides -> $STRIDES -> $OUTPUT"
+        docker run --rm \
+            -v "$PROJECT_DIR/models:/app/models" \
+            -v "$SCRIPT_DIR:/app/training:ro" \
+            "$TRAIN_IMAGE" \
+            training/edit_convs.py "$INPUT" "$OUTPUT" --strides "$STRIDES"
+        ;;
+
+    ae-expand-latent)
+        build_train
+        shift
+        FORMAT="${1:?Usage: ae-expand-latent <json|xml> [new_dim]}"
+        shift
+        NEW_DIM="${1:-128}"
+
+        AE_DIR="$RUN_DIR/ae"
+        INPUT="$AE_DIR/${FORMAT}_best.pt"
+        OUTPUT="$AE_DIR/${FORMAT}_expanded.pt"
+        if [ ! -f "$PROJECT_DIR/$INPUT" ]; then
+            echo "No checkpoint found at $INPUT"
+            exit 1
+        fi
+
+        echo "Expanding $INPUT latent to $NEW_DIM dims -> $OUTPUT"
+        docker run --rm \
+            -v "$PROJECT_DIR/models:/app/models" \
+            -v "$SCRIPT_DIR:/app/training:ro" \
+            "$TRAIN_IMAGE" \
+            training/expand_latent.py "$INPUT" "$OUTPUT" --new-dim "$NEW_DIM"
+        ;;
+
     authorize)
         if [ ! -t 0 ]; then
             echo "ERROR: authorize must be run from an interactive terminal."
@@ -997,10 +1369,34 @@ Data:
 Runs:
   new-run           Create next run directory (models/runN+1).
   clean-run [name]  Clean checkpoints/logs/ONNX for a run (keeps tokenizer).
+  clean-run --ae    Clean AE checkpoints/logs for current run (keeps archive/).
   status            Show current run's checkpoints, metrics, container state.
 
   Current run auto-detected as highest models/runN.
   Override with TRANSMUTATION_RUN=runN.
+
+Autoencoder (Run 8):
+  train-ae <json|xml> [flags]  Start AE training (detached). Auto-resumes.
+    --resume PATH        Resume from specific checkpoint (default: auto-detect latest).
+    --override-lr LR     Force learning rate on resume (e.g. 1.5e-4).
+    --freq-weight        Enable inverse-sqrt-frequency CE loss weighting.
+    --freeze-encoder     Freeze encoder weights (decoder-only training).
+    --freeze-decoder     Freeze decoder weights (encoder-only training).
+    --epochs N           Total epochs (default: 50).
+    --lr-patience N      Epochs without improvement before LR drop (default: 3).
+    --noise-frac F       Fraction of tokens to corrupt during training (default: 0.20).
+    --clean              Filter out structurally malformed samples (aug_type=corrupted).
+    --noise-schedule     On first plateau, drop noise-frac to 0 (single-shot).
+  ae-stop                      Graceful stop (checkpoint + exit).
+  ae-logs [N]                  Follow AE training output.
+  ae-status                    Show AE checkpoints, metrics.
+  ae-infer <json|xml> [N]     Reconstruct N samples per length bucket, show per-bucket accuracy.
+  ae-edit-convs <json|xml>     Edit conv stack: drop middle layer, change strides.
+    --strides S0,S1            Target strides (e.g. 2,4 for 8x in 2 convs).
+  ae-edit-layers <json|xml>    Edit transformer layer counts via Net2DeeperNet.
+    --enc-layers N             Target encoder layers.
+    --dec-layers N             Target decoder layers.
+    --strategy append|interleave  Where to insert new layers (default: append).
 
 Other:
   prepare-data      Pre-generate and tokenize run7 dataset.

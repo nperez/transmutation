@@ -521,3 +521,147 @@ def create_dataloader(
         collate_fn=lambda batch: collate_fn(batch, pad_id),
         pin_memory=True,
     ), epoch_seed, dataset
+
+
+# ── Autoencoder Dataset ────────────────────────────────────────────────────────
+
+AE_LENGTH_BUCKETS = [64, 128, 256, 384, 512, 768, 1024, 1536]
+
+
+class AutoencoderDataset(Dataset):
+    """Wraps pre-tokenized dataset.pt, returning individual src or tgt sequences."""
+
+    def __init__(self, data_path, tokenizer_path, format="json"):
+        data = torch.load(data_path, weights_only=True)
+        if format == "json":
+            self._pad = data["src"]          # (N, max_len) int16
+            self._lens = data["src_lens"]    # (N,) int32
+        elif format == "xml":
+            self._pad = data["tgt"]
+            self._lens = data["tgt_lens"]
+        else:
+            raise ValueError(f"format must be 'json' or 'xml', got '{format}'")
+
+        self._corrupt = data.get("corrupt")  # (N,) bool or None
+        sp = spm.SentencePieceProcessor()
+        sp.load(tokenizer_path)
+        self.pad_id = sp.pad_id()
+        self._active_indices = torch.arange(len(self._lens))
+        print(f"  AutoencoderDataset({format}): {len(self._lens)} total samples loaded", flush=True)
+
+    def apply_stage_filter(self, max_tokens, allow_corrupt=True):
+        """Filter samples by max token length and corruption. Returns count."""
+        mask = self._lens <= max_tokens
+        if not allow_corrupt:
+            if self._corrupt is None:
+                raise RuntimeError(
+                    "apply_stage_filter called with allow_corrupt=False but "
+                    "dataset has no 'corrupt' field — dataset is from an older "
+                    "format. Regenerate the dataset via prepare_data.py.")
+            mask = mask & ~self._corrupt
+        self._active_indices = mask.nonzero(as_tuple=True)[0]
+        return len(self._active_indices)
+
+    def __len__(self):
+        return len(self._active_indices)
+
+    def __getitem__(self, idx):
+        real_idx = self._active_indices[idx].item()
+        length = self._lens[real_idx].item()
+        token_ids = self._pad[real_idx, :length].long()
+        return {"token_ids": token_ids, "length": length}
+
+
+def _ae_assign_bucket(length):
+    """Assign a token length to the smallest AE bucket that fits it."""
+    for i, b in enumerate(AE_LENGTH_BUCKETS):
+        if length <= b:
+            return i
+    return len(AE_LENGTH_BUCKETS) - 1
+
+
+def ae_collate_fn(batch, pad_id=0):
+    """Pad sequences to bucket ceiling (divisible by 8) for autoencoder training."""
+    token_ids = [item["token_ids"] for item in batch]
+    lengths = [item["length"] for item in batch]
+
+    max_len = max(lengths)
+    bucket_idx = _ae_assign_bucket(max_len)
+    bucket_len = AE_LENGTH_BUCKETS[bucket_idx]
+
+    padded = torch.full((len(batch), bucket_len), pad_id, dtype=torch.long)
+    for i, ids in enumerate(token_ids):
+        padded[i, :len(ids)] = ids
+    pad_mask = (padded == pad_id)
+
+    return {
+        "token_ids": padded,
+        "pad_mask": pad_mask,
+        "lengths": torch.tensor(lengths, dtype=torch.long),
+    }
+
+
+class AEBucketedBatchSampler(Sampler):
+    """Length-bucketed batch sampler for autoencoder training.
+
+    Buckets by single-sequence length. Batch size scales inversely with
+    bucket max length for efficient GPU utilization.
+    """
+
+    BINS = [0, 64, 128, 256, 384, 512, 768, 1024, 1536]
+
+    def __init__(self, dataset, seed, base_batch_size, max_seq_len,
+                 start_index=0, max_samples=0):
+        self.seed = seed
+        seq_lens = dataset._lens[dataset._active_indices]
+        n = len(seq_lens)
+        g = torch.Generator()
+        g.manual_seed(seed)
+
+        n_bins = len(self.BINS)
+        bucket_ids = torch.zeros(n, dtype=torch.long)
+        for i in range(n_bins - 1):
+            mask = (seq_lens >= self.BINS[i]) & (seq_lens < self.BINS[i + 1])
+            bucket_ids[mask] = i
+        bucket_ids[seq_lens >= self.BINS[-1]] = n_bins - 1
+
+        bucket_indices = []
+        bucket_batch_sizes = []
+        for b in range(n_bins):
+            indices = (bucket_ids == b).nonzero(as_tuple=True)[0]
+            if len(indices) == 0:
+                continue
+            bucket_max = self.BINS[min(b + 1, n_bins - 1)]
+            if bucket_max == 0:
+                bucket_max = self.BINS[1]
+            # Scale batch inversely with length. Keeps B*L product constant
+            # across buckets, equalizing VRAM from logits + CE fp32 allocation.
+            bs = max(base_batch_size, int(base_batch_size * max_seq_len / bucket_max))
+            perm = torch.randperm(len(indices), generator=g)
+            bucket_indices.append(indices[perm])
+            bucket_batch_sizes.append(bs)
+
+        n_active = len(bucket_indices)
+        if max_samples > 0 and n_active > 0:
+            per_bucket = max_samples // n_active
+        else:
+            per_bucket = max(len(b) for b in bucket_indices) if bucket_indices else 0
+
+        self._batches = []
+        for indices, bs in zip(bucket_indices, bucket_batch_sizes):
+            capped = indices[:per_bucket]
+            for i in range(0, len(capped), bs):
+                self._batches.append(capped[i:i + bs].tolist())
+
+        batch_perm = torch.randperm(len(self._batches), generator=g)
+        self._batches = [self._batches[i] for i in batch_perm]
+
+        if start_index > 0:
+            self._batches = self._batches[start_index:]
+
+    def __iter__(self):
+        for batch in self._batches:
+            yield batch
+
+    def __len__(self):
+        return len(self._batches)
